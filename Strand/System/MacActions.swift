@@ -1,7 +1,11 @@
 import Foundation
+#if canImport(AppKit)
 import AppKit
+#endif
 
-/// What a strap double-tap (or a wrist-off trigger) does on the Mac.
+/// What a strap double-tap (or a wrist-off trigger) does on the Mac. The enum itself is
+/// cross-platform because it's persisted by `BehaviorStore`; only the *execution* (`MacActions`,
+/// below) is macOS-only.
 enum MacActionKind: String, Codable, CaseIterable, Identifiable {
     case none
     case lockScreen
@@ -30,8 +34,10 @@ enum MacActionKind: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+#if os(macOS)
 /// Mac-side side effects. Sandbox-friendly: Shortcuts run via the URL scheme (Shortcuts.app does the
-/// privileged work), and screen lock uses login.framework's lock entry point.
+/// privileged work), and screen lock uses login.framework's lock entry point. macOS only — there is
+/// no iPhone equivalent for screen-lock / running a named Shortcut on demand.
 enum MacActions {
     /// Lock the screen immediately — the same call the Apple-menu "Lock Screen" uses
     /// (login.framework `SACLockScreenImmediate`, resolved at runtime). Returns false if unavailable,
@@ -58,3 +64,4 @@ enum MacActions {
         NSWorkspace.shared.open(url)
     }
 }
+#endif // os(macOS)

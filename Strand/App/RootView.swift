@@ -24,6 +24,18 @@ enum NavItem: String, CaseIterable, Identifiable, Hashable {
     case support = "Support"
 
     var id: String { rawValue }
+
+    /// Items shown in the sidebar for the current platform. Automations (Mac screen-lock /
+    /// Shortcuts) and Notifications (mirroring installed *Mac* apps to the wrist) are desktop-only
+    /// and have no iPhone equivalent, so they're hidden on iOS.
+    static var visible: [NavItem] {
+        #if os(macOS)
+        allCases
+        #else
+        allCases.filter { $0 != .automation && $0 != .notifications }
+        #endif
+    }
+
     var icon: String {
         switch self {
         case .today: return "circle.hexagongrid.fill"
@@ -60,7 +72,7 @@ struct RootView: View {
     var body: some View {
         NavigationSplitView {
             VStack(spacing: 0) {
-                List(NavItem.allCases, selection: $selection) { item in
+                List(NavItem.visible, selection: $selection) { item in
                     Label(item.rawValue, systemImage: item.icon)
                         .font(.system(size: 13, weight: .medium))
                         .tag(item)
@@ -108,8 +120,18 @@ struct RootView: View {
         case .stress: StressView()
         case .appleHealth: AppleHealthView()
         case .dataSources: DataSourcesView()
-        case .notifications: NotificationSettingsView()
-        case .automation: AutomationsView()
+        case .notifications:
+            #if os(macOS)
+            NotificationSettingsView()
+            #else
+            EmptyView()
+            #endif
+        case .automation:
+            #if os(macOS)
+            AutomationsView()
+            #else
+            EmptyView()
+            #endif
         case .settings: SettingsView()
         case .support: SupportView()
         }

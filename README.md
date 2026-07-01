@@ -4,13 +4,16 @@
 
 <h1 align="center">NOOP</h1>
 
-<p align="center"><b>Your strap. Your data. Your machine. Local-first, no cloud.</b></p>
+<p align="center"><b>Your body's data. Finally yours.</b></p>
+
+<p align="center"><i>Local-first, no cloud, no account, £0 forever.</i></p>
 
 <p align="center">
+  <img alt="Version" src="https://img.shields.io/badge/version-7.7.0-18C98B?style=flat-square">
   <img alt="Platforms" src="https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Android%20%C2%B7%20iOS-18C98B?style=flat-square">
   <img alt="Local first" src="https://img.shields.io/badge/local-first-18C98B?style=flat-square">
   <img alt="Account free" src="https://img.shields.io/badge/account-free-2FE6A8?style=flat-square">
-  <img alt="WHOOP 4 and 5" src="https://img.shields.io/badge/works%20with-WHOOP%204.0%20%26%205.0-8B9690?style=flat-square">
+  <img alt="WHOOP 4 and 5" src="https://img.shields.io/badge/works%20with-WHOOP%204.0%20%26%205.0%2FMG-8B9690?style=flat-square">
 </p>
 
 <p align="center">
@@ -29,10 +32,10 @@ Pre-built apps you can run right now:
 
 | Platform | Build | Notes |
 |---|---|---|
-| **macOS** | `NOOP.app` (see [Releases](../../releases)) | Apple Silicon + Intel. Drag to Applications. |
+| **macOS** | `NOOP.app` (`.zip`, see [Releases](../../releases)) | Universal — Apple Silicon + Intel. Unzip and drag to Applications. |
 | **Android** | `NOOP-full.apk` (see [Releases](../../releases)) | The full app. `minSdk 26` (Android 8+). Sideload — enable "install unknown apps". |
 | **Android (demo)** | `NOOP-demo.apk` | Preloaded with sample data so you can explore every screen with no strap. Installs alongside the full app. |
-| **iOS** | — | The shared library is iOS-ready; the app is on the roadmap. |
+| **iPhone** | Sideload the `.ipa` (see [Releases](../../releases)) | Experimental build. Sideload with **AltStore** or **SideStore** using your own Apple ID. |
 
 Prefer to build it yourself? See [`docs/BUILD.md`](docs/BUILD.md).
 
@@ -40,11 +43,12 @@ Everything runs **offline**. The only feature that ever uses the network is the 
 
 ---
 
-NOOP is a standalone, fully **offline** companion app for WHOOP straps (4.0 and
-5.0). It pairs directly with the strap over Bluetooth, stores everything on your
-own device in SQLite, imports your existing WHOOP and Apple Health history, and
-computes recovery, strain, HRV, and sleep **locally**, with no WHOOP account and
-no WHOOP cloud.
+NOOP is a standalone, fully **offline** companion app for WHOOP straps. It pairs
+directly with the strap over Bluetooth, stores everything on your own device in
+SQLite, imports your existing WHOOP and Apple Health history, and computes
+recovery, strain, HRV, and sleep **locally**, with no WHOOP account and no WHOOP
+cloud. **WHOOP 4.0** is fully supported end to end — the tested path; **WHOOP 5.0
+& MG** read live heart rate today, with deeper metrics building.
 
 It is built on prior open-source reverse-engineering work and exists for one
 reason: to let someone who owns a WHOOP strap read **their own biometric data**
@@ -158,7 +162,14 @@ import required.
 |---|---|
 | **macOS** | ✅ Full app (`Strand/`, SwiftUI, macOS 13+). Pairs over BLE, offloads the strap's history, and scores recovery / strain / sleep on-device. The complete feature set above runs here. |
 | **Android** | ✅ Full app (`android/`, Jetpack Compose, Android 8+). Pairs over BLE, persists and scores on-device, and imports WHOOP / Apple Health / Health Connect. Grab the APK from [Releases](../../releases). |
-| **iOS** | 🟡 Libraries ready. Every package declares `.iOS(.v16)` and UI-framework code is guarded with `#if canImport(UIKit)` / `AppKit`; an iOS app target is planned. |
+| **iPhone** | 🧪 Experimental sideload build. Every package declares `.iOS(.v16)` and UI-framework code is guarded with `#if canImport(UIKit)` / `AppKit`. Install the `.ipa` with **AltStore** or **SideStore** using your own Apple ID. |
+
+WHOOP device coverage:
+
+| Device | Status |
+|---|---|
+| **WHOOP 4.0** | ✅ Fully supported, end to end — the tested path. |
+| **WHOOP 5.0 & MG** | 🟡 Live heart rate today; deeper metrics building. |
 
 ### What to expect when you start
 

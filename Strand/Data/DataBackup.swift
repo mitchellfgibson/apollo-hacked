@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(AppKit)
 import AppKit
+#endif
 import UniformTypeIdentifiers
 import WhoopStore
 
@@ -31,8 +33,9 @@ enum DataBackup {
         case failure(String)
     }
 
-    // MARK: - Export
+    // MARK: - Export (macOS, panel-driven)
 
+    #if os(macOS)
     /// Checkpoint (if the store is reachable) and copy the live database to a user-chosen file.
     ///
     /// - Parameter checkpoint: invoked first to flush the WAL into the main file. Pass
@@ -87,17 +90,13 @@ enum DataBackup {
         }
     }
 
-    // MARK: - Import
+    // MARK: - Import (macOS, panel-driven)
 
     /// Pick a `.sqlite` backup, validate it, snapshot the current DB to a side file, then copy the
     /// backup over the live database path (removing the `-wal`/`-shm` siblings). The store stays
     /// open, so the swapped-in file only takes effect after a relaunch — the caller informs the user.
     @MainActor
     static func runImport() async -> BackupResult {
-        let dbPath: String
-        do { dbPath = try StorePaths.defaultDatabasePath() }
-        catch { return .failure("Couldn't locate the NOOP database. \(error.localizedDescription)") }
-
         let panel = NSOpenPanel()
         panel.title = "Import NOOP backup"
         panel.prompt = "Import"
@@ -107,8 +106,63 @@ enum DataBackup {
         panel.allowedContentTypes = sqliteContentTypes()
 
         guard panel.runModal() == .OK, let source = panel.url else { return .cancelled }
+        return install(from: source, securityScoped: true)
+    }
+    #endif // os(macOS)
 
-        let scoped = source.startAccessingSecurityScopedResource()
+    // MARK: - Export / Import (iOS, SwiftUI file-picker driven)
+    //
+    // On iOS there are no modal panels: `.fileExporter` / `.fileImporter` are view modifiers that
+    // hand the view a destination (export) or a picked source (import) URL. These two entry points
+    // do the platform-independent work; the view supplies the URL.
+
+    /// Prepare a consolidated copy of the database in a temporary directory, ready to hand to
+    /// `.fileExporter`. Returns the temp URL to export, or a `.failure`/`.cancelled` reason.
+    ///
+    /// - Parameter checkpoint: flushes the WAL into the main file first (best-effort), same as macOS.
+    @MainActor
+    static func prepareExportFile(checkpoint: @escaping () async -> Bool) async -> Result<URL, BackupResult> {
+        let dbPath: String
+        do { dbPath = try StorePaths.defaultDatabasePath() }
+        catch { return .failure(.failure("Couldn't locate the NOOP database. \(error.localizedDescription)")) }
+
+        let dbURL = URL(fileURLWithPath: dbPath)
+        guard FileManager.default.fileExists(atPath: dbPath) else {
+            return .failure(.failure("There's no NOOP data to export yet. Import or record some first."))
+        }
+
+        _ = await checkpoint()
+
+        let fm = FileManager.default
+        let tmp = fm.temporaryDirectory.appendingPathComponent(defaultBackupName())
+        do {
+            if fm.fileExists(atPath: tmp.path) { try fm.removeItem(at: tmp) }
+            try fm.copyItem(at: dbURL, to: tmp)
+            return .success(tmp)
+        } catch {
+            return .failure(.failure("Export failed: \(error.localizedDescription)"))
+        }
+    }
+
+    /// Install a `.fileImporter`-picked backup over the live database. The picked URL is
+    /// security-scoped on iOS, so we access it as such.
+    @MainActor
+    static func importPicked(_ source: URL) -> BackupResult {
+        install(from: source, securityScoped: true)
+    }
+
+    // MARK: - Shared install (validate + swap in)
+
+    /// Validate that `source` is a SQLite file, snapshot the current DB to a rollback sidecar, then
+    /// copy `source` over the live database (removing WAL/SHM siblings). Used by both the macOS
+    /// panel path and the iOS file-importer path.
+    @MainActor
+    private static func install(from source: URL, securityScoped: Bool) -> BackupResult {
+        let dbPath: String
+        do { dbPath = try StorePaths.defaultDatabasePath() }
+        catch { return .failure("Couldn't locate the NOOP database. \(error.localizedDescription)") }
+
+        let scoped = securityScoped && source.startAccessingSecurityScopedResource()
         defer { if scoped { source.stopAccessingSecurityScopedResource() } }
 
         // Validate: must be a real SQLite database (magic header "SQLite format 3\0").
@@ -120,7 +174,7 @@ enum DataBackup {
         let dbURL = URL(fileURLWithPath: dbPath)
 
         do {
-            // Snapshot the current DB (+ sidecars) to a timestamped side file so the user can roll back.
+            // Snapshot the current DB to a timestamped side file so the user can roll back.
             var sidecar = dbURL.deletingLastPathComponent()
                 .appendingPathComponent("whoop-replaced-\(timestamp()).sqlite")
             if fm.fileExists(atPath: dbURL.path) {
@@ -161,8 +215,9 @@ enum DataBackup {
     }
 
     /// `.sqlite` UTType if the system knows it, always falling back to the generic database type so
-    /// the panels still open on systems without a `.sqlite` declaration.
-    private static func sqliteContentTypes() -> [UTType] {
+    /// the picker still opens on systems without a `.sqlite` declaration. Used by the macOS panels
+    /// and by the iOS `.fileImporter`.
+    static func sqliteContentTypes() -> [UTType] {
         var types: [UTType] = []
         if let sqlite = UTType(filenameExtension: "sqlite") { types.append(sqlite) }
         types.append(.database)
@@ -185,8 +240,10 @@ enum DataBackup {
         if fm.fileExists(atPath: url.path) { try? fm.removeItem(at: url) }
     }
 
+    #if os(macOS)
     /// Copy `<db>-wal`/`<db>-shm` next to the main backup, under the backup's base name, if they
     /// exist on disk (only reached when the checkpoint didn't run). Best-effort — failures are ignored.
+    /// Only the macOS panel export path needs this (the iOS path checkpoints then copies the single file).
     private static func copySidecarsIfPresent(from dbURL: URL, toMainBackup dest: URL) {
         let fm = FileManager.default
         for suffix in ["-wal", "-shm"] {
@@ -197,4 +254,5 @@ enum DataBackup {
             try? fm.copyItem(at: side, to: target)
         }
     }
+    #endif // os(macOS)
 }

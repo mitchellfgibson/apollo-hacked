@@ -1,7 +1,12 @@
 import Foundation
 import Combine
 import SwiftUI
+#if os(macOS)
 import AppKit
+
+// Mac-app → wrist notification mirroring is macOS-only: it discovers installed *Mac* apps via
+// LaunchServices/NSWorkspace and shows their icons. Nothing outside this feature references these
+// types, so the whole file compiles out on iOS, where the feature isn't offered in the sidebar.
 
 // MARK: - Buzz pattern
 
@@ -195,3 +200,4 @@ final class NotificationSettingsStore: ObservableObject {
         return out
     }
 }
+#endif // os(macOS)

@@ -1,6 +1,10 @@
 import SwiftUI
-import AppKit
 import StrandDesign
+
+// Mac-app → wrist notification mirroring is macOS-only (see NotificationSettingsStore); the screen
+// isn't shown on iOS, so the whole view compiles out there.
+#if os(macOS)
+import AppKit
 
 /// Notifications — choose which Mac apps tap your wrist, and how.
 /// Real app icons via NSWorkspace; per-app on/off + buzz pattern; quiet hours.
@@ -352,4 +356,6 @@ private struct FormToggleRow: View {
         .background(StrandPalette.surfaceBase)
         .preferredColorScheme(.dark)
 }
-#endif
+#endif // DEBUG
+
+#endif // os(macOS)

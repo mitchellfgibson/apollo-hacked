@@ -1,6 +1,7 @@
 import SwiftUI
 import StrandDesign
 import WhoopStore
+import UniformTypeIdentifiers
 
 /// Settings — profile (powers zones / calories / recovery), strap connection, and about.
 /// Grouped cards on surface.raised with a two-column form feel.
@@ -15,9 +16,17 @@ struct SettingsView: View {
     @State private var backupAlertMessage = ""
     @State private var showBackupAlert = false
 
+    #if !os(macOS)
+    // iOS drives backup through SwiftUI file pickers (there are no modal panels). The exporter needs
+    // a prepared document; the importer hands back a picked URL.
+    @State private var showExporter = false
+    @State private var showImporter = false
+    @State private var exportDocument: SQLiteBackupDocument?
+    #endif
+
     var body: some View {
         ScreenScaffold(title: "Settings",
-                       subtitle: "Your numbers, your strap, and how NOOP works. All on this Mac.") {
+                       subtitle: "Your numbers, your strap, and how NOOP works. All on this device.") {
             profileCard
             strapCard
             backupCard
@@ -28,7 +37,53 @@ struct SettingsView: View {
         } message: {
             Text(backupAlertMessage)
         }
+        .modify { content in
+            #if os(macOS)
+            content
+            #else
+            content
+                .fileExporter(isPresented: $showExporter,
+                              document: exportDocument,
+                              contentType: .database,
+                              defaultFilename: exportDocument?.filename ?? "NOOP-backup.sqlite") { result in
+                    finishExport(result)
+                }
+                .fileImporter(isPresented: $showImporter,
+                              allowedContentTypes: DataBackup.sqliteContentTypes(),
+                              allowsMultipleSelection: false) { result in
+                    finishImport(result)
+                }
+            #endif
+        }
     }
+
+    #if !os(macOS)
+    @MainActor private func finishExport(_ result: Result<URL, Error>) {
+        backupBusy = false
+        switch result {
+        case .success:
+            backupAlertTitle = "Backup exported"
+            backupAlertMessage = "Saved. Copy this file to your other device and use Import there to restore everything."
+            showBackupAlert = true
+        case .failure(let error):
+            // A user cancel arrives as a failure with a userCancelled code — treat it as a no-op.
+            if (error as NSError).code == NSUserCancelledError { return }
+            handleBackup(.failure("Export failed: \(error.localizedDescription)"))
+        }
+    }
+
+    @MainActor private func finishImport(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            guard let url = urls.first else { return }
+            backupBusy = true
+            handleBackup(DataBackup.importPicked(url))
+        case .failure(let error):
+            if (error as NSError).code == NSUserCancelledError { return }
+            handleBackup(.failure("Import failed: \(error.localizedDescription)"))
+        }
+    }
+    #endif
 
     // MARK: - Profile
 
@@ -254,18 +309,36 @@ struct SettingsView: View {
 
     private func runExport() {
         backupBusy = true
+        #if os(macOS)
         Task {
             let result = await DataBackup.runExport(checkpoint: { await model.repo.checkpointForBackup() })
             handleBackup(result)
         }
+        #else
+        // Prepare a consolidated file, then present `.fileExporter` (attached below).
+        Task {
+            switch await DataBackup.prepareExportFile(checkpoint: { await model.repo.checkpointForBackup() }) {
+            case .success(let url):
+                exportDocument = SQLiteBackupDocument(url: url)
+                showExporter = true
+            case .failure(let result):
+                handleBackup(result)
+            }
+        }
+        #endif
     }
 
     private func runImport() {
+        #if os(macOS)
         backupBusy = true
         Task {
             let result = await DataBackup.runImport()
             handleBackup(result)
         }
+        #else
+        // Present `.fileImporter` (attached below); it stays un-busy until a file is chosen.
+        showImporter = true
+        #endif
     }
 
     @MainActor

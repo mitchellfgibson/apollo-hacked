@@ -3,12 +3,13 @@ options:
   bundleIdPrefix: com.noopapp
   deploymentTarget:
     macOS: "13.0"
+    iOS: "16.0"
   createIntermediateGroups: true
   groupSortPosition: top
 settings:
   base:
-    MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "7.7.0"
+    CURRENT_PROJECT_VERSION: "7"
     SWIFT_VERSION: "5.0"
     SWIFT_STRICT_CONCURRENCY: minimal
     DEVELOPMENT_TEAM: ""
@@ -64,6 +65,50 @@ targets:
         # distributed (ad-hoc) build. The app uses no JIT / unsigned-exec memory, so it's safe.
         ENABLE_HARDENED_RUNTIME: YES
         COMBINE_HIDPI_IMAGES: YES
+    dependencies:
+      - package: WhoopProtocol
+      - package: WhoopStore
+      - package: StrandAnalytics
+      - package: StrandImport
+      - package: StrandDesign
+  StrandiOS:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    # Same app sources as macOS; platform-specific code is guarded with #if os(macOS) /
+    # #if canImport(AppKit), so the desktop-only features (menu bar, Mac automations,
+    # Mac-app notification mirroring) compile out and the core WHOOP experience remains.
+    sources:
+      - path: Strand
+        excludes:
+          - "Resources/Info.plist"
+          - "Resources/Strand.entitlements"
+          - "Resources/StrandiOS-Info.plist"
+    info:
+      path: Strand/Resources/StrandiOS-Info.plist
+      properties:
+        CFBundleName: NOOP
+        CFBundleDisplayName: NOOP
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        UILaunchScreen: {}
+        UIUserInterfaceStyle: Dark
+        # iPhone-only, portrait. The strap is always with the phone, so offload happens in the
+        # background whenever they're in range — including catching up on 6+ days of buffered history.
+        UIDeviceFamily: [1]
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        # CoreBluetooth: connect to the strap and keep syncing history in the background.
+        NSBluetoothAlwaysUsageDescription: "NOOP connects directly to your WHOOP strap over Bluetooth to read heart rate, R-R intervals, battery, and sensor data locally on your iPhone. Nothing leaves your device."
+        UIBackgroundModes: [bluetooth-central]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.noopapp.noop
+        PRODUCT_NAME: NOOP
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        GENERATE_INFOPLIST_FILE: NO
+        TARGETED_DEVICE_FAMILY: "1"
+        # Sideload-friendly: no team baked in, automatic signing filled in by whoever builds it.
+        CODE_SIGN_STYLE: Automatic
     dependencies:
       - package: WhoopProtocol
       - package: WhoopStore

@@ -192,10 +192,18 @@ final class AppModel: ObservableObject {
     func runMacAction(_ kind: MacActionKind, shortcut: String) {
         switch kind {
         case .none: break
-        case .lockScreen: if !MacActions.lockScreen() { MacActions.runShortcut("Lock Screen") }
         case .buzzBack: buzz(loops: 1)
         case .markMoment: markMoment()
-        case .runShortcut: MacActions.runShortcut(shortcut)
+        // Screen-lock and named Shortcuts are macOS-only; on iOS these actions are inert
+        // (the Automations screen that configures them isn't shown there either).
+        case .lockScreen:
+            #if os(macOS)
+            if !MacActions.lockScreen() { MacActions.runShortcut("Lock Screen") }
+            #endif
+        case .runShortcut:
+            #if os(macOS)
+            MacActions.runShortcut(shortcut)
+            #endif
         }
     }
 
@@ -209,12 +217,15 @@ final class AppModel: ObservableObject {
     }
 
     private func handleWristChange(_ worn: Bool) {
+        // Wear/presence → Mac side effects (lock, run a Shortcut) are macOS-only.
+        #if os(macOS)
         if worn {
             if !behavior.wristOnShortcut.isEmpty { MacActions.runShortcut(behavior.wristOnShortcut) }
         } else {
             if behavior.autoLockOnWristOff, !MacActions.lockScreen() { MacActions.runShortcut("Lock Screen") }
             if !behavior.wristOffShortcut.isEmpty { MacActions.runShortcut(behavior.wristOffShortcut) }
         }
+        #endif
     }
 
     /// HR-zone haptic coaching: buzz when crossing into the top zone (ease off) or back to recovery.

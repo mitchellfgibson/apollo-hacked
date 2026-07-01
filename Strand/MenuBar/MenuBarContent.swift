@@ -3,6 +3,10 @@ import Foundation
 import StrandDesign
 import WhoopStore
 
+// The menu-bar extra is a macOS-only affordance (no iPhone analog); the whole file compiles out
+// on iOS. StrandApp only references these views inside its own `#if os(macOS)` MenuBarExtra scene.
+#if os(macOS)
+
 // MARK: - Menu-Bar Extra (NOOP)
 //
 // A glanceable presence in the macOS menu bar. The label shows a tiny heart-dot
@@ -377,4 +381,6 @@ private func previewEnv(
         .environmentObject(live)
         .environmentObject(model)
 }
-#endif
+#endif // DEBUG
+
+#endif // os(macOS)
