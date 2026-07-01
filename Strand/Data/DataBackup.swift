@@ -21,7 +21,7 @@ enum DataBackup {
 
     // MARK: - Result
 
-    enum BackupResult {
+    enum BackupResult: Error {
         /// Export wrote the backup to `url`.
         case exported(URL)
         /// Import succeeded; a relaunch is required for it to take effect. `sidecar` is where the

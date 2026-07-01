@@ -5,7 +5,26 @@ struct StrandApp: App {
     @StateObject private var model = AppModel()
 
     var body: some Scene {
-        WindowGroup {
+        mainWindow
+
+        // Menu-bar extra: glanceable live HR + a compact popover. macOS only.
+        #if os(macOS)
+        MenuBarExtra {
+            MenuBarContent()
+                .environmentObject(model)
+                .environmentObject(model.repo)
+                .environmentObject(model.live)
+        } label: {
+            MenuBarLabel()
+                .environmentObject(model.repo)
+                .environmentObject(model.live)
+        }
+        .menuBarExtraStyle(.window)
+        #endif
+    }
+
+    private var mainWindow: some Scene {
+        let window = WindowGroup {
             ContentView()
                 .environmentObject(model)
                 .environmentObject(model.live)
@@ -18,21 +37,11 @@ struct StrandApp: App {
                 .preferredColorScheme(.dark)
         }
         #if os(macOS)
-        .windowStyle(.hiddenTitleBar)
-        .defaultSize(width: 1180, height: 820)
-
-        // Menu-bar extra: glanceable live HR + a compact popover. macOS only.
-        MenuBarExtra {
-            MenuBarContent()
-                .environmentObject(model)
-                .environmentObject(model.repo)
-                .environmentObject(model.live)
-        } label: {
-            MenuBarLabel()
-                .environmentObject(model.repo)
-                .environmentObject(model.live)
-        }
-        .menuBarExtraStyle(.window)
+        return window
+            .windowStyle(.hiddenTitleBar)
+            .defaultSize(width: 1180, height: 820)
+        #else
+        return window
         #endif
     }
 }

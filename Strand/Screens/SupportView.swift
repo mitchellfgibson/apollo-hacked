@@ -191,7 +191,11 @@ struct SupportModalOverlay: View {
                 }
                 .shadow(color: Color.black.opacity(0.5), radius: 30, x: 0, y: 14)
         }
+        #if os(macOS)
+        // Esc-to-close is a desktop affordance; `.onExitCommand` is unavailable on iOS,
+        // where the sheet is dismissed by its own Close button / swipe-down instead.
         .onExitCommand { isPresented = false }
+        #endif
         .transition(.opacity)
     }
 }
