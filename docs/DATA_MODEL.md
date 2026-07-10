@@ -1,6 +1,6 @@
 # NOOP — On-Device Data Model
 
-NOOP is a standalone, fully offline companion app for WHOOP straps (4.0 and 5.0). It talks to
+NOOP is a standalone, fully offline tool to own your WHOOP strap's data (4.0 and 5.0). It talks to
 the user's own strap directly over Bluetooth Low Energy — no WHOOP cloud or account
 is involved, and stores everything it decodes locally in a single SQLite database.
 This document describes that on-device database: every table, its columns, natural keys, indexes,

@@ -1,7 +1,7 @@
 # iOS Provisions & Port Plan
 
-This document describes how NOOP — a standalone, fully offline companion app for
-WHOOP straps — is positioned for iOS, what already works, and the concrete plan
+This document describes how NOOP — a standalone, fully offline tool to own your
+WHOOP strap's data — is positioned for iOS, what already works, and the concrete plan
 for a native iOS app target.
 
 > **Not affiliated with WHOOP.** NOOP is an independent, unofficial project. It is

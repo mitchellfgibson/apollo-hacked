@@ -5,7 +5,7 @@ This document specifies the Bluetooth Low Energy (BLE) wire protocol that NOOP u
 frame envelope, checksums, packet/command/event enumerations, the bond handshake, and the
 historical-data offload state machine.
 
-NOOP is a standalone, fully offline companion. It pairs over BLE, decodes the strap's own
+NOOP is a standalone, fully offline tool to own your WHOOP strap's data. It pairs over BLE, decodes the strap's own
 streams on-device, and stores everything locally in SQLite. There is no cloud or account
 involved in any of the exchanges described here.
 

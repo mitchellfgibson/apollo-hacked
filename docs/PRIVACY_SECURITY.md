@@ -6,7 +6,7 @@ against the actual source tree; file paths and identifiers below are real and ca
 be checked.
 
 > **Not affiliated with WHOOP. Not a medical device.** NOOP is an independent,
-> unofficial, local-first companion app. It interoperates with a WHOOP strap that
+> unofficial, local-first tool to own your data. It interoperates with a WHOOP strap that
 > **you own**, reading **your own** biometric data from **your own** device. It is
 > not affiliated with, endorsed by, or connected to WHOOP, Inc. All computed
 > outputs (recovery, strain, HRV, sleep, SpO₂, skin temperature, respiratory rate)

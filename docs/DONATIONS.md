@@ -2,7 +2,7 @@
 
 **NOOP is free, and it stays free. Nothing here is a paywall.**
 
-NOOP is a standalone, fully offline companion app for WHOOP straps (4.0 and
+NOOP is a standalone, fully offline tool to own your WHOOP strap's data (4.0 and
 5.0). It pairs directly with the strap over Bluetooth, stores everything on your
 own device in SQLite, imports your existing WHOOP CSV and Apple Health history,
 and computes recovery, strain, HRV, and sleep locally, with no WHOOP account and

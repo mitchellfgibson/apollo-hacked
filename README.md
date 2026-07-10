@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/banner.svg" alt="NOOP — a local-first companion for WHOOP straps" width="860">
+  <img src="docs/assets/banner.svg" alt="NOOP — own your body's data, read from your WHOOP strap, fully local" width="860">
 </p>
 
 <h1 align="center">NOOP</h1>
@@ -43,11 +43,10 @@ Everything runs **offline**. The only feature that ever uses the network is the 
 
 ---
 
-NOOP is a standalone, fully **offline** companion app for WHOOP straps. It pairs
-directly with the strap over Bluetooth, stores everything on your own device in
-SQLite, imports your existing WHOOP and Apple Health history, and computes
-recovery, strain, HRV, and sleep **locally**, with no WHOOP account and no WHOOP
-cloud. **WHOOP 4.0** is fully supported end to end — the tested path; **WHOOP 5.0
+NOOP is a tool to **own your body's data**. It reads *your own* WHOOP strap
+directly over Bluetooth, stores everything on your own device in SQLite, imports
+your existing WHOOP and Apple Health history, and computes recovery, strain, HRV,
+and sleep **locally** — no WHOOP account, no WHOOP cloud, no subscription. **WHOOP 4.0** is fully supported end to end — the tested path; **WHOOP 5.0
 & MG** read live heart rate today, with deeper metrics building.
 
 It is built on prior open-source reverse-engineering work and exists for one
