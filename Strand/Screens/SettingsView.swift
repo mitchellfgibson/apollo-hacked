@@ -10,6 +10,13 @@ struct SettingsView: View {
     @EnvironmentObject var live: LiveState
     @EnvironmentObject var profile: ProfileStore
 
+    /// Profile is locked (read-only) by default; the user taps Edit to change their numbers.
+    @State private var editingProfile = false
+
+    /// Include imported 2024/2025 history (past) alongside present data. OFF = present only
+    /// (from the June 10 2026 boundary onward). Applied app-wide in Repository.refresh().
+    @AppStorage(HistoryFilter.includePastKey) private var includePastData = true
+
     /// Backup & restore UI state.
     @State private var backupBusy = false
     @State private var backupAlertTitle = ""
@@ -28,9 +35,18 @@ struct SettingsView: View {
         ScreenScaffold(title: "Settings",
                        subtitle: "Your numbers, your strap, and how NOOP works. All on this device.") {
             profileCard
+            sleepDataCard
             strapCard
+            // The old "Data" nav page now lives here — embedded (no scaffold), with env + state intact.
+            DataSourcesView(embedded: true)
             backupCard
-            aboutCard
+
+            // Simple version footer (replaces the old About page).
+            Text("Version 1")
+                .font(StrandFont.footnote)
+                .foregroundStyle(StrandPalette.textTertiary)
+                .frame(maxWidth: .infinity)
+                .padding(.top, 8)
         }
         .alert(backupAlertTitle, isPresented: $showBackupAlert) {
             Button("OK", role: .cancel) { }
@@ -94,49 +110,86 @@ struct SettingsView: View {
             blurb: "These power your heart-rate zones, calorie estimates and recovery baselines. Keep them accurate."
         ) {
             VStack(spacing: 0) {
+                // Edit / Done toggle — the whole card is read-only until the user opts in.
+                HStack {
+                    Spacer()
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) { editingProfile.toggle() }
+                    } label: {
+                        Label(editingProfile ? "Done" : "Edit",
+                              systemImage: editingProfile ? "checkmark" : "pencil")
+                            .font(StrandFont.caption)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(StrandPalette.accent)
+                    .accessibilityLabel(editingProfile ? "Done editing profile" : "Edit profile")
+                }
+                .padding(.bottom, 4)
+
                 FormRow(label: "Age") {
-                    HStack(spacing: 12) {
-                        Text("\(profile.age)")
-                            .font(StrandFont.bodyNumber)
-                            .foregroundStyle(StrandPalette.textPrimary)
-                            .frame(minWidth: 28, alignment: .trailing)
-                        Stepper("Age", value: $profile.age, in: 13...100)
-                            .labelsHidden()
-                            .accessibilityLabel("Age, \(profile.age) years")
+                    if editingProfile {
+                        HStack(spacing: 12) {
+                            Text("\(profile.age)")
+                                .font(StrandFont.bodyNumber)
+                                .foregroundStyle(StrandPalette.textPrimary)
+                                .frame(minWidth: 28, alignment: .trailing)
+                            Stepper("Age", value: $profile.age, in: 13...100)
+                                .labelsHidden()
+                                .accessibilityLabel("Age, \(profile.age) years")
+                        }
+                    } else {
+                        readOnlyValue("\(profile.age)", unit: "yrs")
                     }
                 }
                 rowDivider
                 FormRow(label: "Sex") {
-                    Picker("Sex", selection: $profile.sex) {
-                        Text("Male").tag("male")
-                        Text("Female").tag("female")
-                        Text("Non-binary").tag("nonbinary")
+                    if editingProfile {
+                        Picker("Sex", selection: $profile.sex) {
+                            Text("Male").tag("male")
+                            Text("Female").tag("female")
+                            Text("Non-binary").tag("nonbinary")
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
+                        .fixedSize()
+                        .accessibilityLabel("Sex")
+                    } else {
+                        readOnlyValue(sexLabel(profile.sex))
                     }
-                    .labelsHidden()
-                    .pickerStyle(.segmented)
-                    .fixedSize()
-                    .accessibilityLabel("Sex")
                 }
                 rowDivider
                 FormRow(label: "Weight") {
-                    measureField(value: $profile.weightKg, unit: "kg",
-                                 range: 30...250, step: 0.5, format: "%.1f",
-                                 accessibility: "Weight in kilograms")
+                    if editingProfile {
+                        measureField(value: $profile.weightKg, unit: "kg",
+                                     range: 30...250, step: 0.5, format: "%.1f",
+                                     accessibility: "Weight in kilograms")
+                    } else {
+                        readOnlyValue(String(format: "%.1f", profile.weightKg), unit: "kg")
+                    }
                 }
                 rowDivider
                 FormRow(label: "Height") {
-                    measureField(value: $profile.heightCm, unit: "cm",
-                                 range: 120...230, step: 1, format: "%.0f",
-                                 accessibility: "Height in centimetres")
+                    if editingProfile {
+                        measureField(value: $profile.heightCm, unit: "cm",
+                                     range: 120...230, step: 1, format: "%.0f",
+                                     accessibility: "Height in centimetres")
+                    } else {
+                        readOnlyValue(String(format: "%.0f", profile.heightCm), unit: "cm")
+                    }
                 }
                 rowDivider
                 FormRow(label: "Max heart rate") {
                     VStack(alignment: .trailing, spacing: 6) {
-                        HStack(spacing: 8) {
-                            hrMaxField
-                            Text("bpm")
-                                .font(StrandFont.caption)
-                                .foregroundStyle(StrandPalette.textTertiary)
+                        if editingProfile {
+                            HStack(spacing: 8) {
+                                hrMaxField
+                                Text("bpm")
+                                    .font(StrandFont.caption)
+                                    .foregroundStyle(StrandPalette.textTertiary)
+                            }
+                        } else {
+                            readOnlyValue(profile.hrMaxOverride > 0 ? "\(profile.hrMaxOverride)" : "\(profile.hrMax)",
+                                          unit: "bpm")
                         }
                         Text(profile.hrMaxOverride > 0
                              ? "Manual override"
@@ -148,6 +201,30 @@ struct SettingsView: View {
                     }
                 }
             }
+        }
+    }
+
+    /// A locked, read-only profile value: tabular number + optional unit, no controls.
+    private func readOnlyValue(_ text: String, unit: String? = nil) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 4) {
+            Text(text)
+                .font(StrandFont.bodyNumber)
+                .foregroundStyle(StrandPalette.textPrimary)
+            if let unit {
+                Text(unit)
+                    .font(StrandFont.caption)
+                    .foregroundStyle(StrandPalette.textTertiary)
+            }
+        }
+    }
+
+    /// Human label for the stored sex tag.
+    private func sexLabel(_ tag: String) -> String {
+        switch tag {
+        case "male": return "Male"
+        case "female": return "Female"
+        case "nonbinary": return "Non-binary"
+        default: return tag.capitalized
         }
     }
 
@@ -187,6 +264,40 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - History (past / present data)
+
+    /// The app-wide past/present filter. ON = your imported 2024/2025 history is shown alongside
+    /// present data; OFF = present only (from the June 10 2026 boundary onward). Flipping it
+    /// re-filters every screen by reloading the repository.
+    private var sleepDataCard: some View {
+        SettingsSection(
+            icon: "clock.arrow.circlepath",
+            title: "History",
+            blurb: "Include your imported history from before \(HistoryFilter.cutoverLabel), or show only present data from then on. Applies everywhere — Today, Trends, Sleep and more."
+        ) {
+            VStack(spacing: 0) {
+                FormRow(label: "Include past data") {
+                    Toggle("", isOn: $includePastData)
+                        .labelsHidden()
+                        .tint(StrandPalette.accent)
+                        .accessibilityLabel("Include past data before \(HistoryFilter.cutoverLabel)")
+                        .onChange(of: includePastData) { _ in
+                            // Re-filter the whole app immediately.
+                            Task { await model.repo.refresh() }
+                        }
+                }
+                rowDivider
+                FormRow(label: "Showing") {
+                    readOnlyValue(includePastData ? "Past + present" : "Present only")
+                }
+                rowDivider
+                FormRow(label: "Present starts") {
+                    readOnlyValue(HistoryFilter.cutoverLabel)
+                }
+            }
+        }
+    }
+
     // MARK: - Strap
 
     private var strapCard: some View {
@@ -203,6 +314,14 @@ struct SettingsView: View {
                                   tone: batteryTone(pct), showsDot: false)
                     }
                     Spacer(minLength: 0)
+                    // Data-sync circle: slowly fills as we catch up on the strap's stored history.
+                    // Full = "live" (caught up).
+                    VStack(spacing: 3) {
+                        SyncRing(progress: live.syncProgress, size: 40)
+                        Text(live.isLive ? "Live" : "Syncing")
+                            .font(StrandFont.caption)
+                            .foregroundStyle(live.isLive ? StrandPalette.accent : StrandPalette.textTertiary)
+                    }
                 }
                 Text(strapStatusDetail)
                     .font(StrandFont.subhead)
@@ -362,78 +481,6 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - About
-
-    private var aboutCard: some View {
-        SettingsSection(
-            icon: "info.circle.fill",
-            title: "About",
-            blurb: "NOOP — all your data, none of the cloud."
-        ) {
-            VStack(alignment: .leading, spacing: 16) {
-                HStack(spacing: 10) {
-                    Text("NOOP")
-                        .font(StrandFont.title2)
-                        .foregroundStyle(StrandPalette.textPrimary)
-                    StatePill("v0.1.0", tone: .neutral, showsDot: false)
-                }
-
-                Text("A standalone macOS companion for your WHOOP. Everything stays on this Mac — your history, your live stream, your numbers. Nothing is uploaded.")
-                    .font(StrandFont.subhead)
-                    .foregroundStyle(StrandPalette.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                // Medical disclaimer
-                HStack(alignment: .top, spacing: 10) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(StrandPalette.statusWarning)
-                        .font(.system(size: 13))
-                        .accessibilityHidden(true)
-                    Text("NOOP is not a medical device. It is for informational and personal-insight purposes only and is not intended to diagnose, treat, cure or prevent any condition. Talk to a clinician for medical advice.")
-                        .font(StrandFont.footnote)
-                        .foregroundStyle(StrandPalette.textSecondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .padding(12)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(StrandPalette.surfaceInset,
-                            in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .stroke(StrandPalette.statusWarning.opacity(0.25), lineWidth: 1)
-                )
-
-                rowDivider
-
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Built on").strandOverline()
-                    attribution(repo: "johnmiddleton12/my-whoop", note: "WHOOP 4.0 protocol")
-                    attribution(repo: "b-nnett/goose", note: "WHOOP 5.0 protocol")
-                }
-
-                Text("Open-source BLE reverse-engineering work. Thank you.")
-                    .font(StrandFont.footnote)
-                    .foregroundStyle(StrandPalette.textTertiary)
-            }
-        }
-    }
-
-    private func attribution(repo: String, note: String) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: "chevron.right")
-                .font(.system(size: 9, weight: .semibold))
-                .foregroundStyle(StrandPalette.accent)
-                .accessibilityHidden(true)
-            Text(repo)
-                .font(StrandFont.mono(12))
-                .foregroundStyle(StrandPalette.textPrimary)
-            Text("· \(note)")
-                .font(StrandFont.footnote)
-                .foregroundStyle(StrandPalette.textTertiary)
-        }
-        .accessibilityElement(children: .combine)
-    }
-
     // MARK: - Shared bits
 
     private var rowDivider: some View {
@@ -507,6 +554,6 @@ private struct FormRow<Control: View>: View {
         .environmentObject(model.profile)
         .frame(width: 720, height: 900)
         .background(StrandPalette.surfaceBase)
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(.light)
 }
 #endif

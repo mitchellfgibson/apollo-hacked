@@ -199,6 +199,6 @@ public struct StrainGauge: View {
     }
     .padding(40)
     .background(StrandPalette.surfaceBase)
-    .preferredColorScheme(.dark)
+    .preferredColorScheme(.light)
 }
 #endif

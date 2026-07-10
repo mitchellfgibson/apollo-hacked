@@ -700,13 +700,13 @@ private func appleHealthPreviewData() -> AppleHealthView.PreviewData {
     AppleHealthView(previewData: appleHealthPreviewData())
         .environmentObject(Repository(deviceId: "preview"))
         .frame(width: 920, height: 980)
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(.light)
 }
 
 #Preview("Apple Health — empty") {
     AppleHealthView(previewData: .init(rows: [], workoutCount: 0, series: [:]))
         .environmentObject(Repository(deviceId: "preview"))
         .frame(width: 920, height: 600)
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(.light)
 }
 #endif

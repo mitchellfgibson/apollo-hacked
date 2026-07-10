@@ -9,35 +9,49 @@ struct DataSourcesView: View {
     @State private var picking = false
     @State private var pickingApple = false
 
+    /// When true, render only the importer cards (no screen scaffold) — used to embed this inside
+    /// the Settings screen, where the surrounding scaffold already exists.
+    var embedded = false
+
     var body: some View {
-        ScreenScaffold(title: "Data Sources",
-                       subtitle: "Everything stays on this Mac. Bring your history in once, then it's yours.") {
-            // Each importer lives on its OWN card. Two `.fileImporter` modifiers on the
-            // same view silently collapse to one in SwiftUI — which is why the WHOOP
-            // button used to do nothing while Apple Health worked (issue #5).
-            whoopCard
-                .fileImporter(isPresented: $picking,
-                              allowedContentTypes: [.zip, .folder],
-                              allowsMultipleSelection: false) { result in
-                    if case .success(let urls) = result, let url = urls.first {
-                        model.importWhoop(url: url)
-                    }
-                }
-            appleHealthCard
-                .fileImporter(isPresented: $pickingApple,
-                              allowedContentTypes: [.zip, .folder],
-                              allowsMultipleSelection: false) { result in
-                    if case .success(let urls) = result, let url = urls.first {
-                        model.importAppleHealth(url: url)
-                    }
-                }
-            liveCard
+        if embedded {
+            VStack(spacing: 16) { sourceCards }
+        } else {
+            ScreenScaffold(title: "Data Sources",
+                           subtitle: "Everything stays on this Mac. Bring your history in once, then it's yours.") {
+                sourceCards
+            }
         }
+    }
+
+    /// The importer cards WITHOUT the screen scaffold — so this content can be embedded inside the
+    /// Settings "Data" section as well as shown on its own (if the standalone page is ever restored).
+    @ViewBuilder var sourceCards: some View {
+        // Each importer lives on its OWN card. Two `.fileImporter` modifiers on the
+        // same view silently collapse to one in SwiftUI — which is why the WHOOP
+        // button used to do nothing while Apple Health worked (issue #5).
+        whoopCard
+            .fileImporter(isPresented: $picking,
+                          allowedContentTypes: [.zip, .folder],
+                          allowsMultipleSelection: false) { result in
+                if case .success(let urls) = result, let url = urls.first {
+                    model.importWhoop(url: url)
+                }
+            }
+        appleHealthCard
+            .fileImporter(isPresented: $pickingApple,
+                          allowedContentTypes: [.zip, .folder],
+                          allowsMultipleSelection: false) { result in
+                if case .success(let urls) = result, let url = urls.first {
+                    model.importAppleHealth(url: url)
+                }
+            }
+        liveCard
     }
 
     private var whoopCard: some View {
         card(title: "WHOOP Export", icon: "square.and.arrow.down.fill",
-             subtitle: "Import your full WHOOP history — recovery, strain, sleep, workouts — from a data export (.zip). Works for WHOOP 4.0, 5.0 and MG. Get one at app.whoop.com → Data Management.") {
+             subtitle: "Import your full WHOOP history — recovery, strain, sleep, workouts — from a data export (.zip). Works for WHOOP 5.0 and MG. Get one at app.whoop.com → Data Management.") {
             HStack(spacing: 12) {
                 Button {
                     picking = true

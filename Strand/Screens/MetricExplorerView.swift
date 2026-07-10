@@ -108,6 +108,9 @@ struct MetricExplorerView: View {
     @EnvironmentObject var repo: Repository
     /// metric.id → whether its series is empty (loaded once, lazily).
     @State private var emptyByID: [String: Bool] = [:]
+    /// The past/present toggle. Observed so the empty-probe re-runs when it flips (a metric that had
+    /// only past data becomes empty under "present only", and vice-versa).
+    @AppStorage(HistoryFilter.includePastKey) private var includePastData = true
 
     var body: some View {
         NavigationStack {
@@ -142,7 +145,7 @@ struct MetricExplorerView: View {
                 MetricDetailView(metric: metric)
             }
         }
-        .task { await probeEmptiness() }
+        .task(id: includePastData) { await probeEmptiness() }
     }
 
     /// One lightweight pass to learn which metrics have no series, so rows can flag
@@ -175,14 +178,9 @@ private struct MetricRow: View {
             }
             .frame(width: 34, height: 34)
 
-            VStack(alignment: .leading, spacing: 1) {
-                Text(metric.title)
-                    .font(StrandFont.body)
-                    .foregroundStyle(StrandPalette.textPrimary)
-                Text(metric.source == "apple-health" ? "Apple Health" : "Whoop")
-                    .font(StrandFont.footnote)
-                    .foregroundStyle(StrandPalette.textTertiary)
-            }
+            Text(metric.title)
+                .font(StrandFont.body)
+                .foregroundStyle(StrandPalette.textPrimary)
 
             Spacer(minLength: 8)
 
@@ -219,6 +217,8 @@ private struct MetricRow: View {
 struct MetricDetailView: View {
     let metric: MetricDescriptor
     @EnvironmentObject var repo: Repository
+    /// Past/present toggle — observed so the series reloads when it flips.
+    @AppStorage(HistoryFilter.includePastKey) private var includePastData = true
 
     @State private var range: ExploreRange = .month
     /// Full ascending series for this metric — ALL history.
@@ -318,7 +318,7 @@ struct MetricDetailView: View {
         }
         .background(StrandPalette.surfaceBase)
         .navigationTitle(metric.title)
-        .task(id: metric.id) { await load() }
+        .task(id: "\(metric.id)|\(includePastData)") { await load() }
         // Range changes the window, hence the correlation inputs — recompute the
         // cached scan rather than letting `correlationCard` run it inside body.
         .onChange(of: range) { _ in recomputeCorrelations() }
@@ -593,7 +593,7 @@ private func explorerPreviewRepo() -> Repository {
     MetricExplorerView()
         .environmentObject(explorerPreviewRepo())
         .frame(width: 900, height: 820)
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(.light)
 }
 
 #Preview("Metric Detail") {
@@ -602,6 +602,6 @@ private func explorerPreviewRepo() -> Repository {
     }
     .environmentObject(explorerPreviewRepo())
     .frame(width: 900, height: 820)
-    .preferredColorScheme(.dark)
+    .preferredColorScheme(.light)
 }
 #endif

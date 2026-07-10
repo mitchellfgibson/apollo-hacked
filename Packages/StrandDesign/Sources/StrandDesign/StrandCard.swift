@@ -99,6 +99,6 @@ public extension View {
     .padding(28)
     .frame(width: 420, height: 360)
     .background(StrandPalette.surfaceBase)
-    .preferredColorScheme(.dark)
+    .preferredColorScheme(.light)
 }
 #endif

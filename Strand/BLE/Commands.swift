@@ -32,6 +32,10 @@ public enum WhoopCommand: UInt8, CaseIterable {
     /// the device's preset table). patternId indexes the device's preset patterns (GET_ALL_HAPTICS_PATTERN
     /// reports 7 on harvard); the official app fires id=2. Safe/reversible — just buzzes the motor.
     case runHapticsPattern     = 79
+    /// WHOOP 5.0 / MG ("Maverick") haptic command. The WHOOP 4 `runHapticsPattern` (79) is
+    /// acknowledged by an MG strap but does NOT drive its motor — the 5/MG firmware uses this
+    /// dedicated command instead. Payload format is being determined empirically. Safe/reversible.
+    case runHapticPatternMaverick = 19
     /// Stop an in-progress haptic pattern. Payload `[0x00]`. Safe/reversible.
     case stopHaptics           = 122
     /// The REAL control for the type-43 "R10/R11" realtime-raw stream (payload [0x01]=on / [0x00]=off).
@@ -78,6 +82,7 @@ public enum WhoopCommand: UInt8, CaseIterable {
         case .toggleIMUMode:         return "Toggle IMU Mode"
         case .enableOpticalData:     return "Enable Optical Data"
         case .runHapticsPattern:     return "Run Haptics Pattern"
+        case .runHapticPatternMaverick: return "Run Haptic Pattern (Maverick)"
         case .stopHaptics:           return "Stop Haptics"
         case .sendR10R11Realtime:    return "R10/R11 Realtime (raw stream)"
         case .setAlarmTime:          return "Set Alarm Time"
@@ -126,5 +131,15 @@ public enum WhoopCommand: UInt8, CaseIterable {
             UInt8((trailer >> 24) & 0xFF),
         ]
         return [0xAA] + lenBytes + [headerCRC] + inner + trailerBytes
+    }
+
+    /// Build a complete WHOOP 5.0 / MG ("puffin") COMMAND packet for char fd4b0002.
+    ///
+    /// Delegates to `puffinCommandFrame`, which pads the inner record to a 4-byte boundary before
+    /// computing the declared length + CRC32 — REQUIRED for non-4-aligned payloads like the 12-byte
+    /// maverick haptic (inner 15 → 16). Without the pad the strap rejects the frame. (Ported from the
+    /// verified sibling codebase; replaces the earlier unpadded builder that silently mis-sized these.)
+    public func frameWhoop5(seq: UInt8, payload: [UInt8] = [0x00]) -> [UInt8] {
+        puffinCommandFrame(cmd: rawValue, seq: seq, payload: payload, type: Self.commandType)
     }
 }

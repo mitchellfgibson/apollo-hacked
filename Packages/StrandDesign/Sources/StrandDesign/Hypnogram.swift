@@ -263,6 +263,6 @@ private func sampleNight() -> [SleepInterval] {
     .padding(28)
     .frame(width: 720, height: 340)
     .background(StrandPalette.surfaceBase)
-    .preferredColorScheme(.dark)
+    .preferredColorScheme(.light)
 }
 #endif

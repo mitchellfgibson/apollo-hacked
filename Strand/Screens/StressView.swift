@@ -708,12 +708,12 @@ private struct StressPreviewHarness: View {
 #Preview("Stress — HIGH") {
     StressPreviewHarness(score: 2.4)
         .frame(width: 720, height: 1000)
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(.light)
 }
 
 #Preview("Stress — LOW") {
     StressPreviewHarness(score: 0.6)
         .frame(width: 720, height: 1000)
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(.light)
 }
 #endif

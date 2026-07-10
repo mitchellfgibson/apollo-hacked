@@ -354,7 +354,7 @@ private struct FormToggleRow: View {
         .environmentObject(model.live)
         .frame(width: 760, height: 940)
         .background(StrandPalette.surfaceBase)
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(.light)
 }
 #endif // DEBUG
 

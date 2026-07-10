@@ -62,8 +62,19 @@ final class Repository: ObservableObject {
         let impSleep = (try? await store.sleepSessions(deviceId: deviceId, from: lo, to: hi, limit: 4000)) ?? []
         let compSleep = (try? await store.sleepSessions(deviceId: computedDeviceId, from: lo, to: hi, limit: 4000)) ?? []
 
-        self.days = Self.mergeDaily(imported: imported, computed: computed)
-        self.sleeps = Self.mergeSleep(imported: impSleep, computed: compSleep)
+        let mergedDays = Self.mergeDaily(imported: imported, computed: computed)
+        let mergedSleeps = Self.mergeSleep(imported: impSleep, computed: compSleep)
+
+        // App-wide past/present filter (June 10 2026 boundary). When the user turns OFF
+        // "include past data", drop everything before the cutover so every screen shows
+        // present-only. ON = past + present (no filtering).
+        if HistoryFilter.includePast {
+            self.days = mergedDays
+            self.sleeps = mergedSleeps
+        } else {
+            self.days = mergedDays.filter { HistoryFilter.isPresent(day: $0.day) }
+            self.sleeps = mergedSleeps.filter { HistoryFilter.isPresent(sessionStartTs: $0.startTs) }
+        }
         self.loaded = true
     }
 
@@ -98,6 +109,24 @@ final class Repository: ObservableObject {
         return (try? await store.hrSamples(deviceId: deviceId, from: from, to: to, limit: limit)) ?? []
     }
 
+    /// Heart-rate samples across a night's window, merged from BOTH the imported device id and
+    /// the live-capture id (`deviceId + "-noop"`), de-duplicated by timestamp and sorted. Live
+    /// nights get real HR-over-time here; imported-only nights return whatever the import carried
+    /// (typically empty — WHOOP exports have no per-epoch HR). Used by the Sleep HR chart.
+    // A full night at ~1 Hz is ~30–40k samples; the old 20k cap truncated long nights, so the HR
+    // trace stopped partway across the chart (the tail was ORDER BY ts ASC LIMIT-dropped). 200k
+    // comfortably holds a 24h+ window at 2 Hz so the trace always spans the whole night.
+    func nightHRSamples(from: Int, to: Int, limit: Int = 200_000) async -> [HRSample] {
+        guard let store = await ensureStore() else { return [] }
+        let imported = (try? await store.hrSamples(deviceId: deviceId, from: from, to: to, limit: limit)) ?? []
+        let live = (try? await store.hrSamples(deviceId: computedDeviceId, from: from, to: to, limit: limit)) ?? []
+        guard !imported.isEmpty || !live.isEmpty else { return [] }
+        var byTs: [Int: HRSample] = [:]
+        for s in imported { byTs[s.ts] = s }
+        for s in live { byTs[s.ts] = s }   // live wins on collision
+        return byTs.values.sorted { $0.ts < $1.ts }
+    }
+
     func sleepSessions(from: Int, to: Int, limit: Int = 100) async -> [CachedSleepSession] {
         guard let store = await ensureStore() else { return [] }
         return (try? await store.sleepSessions(deviceId: deviceId, from: from, to: to, limit: limit)) ?? []
@@ -106,13 +135,17 @@ final class Repository: ObservableObject {
     // MARK: - Metric explorer reads (generic substrate)
 
     /// Daily series for any metric key from a given source ("my-whoop" / "apple-health").
+    /// Honors the app-wide past/present filter: when "include past data" is OFF, drops every point
+    /// before the cutover — the Explore page reads through here, so without this it showed full
+    /// history regardless of the Settings toggle (the toggle only filtered `days`/`sleeps`).
     func series(key: String, source: String, days: Int = 4000) async -> [(day: String, value: Double)] {
         guard let store = await ensureStore() else { return [] }
         let now = Date()
         let from = Self.dayString(now.addingTimeInterval(-Double(days) * 86_400))
         let to = Self.dayString(now.addingTimeInterval(86_400))
         let pts = (try? await store.metricSeries(deviceId: source, key: key, from: from, to: to)) ?? []
-        return pts.map { ($0.day, $0.value) }
+        let mapped = pts.map { ($0.day, $0.value) }
+        return HistoryFilter.includePast ? mapped : mapped.filter { HistoryFilter.isPresent(day: $0.0) }
     }
 
     func availableKeys(source: String) async -> [String] {

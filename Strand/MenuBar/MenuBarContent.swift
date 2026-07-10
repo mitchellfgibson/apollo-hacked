@@ -129,7 +129,7 @@ public struct MenuBarContent: View {
         .padding(16)
         .frame(width: 268)
         .background(StrandPalette.surfaceOverlay)
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(.light)
     }
 
     // MARK: Header
@@ -358,7 +358,7 @@ private func previewEnv(
     .environmentObject(repo)
     .environmentObject(live)
     .environmentObject(model)
-    .preferredColorScheme(.dark)
+    .preferredColorScheme(.light)
 }
 
 #Preview("Popover — streaming") {

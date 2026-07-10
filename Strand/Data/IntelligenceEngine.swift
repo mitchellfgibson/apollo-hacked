@@ -54,17 +54,27 @@ final class IntelligenceEngine: ObservableObject {
         let baselines = AnalyticsEngine.ProfileBaselines(hrv: hrvBase, restingHR: rhrBase)
 
         let maxHR = profile.hrMaxOverride > 0 ? Double(profile.hrMaxOverride) : nil
-        let now = Int(Date().timeIntervalSince1970)
+        // Anchor every day to LOCAL MIDNIGHT (00:00 in the wearer's zone), not `now − N×86400`.
+        // The old anchor floated with the current time-of-day, so `dayStart` was never a real day
+        // boundary — strain (a full-calendar-day metric) was summed over a 42h window offset from
+        // midnight, smearing effort across days. Local midnight makes `[dayStart, dayStart+86400)`
+        // the actual calendar day, matching the importers.
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = .current
+        let todayMidnight = Int(cal.startOfDay(for: Date()).timeIntervalSince1970)
         var out: [Computed] = []
         var dailies: [DailyMetric] = []
         var cachedSleep: [CachedSleepSession] = []
 
         for offset in 0..<maxDays {
-            let dayStart = now - offset * 86_400
-            let day = AnalyticsEngine.dayString(dayStart)
-            // Read a generous window around the night that ends on `day`; the stager finds the span.
-            let from = dayStart - 30 * 3_600
-            let to = dayStart + 12 * 3_600
+            let dayStart = todayMidnight - offset * 86_400   // local midnight of the target day
+            let day = AnalyticsEngine.dayString(dayStart + 3_600)   // +1h avoids DST-edge day slip
+            // Read a generous window that covers BOTH this calendar day (for strain) AND the night
+            // that ENDS on this day (for sleep — bedtime the previous evening through late morning).
+            // analyzeDay slices strain to [dayStart, dayStart+24h) itself; the wider read just feeds
+            // the sleep stager the full overnight span.
+            let from = dayStart - 12 * 3_600     // previous-evening bedtime
+            let to = dayStart + 24 * 3_600       // end of this calendar day
 
             let hr = (try? await store.hrSamples(deviceId: deviceId, from: from, to: to, limit: 200_000)) ?? []
             guard hr.count >= 200 else { continue }   // need real raw data, not a stray sample
@@ -72,7 +82,8 @@ final class IntelligenceEngine: ObservableObject {
             let resp = (try? await store.respSamples(deviceId: deviceId, from: from, to: to, limit: 200_000)) ?? []
             let grav = (try? await store.gravitySamples(deviceId: deviceId, from: from, to: to, limit: 200_000)) ?? []
 
-            let res = AnalyticsEngine.analyzeDay(day: day, hr: hr, rr: rr, resp: resp, gravity: grav,
+            let res = AnalyticsEngine.analyzeDay(day: day, dayStart: dayStart,
+                                                 hr: hr, rr: rr, resp: resp, gravity: grav,
                                                  profile: up, baselines: baselines, maxHROverride: maxHR)
             out.append(Computed(day: day, recovery: res.recovery, strain: res.strain,
                                 sleepMin: res.daily.totalSleepMin, hrv: res.daily.avgHrv,

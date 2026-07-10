@@ -73,7 +73,7 @@ private struct MotionDemo: View {
         }
         .frame(width: 360, height: 320)
         .background(StrandPalette.surfaceBase)
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(.light)
     }
 }
 

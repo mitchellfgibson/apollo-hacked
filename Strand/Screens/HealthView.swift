@@ -296,6 +296,6 @@ private struct Vital: Identifiable {
         .environmentObject(live)
         .environmentObject(ProfileStore())
         .frame(width: 900, height: 760)
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(.light)
 }
 #endif

@@ -9,19 +9,28 @@ final class AnalyticsEngineTests: XCTestCase {
         XCTAssertEqual(StrandAnalytics.version, "0.1.0")
     }
 
-    func testDayStringUTC() {
-        // 2021-01-01 00:00:00 UTC == 1609459200.
-        XCTAssertEqual(AnalyticsEngine.dayString(1_609_459_200), "2021-01-01")
+    func testDayStringLocal() {
+        // dayString buckets by the device's LOCAL calendar (to line up with the importers), not UTC.
+        // Assert against a local-zone formatter so the test is correct in any timezone.
+        let ts = 1_609_459_200   // 2021-01-01 00:00:00 UTC
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = .current
+        fmt.dateFormat = "yyyy-MM-dd"
+        let expected = fmt.string(from: Date(timeIntervalSince1970: TimeInterval(ts)))
+        XCTAssertEqual(AnalyticsEngine.dayString(ts), expected)
     }
 
-    /// Build a still, low-HR night ending on a known UTC day.
+    /// Build a still, low-HR night ending on a known LOCAL day. Uses the device's current timezone
+    /// to match `AnalyticsEngine.dayString`, which buckets by local calendar (so computed days line
+    /// up with the importers). Anchoring at 06:00 LOCAL keeps the night's end firmly inside `endDay`.
     private func night(endDay: String, hours: Int) -> (start: Int, end: Int,
                                                        hr: [HRSample], rr: [RRInterval],
                                                        gravity: [GravitySample]) {
-        // Pick an end timestamp on `endDay` at 06:00 UTC.
+        // Pick an end timestamp on `endDay` at 06:00 local time.
         let fmt = DateFormatter()
         fmt.locale = Locale(identifier: "en_US_POSIX")
-        fmt.timeZone = TimeZone(identifier: "UTC")
+        fmt.timeZone = .current
         fmt.dateFormat = "yyyy-MM-dd"
         let dayMidnight = Int(fmt.date(from: endDay)!.timeIntervalSince1970)
         let end = dayMidnight + 6 * 3600

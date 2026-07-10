@@ -799,6 +799,6 @@ private func comparePreviewRepo() -> Repository {
     CompareView()
         .environmentObject(comparePreviewRepo())
         .frame(width: 920, height: 860)
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(.light)
 }
 #endif

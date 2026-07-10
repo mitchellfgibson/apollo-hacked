@@ -13,7 +13,7 @@ public final class FrameRouter {
     /// use the CRC16/offset-8 envelope; the biometric field decode for puffin is still a stub, so
     /// WHOOP 5 custom frames currently surface only their envelope (live HR/battery come from the
     /// standard 0x2A37/0x2A19 profiles instead).
-    var family: DeviceFamily = .whoop4
+    var family: DeviceFamily = .whoop5
 
     public init(state: LiveState) {
         self.state = state

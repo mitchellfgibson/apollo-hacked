@@ -542,13 +542,13 @@ private func previewWorkoutRows() -> [WorkoutRow] {
     WorkoutsView(previewRows: previewWorkoutRows())
         .environmentObject(Repository(deviceId: "preview"))
         .frame(width: 1040, height: 940)
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(.light)
 }
 
 #Preview("Workouts — empty") {
     WorkoutsView(previewRows: [])
         .environmentObject(Repository(deviceId: "preview"))
         .frame(width: 1040, height: 600)
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(.light)
 }
 #endif

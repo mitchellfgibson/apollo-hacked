@@ -9,21 +9,43 @@ import SwiftUI
 
 public enum StrandFont {
 
-    // MARK: Scale (§9.2)
-
-    /// Display 64–80 / Semibold — the recovery ring number. Tabular digits.
-    public static func display(_ size: CGFloat = 72) -> Font {
-        .system(size: size, weight: .semibold, design: .default).monospacedDigit()
+    // MARK: Custom face — Noto Serif Display (bundled, registered via Info.plist)
+    //
+    // A high-contrast serif display face used for headings/titles/display numbers. The
+    // PostScript names must match the bundled TTFs exactly, or SwiftUI silently falls back
+    // to the system font. Body/caption and all mono + numeric styles stay on SF Pro: a serif
+    // breaks tabular-digit alignment for live values and hurts small-size legibility.
+    public enum Serif {
+        public static let regular = "NotoSerifDisplay-Regular"
+        public static let bold    = "NotoSerifDisplay-Bold"
     }
 
-    /// Title1 28 / Bold.
-    public static let title1 = Font.system(size: 28, weight: .bold)
+    /// Noto Serif Display Bold at a given size (scales with Dynamic Type via `relativeTo`).
+    public static func serifBold(_ size: CGFloat, relativeTo style: Font.TextStyle = .body) -> Font {
+        .custom(Serif.bold, size: size, relativeTo: style)
+    }
 
-    /// Title2 22 / Semibold.
-    public static let title2 = Font.system(size: 22, weight: .semibold)
+    /// Noto Serif Display Regular at a given size.
+    public static func serif(_ size: CGFloat, relativeTo style: Font.TextStyle = .body) -> Font {
+        .custom(Serif.regular, size: size, relativeTo: style)
+    }
 
-    /// Headline 17 / Semibold.
-    public static let headline = Font.system(size: 17, weight: .semibold)
+    // MARK: Scale (§9.2)
+
+    /// Display 64–80 — the recovery ring number, in Noto Serif Display Bold.
+    /// (Serif face: loses tabular-digit monospacing, but this hero number rarely reflows.)
+    public static func display(_ size: CGFloat = 72) -> Font {
+        .custom(Serif.bold, size: size, relativeTo: .largeTitle)
+    }
+
+    /// Title1 28 — Noto Serif Display Bold.
+    public static let title1 = Font.custom(Serif.bold, size: 28, relativeTo: .title)
+
+    /// Title2 22 — Noto Serif Display Bold.
+    public static let title2 = Font.custom(Serif.bold, size: 22, relativeTo: .title2)
+
+    /// Headline 17 — Noto Serif Display Bold.
+    public static let headline = Font.custom(Serif.bold, size: 17, relativeTo: .headline)
 
     /// Body 15 / Regular.
     public static let body = Font.system(size: 15, weight: .regular)
@@ -111,6 +133,6 @@ public extension View {
     }
     .frame(width: 520, height: 620)
     .background(StrandPalette.surfaceBase)
-    .preferredColorScheme(.dark)
+    .preferredColorScheme(.light)
 }
 #endif

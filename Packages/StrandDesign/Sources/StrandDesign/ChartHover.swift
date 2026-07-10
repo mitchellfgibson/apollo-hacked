@@ -219,6 +219,6 @@ struct PositionedTooltip: View {
     .padding(40)
     .frame(width: 320, height: 240)
     .background(StrandPalette.surfaceBase)
-    .preferredColorScheme(.dark)
+    .preferredColorScheme(.light)
 }
 #endif

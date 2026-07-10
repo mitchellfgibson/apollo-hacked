@@ -8,6 +8,75 @@ extension WhoopStore {
     /// thousands of rows; reusing one decoder removes that per-row allocation.
     fileprivate static let eventDecoder = JSONDecoder()
 
+    /// Count of DISTINCT hour-buckets that have any HR sample in [from, to] — a cheap coverage
+    /// measure for the sync ring ("how much of the strap's stored window have we actually pulled").
+    /// Grouping by the integer hour (ts/3600) is index-friendly and avoids a per-row string format.
+    public func coveredHours(deviceId: String, from: Int, to: Int) async throws -> Int {
+        try syncRead { db in
+            try Int.fetchOne(db, sql: """
+                SELECT COUNT(*) FROM (
+                    SELECT ts / 3600 AS hr FROM hrSample
+                    WHERE deviceId = ? AND ts >= ? AND ts <= ?
+                    GROUP BY hr
+                )
+                """, arguments: [deviceId, from, to]) ?? 0
+        }
+    }
+
+    /// How far behind "now" our newest persisted HR record is, in seconds (nil if we have none).
+    /// This is the HONEST "are we caught up" signal for the sync ring: a raw calendar-hour coverage
+    /// count wrongly treats every off-wrist hour (shower, gym, charging) as a permanent hole, so it
+    /// can never reach 100% however perfectly we sync. What actually matters is whether our newest
+    /// data is close to the present — i.e. we've drained everything the strap has recorded up to now.
+    /// Small lag (minutes/an hour) = live; a week of lag = genuinely behind. Off-wrist gaps in the
+    /// middle don't count against it, because the strap never recorded anything there to pull.
+    public func secondsBehind(deviceId: String, now: Int) async throws -> Int? {
+        try syncRead { db in
+            guard let newest = try Int.fetchOne(db,
+                sql: "SELECT MAX(ts) FROM hrSample WHERE deviceId = ?", arguments: [deviceId])
+            else { return nil }
+            return max(0, now - newest)
+        }
+    }
+
+    /// Gap-aware wear-completeness for the sync ring: of the history we SHOULD have (hours the strap
+    /// was actually worn), what fraction have we pulled? Returns `(coveredHours, smallHoleHours)`:
+    ///   • `coveredHours` — distinct hour-buckets in [from, to] that have HR data,
+    ///   • `smallHoleHours` — empty hours sandwiched in a wear session (gaps between consecutive
+    ///     covered hours that are LONGER than 1 hour but no longer than `maxWornGapHours`).
+    /// A gap longer than `maxWornGapHours` is treated as "strap taken off" (sleep-length off-wrist
+    /// stretch) and NOT counted as missing — you can't be missing data that was never recorded.
+    /// Completeness = covered / (covered + smallHoles): 1.0 when every worn hour is drained, and it
+    /// only drops for holes INSIDE a wear session (a botched/interrupted sync), which is exactly the
+    /// "we still owe you history" signal — off-wrist time never drags it down. `maxWornGapHours`
+    /// default 3h comfortably spans real usage gaps (shower + commute) while still catching a genuine
+    /// mid-session hole.
+    public func wearCompleteness(deviceId: String, from: Int, to: Int,
+                                 maxWornGapHours: Int = 3) async throws -> (covered: Int, smallHoles: Int) {
+        try syncRead { db in
+            let covered = try Int.fetchOne(db, sql: """
+                SELECT COUNT(*) FROM (
+                    SELECT ts / 3600 AS hr FROM hrSample
+                    WHERE deviceId = ? AND ts >= ? AND ts <= ? GROUP BY hr
+                )
+                """, arguments: [deviceId, from, to]) ?? 0
+            // Sum (gap-1) empty hours for gaps that are >1h and ≤maxWornGapHours between consecutive
+            // covered hour-buckets. LAG gives the previous covered hour; a gap of exactly 1 is
+            // contiguous (no hole). Everything larger than the cap is off-wrist, excluded.
+            let smallHoles = try Int.fetchOne(db, sql: """
+                WITH hours AS (
+                    SELECT DISTINCT ts / 3600 AS h FROM hrSample
+                    WHERE deviceId = ? AND ts >= ? AND ts <= ?
+                ),
+                gaps AS (
+                    SELECT h - LAG(h) OVER (ORDER BY h) AS gap FROM hours
+                )
+                SELECT COALESCE(SUM(gap - 1), 0) FROM gaps WHERE gap > 1 AND gap <= ?
+                """, arguments: [deviceId, from, to, maxWornGapHours]) ?? 0
+            return (covered, smallHoles)
+        }
+    }
+
     public func hrSamples(deviceId: String, from: Int, to: Int, limit: Int) async throws -> [HRSample] {
         try syncRead { db in
             try Row.fetchAll(db, sql: """
@@ -108,6 +177,15 @@ extension WhoopStore {
         try syncRead { db in
             try Int.fetchOne(db,
                 sql: "SELECT MAX(ts) FROM hrSample WHERE deviceId = ?", arguments: [deviceId])
+        }
+    }
+
+    /// Min HR sample timestamp for a device (our OLDEST record), or nil if none. Compared to the
+    /// strap's oldest reported record (GET_DATA_RANGE) to decide if older history remains to pull.
+    public func oldestHRSampleTs(deviceId: String) async throws -> Int? {
+        try syncRead { db in
+            try Int.fetchOne(db,
+                sql: "SELECT MIN(ts) FROM hrSample WHERE deviceId = ?", arguments: [deviceId])
         }
     }
 

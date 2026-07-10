@@ -89,6 +89,34 @@ final class Collector {
         return try? await s.latestHRSampleTs(deviceId: deviceId)
     }
 
+    /// Min persisted HR sample ts (our OLDEST record). Compared to the strap's oldest reported record
+    /// to answer "is there still older history on the strap to pull". nil if nothing persisted.
+    func oldestHRSampleTs() async -> Int? {
+        guard let s = concreteStore else { return nil }
+        return (try? await s.oldestHRSampleTs(deviceId: deviceId)) ?? nil
+    }
+
+
+    /// Distinct hour-buckets covered by stored HR in [from, to] — feeds the sync ring's coverage %.
+    func coveredHours(from: Int, to: Int) async -> Int {
+        guard let s = concreteStore else { return 0 }
+        return (try? await s.coveredHours(deviceId: deviceId, from: from, to: to)) ?? 0
+    }
+
+    /// Seconds our newest persisted HR record lags behind `now` (nil if none). Feeds the sync ring's
+    /// freshness-based progress — how caught-up we are, ignoring off-wrist gaps.
+    func secondsBehind(now: Int) async -> Int? {
+        guard let s = concreteStore else { return nil }
+        return (try? await s.secondsBehind(deviceId: deviceId, now: now)) ?? nil
+    }
+
+    /// Gap-aware wear completeness in [from, to]: (covered hours, small-hole hours inside wear
+    /// sessions). Feeds the "complete" half of the sync ring. See `WhoopStore.wearCompleteness`.
+    func wearCompleteness(from: Int, to: Int) async -> (covered: Int, smallHoles: Int) {
+        guard let s = concreteStore else { return (0, 0) }
+        return (try? await s.wearCompleteness(deviceId: deviceId, from: from, to: to)) ?? (0, 0)
+    }
+
     /// Apply the raw-retention policy. Returns rows pruned (0 if no concrete store).
     @discardableResult
     func prune() async -> Int {

@@ -57,12 +57,19 @@ public enum AnalyticsEngine {
     private static let isoDay: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
-        f.timeZone = TimeZone(identifier: "UTC")
+        // LOCAL timezone, NOT UTC. The WHOOP/Apple importers bucket days by the wearer's local
+        // calendar (WhoopImporter.dayString uses each cycle's tzOffsetMin), so a UTC day here put
+        // computed strain/recovery on a DIFFERENT day than the imported rows for the same activity —
+        // e.g. Pacific-evening effort (which is next-day in UTC) landed a day late, and the
+        // Repository's merge of imported-over-computed rows silently disagreed. Using the device's
+        // current local zone realigns computed days with imports and with the user's actual calendar.
+        f.timeZone = .current
         f.dateFormat = "yyyy-MM-dd"
         return f
     }()
 
-    /// Format a unix-seconds timestamp as a UTC YYYY-MM-DD day string.
+    /// Format a unix-seconds timestamp as a LOCAL-timezone YYYY-MM-DD day string (matches the
+    /// importers' local-calendar bucketing so computed and imported days line up).
     public static func dayString(_ ts: Int) -> String {
         isoDay.string(from: Date(timeIntervalSince1970: TimeInterval(ts)))
     }
@@ -84,7 +91,12 @@ public enum AnalyticsEngine {
     ///   - baselines: personal baselines for recovery normalization.
     ///   - maxHROverride: explicit HRmax (bpm) to use for strain/zones; nil →
     ///     Tanaka from profile.age.
+    /// - Parameter dayStart: unix seconds of LOCAL midnight for `day`. When provided, strain is
+    ///   summed ONLY over `[dayStart, dayStart+86400)` — the actual calendar day — instead of the
+    ///   whole (night-centric) HR window that's passed for sleep detection. Without it (nil, e.g.
+    ///   older tests), strain falls back to the full `hr` window as before.
     public static func analyzeDay(day: String,
+                                  dayStart: Int? = nil,
                                   hr: [HRSample] = [],
                                   rr: [RRInterval] = [],
                                   resp: [RespSample] = [],
@@ -146,10 +158,21 @@ public enum AnalyticsEngine {
                 sleepPerf: sleepPerf)
         }
 
-        // ── Strain (day cardiovascular load over the full HR window) ──────────
+        // ── Strain (cardiovascular load over THIS CALENDAR DAY) ───────────────
+        // Strain is a whole-day metric, so it must be summed over [dayStart, dayStart+24h) — NOT the
+        // wider night-centric window passed for sleep detection, which would fold the previous
+        // evening's and next morning's HR into the wrong day. When `dayStart` is nil (older callers/
+        // tests), fall back to the full window unchanged.
+        let strainHR: [HRSample]
+        if let dayStart {
+            let dayEnd = dayStart + 86_400
+            strainHR = hr.filter { $0.ts >= dayStart && $0.ts < dayEnd }
+        } else {
+            strainHR = hr
+        }
         let effMaxHR: Double? = maxHROverride ?? (profile.age > 0 ? StrainScorer.tanakaHRmax(age: profile.age) : nil)
         let restForStrain = restingHRDaily.map(Double.init) ?? StrainScorer.defaultRestingHR
-        let strain = StrainScorer.strain(hr, maxHR: effMaxHR, restingHR: restForStrain,
+        let strain = StrainScorer.strain(strainHR, maxHR: effMaxHR, restingHR: restForStrain,
                                          sex: profile.sex)
 
         // ── Workouts ──────────────────────────────────────────────────────────

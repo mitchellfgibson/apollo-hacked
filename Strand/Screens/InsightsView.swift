@@ -569,6 +569,6 @@ private func insightsPreviewRepo() -> Repository {
     InsightsView()
         .environmentObject(insightsPreviewRepo())
         .frame(width: 920, height: 900)
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(.light)
 }
 #endif

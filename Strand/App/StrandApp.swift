@@ -34,7 +34,7 @@ struct StrandApp: App {
                 .environmentObject(model.intelligence)
                 .environmentObject(model.coach)
                 .rootWindowChrome()
-                .preferredColorScheme(.dark)
+                .preferredColorScheme(.light)
         }
         #if os(macOS)
         return window

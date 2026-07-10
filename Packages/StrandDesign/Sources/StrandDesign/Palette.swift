@@ -28,31 +28,34 @@ public extension Color {
 
 // MARK: - Strand Palette
 //
-// Every semantic token from design spec §9.1. Dark-only, instrument-grade.
-// Hex values are exact per the spec — do not substitute.
+// Every semantic token from design spec §9.1. LIGHT theme (chrome inverted from the
+// original near-black instrument palette): white surfaces, near-black text. The DATA
+// colors below (recovery / strain / sleep / HR-zone / status / metric accents) are
+// intentionally left at their original values so the recovery & strain color language
+// is preserved on the light background.
 
 public enum StrandPalette {
 
-    // MARK: Surfaces (§9.1)
-    public static let surfaceBase    = Color(hex: "#060A08") // near-black, faint green (brief)
-    public static let surfaceRaised  = Color(hex: "#0D1512") // dark green-black cards
-    public static let surfaceOverlay = Color(hex: "#121D18") // raised / popovers / sheets
-    public static let surfaceInset   = Color(hex: "#0A100D") // wells / chart insets
-    public static let hairline       = Color(hex: "#1B2620") // soft green-grey 1px border
-    public static let hairlineStrong = Color(hex: "#27362E") // hover / emphasis border
+    // MARK: Surfaces (§9.1) — light theme
+    public static let surfaceBase    = Color(hex: "#FFFFFF") // page background — white
+    public static let surfaceRaised  = Color(hex: "#F4F6F5") // cards — faint grey
+    public static let surfaceOverlay = Color(hex: "#EAEEEC") // popovers / sheets
+    public static let surfaceInset   = Color(hex: "#F7F9F8") // wells / chart insets
+    public static let hairline       = Color(hex: "#DCE2DF") // soft 1px border
+    public static let hairlineStrong = Color(hex: "#C3CCC7") // hover / emphasis border
 
-    // MARK: Text (§9.1)
-    public static let textPrimary    = Color(hex: "#F4F7F5")
-    public static let textSecondary  = Color(hex: "#8B9690")
-    public static let textTertiary   = Color(hex: "#6F7A74")
+    // MARK: Text (§9.1) — near-black on white
+    public static let textPrimary    = Color(hex: "#0A0C0B")
+    public static let textSecondary  = Color(hex: "#525C57")
+    public static let textTertiary   = Color(hex: "#7A847F")
 
-    // MARK: Glow (§9.1)
-    public static let glowAmbient    = Color(hex: "#1B2A3A")
+    // MARK: Glow (§9.1) — kept as a soft tint (unused as page bg now)
+    public static let glowAmbient    = Color(hex: "#D6E2EC")
 
     // MARK: Accent — chrome, not data (§9.1)
     public static let accent         = Color(hex: "#18C98B") // health green (brief)
     public static let accentHover    = Color(hex: "#2FE0A0")
-    public static let accentMuted    = Color(hex: "#10271F") // dark-green tint (selected rows)
+    public static let accentMuted    = Color(hex: "#D8F2E7") // light-green tint (selected rows)
     /// Focus ring color (same as accent).
     public static let focusRing      = Color(hex: "#18C98B")
     /// Opacity for dimmed/disabled sections (shared so screens don't invent their own value).
@@ -301,7 +304,7 @@ extension Color {
     }
     .frame(width: 520, height: 760)
     .background(StrandPalette.surfaceBase)
-    .preferredColorScheme(.dark)
+    .preferredColorScheme(.light)
 }
 
 @ViewBuilder

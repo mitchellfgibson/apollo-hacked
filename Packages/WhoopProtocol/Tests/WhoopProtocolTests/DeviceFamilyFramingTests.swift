@@ -3,6 +3,27 @@ import XCTest
 
 final class DeviceFamilyFramingTests: XCTestCase {
 
+    // MARK: - Whoop 5.0 command framing (puffinCommandFrame) — locked to ground truth
+
+    /// A 4-aligned command needs no padding and must verify as a well-formed puffin frame.
+    func testPuffinCommandFrameAligned() {
+        // SEND_HISTORICAL_DATA (cmd 22) payload [0]: inner [35,1,22,0] is already 4-aligned.
+        let built = puffinCommandFrame(cmd: 22, seq: 1, payload: [0x00])
+        XCTAssertEqual(built, Self.hex("aa0108000001e671230116002c00998e"))
+        XCTAssertTrue(verifyFrame(built, family: .whoop5).ok)
+    }
+
+    /// THE PADDING FIX: the 12-byte maverick haptic payload makes the inner record 15 bytes, which
+    /// MUST be padded to 16 before the length/CRC are computed — otherwise the strap rejects the
+    /// frame (it was ACK'd-but-silent before this fix). Round-trips through verifyFrame.
+    func testPuffinCommandFramePads12ByteHaptic() {
+        let buzz = MaverickHaptics.notificationBuzz(loops: 1)   // 12 bytes
+        XCTAssertEqual(buzz.count, 12)
+        let built = puffinCommandFrame(cmd: 19, seq: 5, payload: buzz)
+        XCTAssertEqual(built, Self.hex("aa0114000001e1e1230513012f9800000000000000000100ba9fe436"))
+        XCTAssertTrue(verifyFrame(built, family: .whoop5).ok, "padded frame must verify")
+    }
+
     static func hex(_ s: String) -> [UInt8] {
         var out = [UInt8](); out.reserveCapacity(s.count / 2)
         var idx = s.startIndex
@@ -149,7 +170,7 @@ final class DeviceFamilyFramingTests: XCTestCase {
         // A puffin-metadata (type 56) frame must parse with typeName "METADATA".
         // payload=[56 03 00 ab cd 00 00 00] (padded), crc32 over it.
         let frame = Self.hex("aa010c000001e741380300abcd00000060153281")
-        let parsed = parseFrame(frame, family: .whoop5)
+        let parsed = parseFrame(frame, family: .whoop5, collectFields: true)
         XCTAssertTrue(parsed.ok)
         XCTAssertEqual(parsed.typeName, "METADATA")
         XCTAssertEqual(parsed.seq, 3)

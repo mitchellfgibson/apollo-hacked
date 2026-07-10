@@ -139,6 +139,6 @@ public struct ConnectionDot: View {
     .padding(28)
     .frame(width: 560, height: 280)
     .background(StrandPalette.surfaceBase)
-    .preferredColorScheme(.dark)
+    .preferredColorScheme(.light)
 }
 #endif

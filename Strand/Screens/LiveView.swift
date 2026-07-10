@@ -9,10 +9,10 @@ struct LiveView: View {
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var live: LiveState
 
-    /// Which strap the user is pairing — persists across launches. Drives which
-    /// BLE service we scan for so a WHOOP 4.0 scan never hangs on a WHOOP 5 wrist.
-    @AppStorage("selectedWhoopModel") private var selectedModelRaw = WhoopModel.whoop4.rawValue
-    private var selectedModel: WhoopModel { WhoopModel(rawValue: selectedModelRaw) ?? .whoop4 }
+    /// Which strap the user is pairing — persists across launches. The app supports
+    /// WHOOP 5.0 / MG only, so this is fixed and drives which BLE service we scan for.
+    @AppStorage("selectedWhoopModel") private var selectedModelRaw = WhoopModel.whoop5mg.rawValue
+    private var selectedModel: WhoopModel { WhoopModel(rawValue: selectedModelRaw) ?? .whoop5mg }
 
     /// Smoothed, spike-filtered live HR from AppModel (median over a short window).
     private var displayHR: Int? { model.bpm }
@@ -24,7 +24,6 @@ struct LiveView: View {
                 connectionRow
                 heartRateCard
                 statusGrid
-                if !live.bonded { modelPicker }
                 controls
                 logCard
             }
@@ -104,23 +103,6 @@ struct LiveView: View {
     }
 
     // MARK: - Strap picker
-
-    /// Pick the strap family before scanning. Hidden once bonded — by then we know
-    /// what's on the wrist.
-    private var modelPicker: some View {
-        HStack(spacing: 10) {
-            Text("Strap").font(StrandFont.caption).foregroundStyle(StrandPalette.textSecondary)
-            SegmentedPillControl(
-                WhoopModel.allCases,
-                selection: Binding(
-                    get: { selectedModel },
-                    set: { selectedModelRaw = $0.rawValue }
-                ),
-                label: { $0.displayName }
-            )
-            Spacer()
-        }
-    }
 
     // MARK: - Controls
 

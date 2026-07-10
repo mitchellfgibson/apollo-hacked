@@ -67,6 +67,10 @@ final class AppModel: ObservableObject {
         // Illness/strain early-warning recomputes when the daily history changes.
         repo.$days.sink { [weak self] days in self?.evaluateIllness(days) }.store(in: &hrCancellables)
 
+        // After a backfill lands new biometrics, recompute scores promptly (debounced ~10s) rather
+        // than waiting on the 15-min timer — so a night synced just now shows up right away.
+        ble.onBackfillProducedData = { [weak self] in self?.scheduleAnalyzeSoon() }
+
         moments = (UserDefaults.standard.array(forKey: "moments") as? [Double] ?? [])
             .map { Date(timeIntervalSince1970: $0) }
 
@@ -81,6 +85,19 @@ final class AppModel: ObservableObject {
                 await self.intelligence.analyzeRecent()
                 try? await Task.sleep(nanoseconds: 900_000_000_000)  // 15 min, matches the offload cadence
             }
+        }
+    }
+
+    /// Debounced "recompute scores now" — coalesces a burst of backfill-completed callbacks into a
+    /// single `analyzeRecent()` ~10s after the last one, so nights populate promptly after a sync
+    /// without re-running the full 21-day analysis on every chunk.
+    private var analyzeSoonTask: Task<Void, Never>?
+    private func scheduleAnalyzeSoon() {
+        analyzeSoonTask?.cancel()
+        analyzeSoonTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 10_000_000_000)   // 10s settle
+            guard !Task.isCancelled, let self else { return }
+            await self.intelligence.analyzeRecent()
         }
     }
 
@@ -140,7 +157,7 @@ final class AppModel: ObservableObject {
     func scan(model: WhoopModel? = nil) {
         let chosen = model
             ?? UserDefaults.standard.string(forKey: "selectedWhoopModel").flatMap(WhoopModel.init(rawValue:))
-            ?? .whoop4
+            ?? .whoop5mg
         ble.connect(model: chosen)
     }
     func disconnect() { ble.disconnect() }

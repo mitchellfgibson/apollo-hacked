@@ -83,7 +83,7 @@ public struct OnboardingWizard: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(StrandPalette.surfaceBase.ignoresSafeArea())
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(.light)
         .onAppear { glow = true }
         // Isolated live observation — a hidden watcher slides Scan → celebration on bond
         // without subscribing the whole wizard to per-tick updates.
@@ -431,8 +431,9 @@ private struct ScanStep: View {
     @State private var showHelp = false
 
     /// Which strap to look for — shared with the Live screen via the same key.
-    @AppStorage("selectedWhoopModel") private var selectedModelRaw = WhoopModel.whoop4.rawValue
-    private var selectedModel: WhoopModel { WhoopModel(rawValue: selectedModelRaw) ?? .whoop4 }
+    /// Fixed to WHOOP 5.0 / MG (the only supported strap).
+    @AppStorage("selectedWhoopModel") private var selectedModelRaw = WhoopModel.whoop5mg.rawValue
+    private var selectedModel: WhoopModel { WhoopModel(rawValue: selectedModelRaw) ?? .whoop5mg }
 
     var body: some View {
         StepShell(title: "Find your strap",
@@ -444,20 +445,6 @@ private struct ScanStep: View {
                 statusLine
 
                 if !live.bonded {
-                    VStack(spacing: 8) {
-                        Text("Which strap?").font(StrandFont.caption)
-                            .foregroundStyle(StrandPalette.textSecondary)
-                        SegmentedPillControl(
-                            WhoopModel.allCases,
-                            selection: Binding(
-                                get: { selectedModel },
-                                set: { selectedModelRaw = $0.rawValue }
-                            ),
-                            label: { $0.displayName }
-                        )
-                    }
-                    .disabled(scanning)
-
                     Button(action: startScan) {
                         Label(scanning ? "Scanning…" : "Scan", systemImage: "dot.radiowaves.left.and.right")
                     }
@@ -1058,7 +1045,7 @@ private struct OnboardingPreview: View {
             .environmentObject(model.live)
             .environmentObject(model.profile)
             .frame(width: 1100, height: 780)
-            .preferredColorScheme(.dark)
+            .preferredColorScheme(.light)
     }
 }
 

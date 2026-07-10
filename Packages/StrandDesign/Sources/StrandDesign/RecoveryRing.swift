@@ -256,7 +256,7 @@ public struct RecoveryArc: Shape {
     }
     .padding(40)
     .background(StrandPalette.surfaceBase)
-    .preferredColorScheme(.dark)
+    .preferredColorScheme(.light)
 }
 
 #Preview("RecoveryRing — primed/peak") {
@@ -266,7 +266,7 @@ public struct RecoveryArc: Shape {
     }
     .padding(40)
     .background(StrandPalette.surfaceBase)
-    .preferredColorScheme(.dark)
+    .preferredColorScheme(.light)
 }
 
 private struct RecoveryRingLive: View {
@@ -279,7 +279,7 @@ private struct RecoveryRingLive: View {
         }
         .padding(40)
         .background(StrandPalette.surfaceBase)
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(.light)
     }
 }
 

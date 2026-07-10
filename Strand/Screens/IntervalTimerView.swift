@@ -426,6 +426,6 @@ struct IntervalTimerView: View {
         .environmentObject(AppModel())
         .environmentObject(LiveState())
         .frame(width: 720, height: 900)
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(.light)
 }
 #endif

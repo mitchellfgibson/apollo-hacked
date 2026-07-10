@@ -406,6 +406,6 @@ private func previewRepo() -> Repository {
         .environmentObject(previewRepo())
         .environmentObject(LiveState())
         .frame(width: 960, height: 960)
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(.light)
 }
 #endif

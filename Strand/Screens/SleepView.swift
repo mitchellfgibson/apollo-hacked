@@ -2,6 +2,7 @@ import SwiftUI
 import Foundation
 import StrandDesign
 import WhoopStore
+import WhoopProtocol
 
 // MARK: - SleepView
 //
@@ -36,6 +37,22 @@ struct SleepView: View {
     /// when it differs from the current inputs we rebuild the model.
     @State private var modelKey: SleepInputKey?
 
+    /// Real HR samples for the currently-shown night's window. Empty for nights we didn't
+    /// capture live (e.g. imported-only history).
+    @State private var nightHR: [HRSample] = []
+    /// The night (startTs) the loaded `nightHR` belongs to, so we don't reload on every render.
+    @State private var loadedNightTs: Int?
+    /// The stage the user CLICKED to lock as highlighted on the HR trace; nil = whole night.
+    @State private var selectedStage: SleepStage?
+    /// The stage the user is HOVERING over (transient); previews the highlight without locking it.
+    /// The effective highlight is `hoveredStage ?? selectedStage` — hover wins while the cursor is
+    /// over a chip, falling back to the locked selection when it leaves.
+    @State private var hoveredStage: SleepStage?
+
+    /// The stage currently driving the HR highlight: a live hover takes precedence over the locked
+    /// click-selection, so moving across the chips previews each while a click still persists.
+    private var activeStage: SleepStage? { hoveredStage ?? selectedStage }
+
     var body: some View {
         // Resolve the memoized model for THIS render. `dataKey` is O(1)-ish (counts + last-row
         // identity), so comparing it every render is cheap. When it matches the cached key we
@@ -44,7 +61,7 @@ struct SleepView: View {
         // synchronously, so the very first frame already shows content (no empty-state flash).
         let key = dataKey
         let resolved: SleepModel? = (key == modelKey) ? model : buildModel()
-        ScreenScaffold(title: "Sleep", subtitle: "Last night, read in two seconds.") {
+        ScreenScaffold(title: "Sleep") {
             Group {
                 if let resolved {
                     VStack(alignment: .leading, spacing: NoopMetrics.sectionGap) {
@@ -70,7 +87,28 @@ struct SleepView: View {
                     model = resolved
                 }
             }
+            // Load the real HR for this night whenever the shown night changes.
+            .task(id: resolved?.night.session.startTs) {
+                await loadNightHR(resolved?.night)
+            }
         }
+    }
+
+    /// Pull the real heart-rate samples spanning the night's window (merged live + imported).
+    /// Resets the highlighted stage so a night change starts on the full trace.
+    private func loadNightHR(_ night: Night?) async {
+        guard let night else { nightHR = []; loadedNightTs = nil; return }
+        if loadedNightTs == night.session.startTs { return }
+        selectedStage = nil
+        let samples = await repo.nightHRSamples(from: night.session.startTs, to: night.session.endTs)
+        nightHR = samples
+        loadedNightTs = night.session.startTs
+    }
+
+    /// True when this night should show the live HR chart — i.e. we actually captured real
+    /// heart-rate samples across it. Imported-only nights (no HR) fall back to the stage view.
+    private func showsHRChart(_ night: Night) -> Bool {
+        !nightHR.isEmpty
     }
 
     // MARK: - 1. HERO — stage breakdown
@@ -78,9 +116,113 @@ struct SleepView: View {
     @ViewBuilder
     private func hero(_ model: SleepModel) -> some View {
         let night = model.night
+        if showsHRChart(night) {
+            hrHero(model)
+        } else {
+            stageHero(model)
+        }
+    }
+
+    /// Live-era hero: real heart rate across the FULL WIDTH of the screen, a clock axis along the
+    /// bottom, and a row of stage chips beneath. Hover a chip → that stage's HR lights up on the
+    /// trace; click to lock it (click again to release). No dropdown — the chips are the control.
+    @ViewBuilder
+    private func hrHero(_ model: SleepModel) -> some View {
+        let night = model.night
         let s = night.stages
-        // Intervals are reconstructed ONCE in the model build, not on every body pass
-        // (Night.intervals is a computed property and was previously evaluated twice here).
+        VStack(alignment: .leading, spacing: NoopMetrics.gap) {
+            SectionHeader("Last night", overline: "Sleep · heart rate",
+                          trailing: "\(night.dateLabel) · \(night.onsetText)–\(night.wakeText)")
+            ChartCard(
+                title: activeStage.map { "Heart rate · \($0.label)" } ?? "Heart rate through the night",
+                subtitle: "\(durationText(night.timeInBed)) in bed · \(hrTrailing)",
+                trailing: nil,
+                height: hrChartHeight,
+                chart: {
+                    NightHRChart(samples: nightHR,
+                                 nightStartTs: night.session.startTs,
+                                 nightEndTs: night.session.endTs,
+                                 intervals: model.intervals,
+                                 selectedStage: activeStage,
+                                 showsTimeAxis: true,
+                                 onsetOffset: sleepOnsetOffset(model.intervals),
+                                 wakeOffset: finalWakeOffset(model.intervals),
+                                 height: hrChartHeight)
+                },
+                footer: { stageChips(s) }
+            )
+        }
+    }
+
+    /// Taller than the default so a full-width night reads clearly.
+    private var hrChartHeight: CGFloat { NoopMetrics.chartHeight * 1.4 }
+
+    /// Sleep onset (seconds from night start) = start of the FIRST non-awake interval. nil if the
+    /// night is all wake / has no intervals.
+    private func sleepOnsetOffset(_ intervals: [SleepInterval]) -> Double? {
+        intervals.first { $0.stage != .awake }?.start
+    }
+
+    /// Final wake (seconds from night start) = end of the LAST non-awake interval.
+    private func finalWakeOffset(_ intervals: [SleepInterval]) -> Double? {
+        intervals.last { $0.stage != .awake }?.end
+    }
+
+    /// The four stage chips beneath the chart — the replacement for the old dropdown. Each is a
+    /// hoverable + tappable box a little larger than its label: HOVER previews the stage's HR on the
+    /// trace, TAP locks it (tap again or tap another to change). The currently-active chip is filled
+    /// in its stage color so it's obvious what's highlighted.
+    @ViewBuilder
+    private func stageChips(_ s: Stages) -> some View {
+        HStack(spacing: 8) {
+            stageChip(.rem,   "REM",   s.rem,   s.total)
+            stageChip(.deep,  "Deep",  s.deep,  s.total)
+            stageChip(.light, "Light", s.light, s.total)
+            stageChip(.awake, "Awake", s.awake, s.total)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    /// One stage chip. `activeStage == stage` (hover or lock) fills it in the stage color.
+    @ViewBuilder
+    private func stageChip(_ stage: SleepStage, _ label: String, _ minutes: Double, _ total: Double) -> some View {
+        let isActive = activeStage == stage
+        let isLocked = selectedStage == stage
+        let color = StrandPalette.sleepStageColor(stage)
+        VStack(spacing: 3) {
+            Text(label)
+                .font(StrandFont.caption)
+                .foregroundStyle(isActive ? StrandPalette.surfaceBase : StrandPalette.textPrimary)
+            Text("\(durationText(minutes)) · \(pct(minutes, total))%")
+                .font(StrandFont.footnote)
+                .foregroundStyle(isActive ? StrandPalette.surfaceBase.opacity(0.85) : StrandPalette.textTertiary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 10)
+        .padding(.horizontal, 8)
+        .background(isActive ? color : StrandPalette.surfaceInset,
+                    in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(isLocked ? color : StrandPalette.hairline, lineWidth: isLocked ? 2 : 1)
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .onHover { hovering in
+            hoveredStage = hovering ? stage : (hoveredStage == stage ? nil : hoveredStage)
+        }
+        .onTapGesture {
+            selectedStage = (selectedStage == stage) ? nil : stage   // toggle lock
+        }
+        .animation(.easeOut(duration: 0.15), value: isActive)
+        .accessibilityLabel("\(label): \(durationText(minutes)). Tap to highlight this stage's heart rate.")
+    }
+
+    /// Legacy / toggle-off hero: the original stage breakdown. Shows a small note for nights
+    /// recorded before NOOP began capturing live heart rate.
+    @ViewBuilder
+    private func stageHero(_ model: SleepModel) -> some View {
+        let night = model.night
+        let s = night.stages
         let intervals = model.intervals
         VStack(alignment: .leading, spacing: NoopMetrics.gap) {
             SectionHeader("Last night", overline: "Sleep",
@@ -110,6 +252,26 @@ struct SleepView: View {
                 }
             )
         }
+    }
+
+    /// HR RANGE (low–high bpm) across the night, or within the active (hovered/locked) stage when
+    /// one is chosen.
+    private var hrTrailing: String {
+        let relevant: [Int]
+        if let stage = activeStage {
+            let night = model?.night
+            let start = night?.session.startTs ?? 0
+            let ranges = (model?.intervals ?? []).filter { $0.stage == stage }.map { $0.start...$0.end }
+            relevant = nightHR.filter { s in
+                let o = Double(s.ts - start)
+                return ranges.contains { $0.contains(o) }
+            }.map { $0.bpm }
+        } else {
+            relevant = nightHR.map { $0.bpm }
+        }
+        let valid = relevant.filter { $0 > 0 }
+        guard let lo = valid.min(), let hi = valid.max() else { return "—" }
+        return "\(lo)–\(hi) bpm"
     }
 
     /// Full-width proportional stacked stage bar (fallback when no intervals).
@@ -386,12 +548,45 @@ struct SleepView: View {
 
     // MARK: - Derived model
 
-    /// The most recent imported sleep, decoded into stage durations.
+    /// The most recent sleep, decoded into stage durations + (when available) the REAL stage
+    /// timeline. Both computed and imported sessions store a `[{start,end,stage}]` segment array
+    /// with absolute unix timestamps, so we can show the true hypnogram instead of a synthetic
+    /// deep-early/rem-later reconstruction.
     private var latestNight: Night? {
         guard let s = repo.sleeps.last,
               let stages = decodeStages(s.stagesJSON),
               stages.total > 0 else { return nil }
-        return Night(session: s, stages: stages)
+        return Night(session: s, stages: stages,
+                     realIntervals: decodeRealIntervals(s.stagesJSON, nightStartTs: s.startTs))
+    }
+
+    /// Parse the real stage timeline from a `[{start,end,stage}]` segment array into
+    /// `SleepInterval`s (start/end = SECONDS FROM `nightStartTs`, which is what Hypnogram expects).
+    /// Returns nil for the legacy dict-of-minutes shape (no timeline to show).
+    private func decodeRealIntervals(_ json: String?, nightStartTs: Int) -> [SleepInterval]? {
+        guard let json, let data = json.data(using: .utf8),
+              let arr = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else { return nil }
+        func num(_ v: Any?) -> Double? {
+            if let n = v as? NSNumber { return n.doubleValue }
+            if let d = v as? Double { return d }
+            if let i = v as? Int { return Double(i) }
+            return nil
+        }
+        func stage(_ s: String) -> SleepStage {
+            switch s.lowercased() {
+            case "wake", "awake":     return .awake
+            case "rem":               return .rem
+            case "deep", "sws", "n3": return .deep
+            default:                  return .light
+            }
+        }
+        let base = TimeInterval(nightStartTs)
+        let out: [SleepInterval] = arr.compactMap { seg in
+            guard let start = num(seg["start"]), let end = num(seg["end"]), end > start else { return nil }
+            return SleepInterval(stage: stage(seg["stage"] as? String ?? ""),
+                                 start: start - base, end: end - base)
+        }
+        return out.count >= 2 ? out.sorted { $0.start < $1.start } : nil
     }
 
     /// Mean total sleep duration (minutes) across nights with data — the "typical".
@@ -612,20 +807,53 @@ struct SleepView: View {
 
     // MARK: - Stage decoding
 
-    /// Decode the imported stagesJSON dict of MINUTES {"light","deep","rem","awake"}.
+    /// Decode `stagesJSON` into per-stage MINUTES. Handles BOTH shapes:
+    ///   1. An ARRAY of segments `[{start,end,stage}]` (unix seconds) — the shape written by BOTH
+    ///      the on-device stager (AnalyticsEngine/SleepStager) AND the WHOOP importer. Per-stage
+    ///      minutes = Σ (end−start)/60 over segments of that stage. THIS is why the graph was blank:
+    ///      the old code only understood shape #2, so every real night decoded to nil → empty state.
+    ///   2. A legacy DICT of minutes `{"light","deep","rem","awake"}` — kept as a fallback.
+    /// Stage names are matched loosely ("wake"/"awake", "rem", "deep"/"sws", "light"/other).
     private func decodeStages(_ json: String?) -> Stages? {
         guard let json, let data = json.data(using: .utf8) else { return nil }
-        guard let obj = try? JSONSerialization.jsonObject(with: data),
-              let dict = obj as? [String: Any] else { return nil }
-        func val(_ key: String) -> Double {
-            if let n = dict[key] as? NSNumber { return n.doubleValue }
-            if let d = dict[key] as? Double { return d }
-            if let i = dict[key] as? Int { return Double(i) }
-            return 0
+        guard let obj = try? JSONSerialization.jsonObject(with: data) else { return nil }
+
+        // Shape #1: array of {start,end,stage} segments.
+        if let arr = obj as? [[String: Any]] {
+            func num(_ v: Any?) -> Double? {
+                if let n = v as? NSNumber { return n.doubleValue }
+                if let d = v as? Double { return d }
+                if let i = v as? Int { return Double(i) }
+                return nil
+            }
+            var awake = 0.0, light = 0.0, deep = 0.0, rem = 0.0
+            for seg in arr {
+                guard let start = num(seg["start"]), let end = num(seg["end"]), end > start else { continue }
+                let mins = (end - start) / 60.0
+                switch (seg["stage"] as? String ?? "").lowercased() {
+                case "wake", "awake":        awake += mins
+                case "rem":                  rem += mins
+                case "deep", "sws", "n3":    deep += mins
+                default:                     light += mins   // "light", "core", "n1", "n2", unknown
+                }
+            }
+            let s = Stages(awake: awake, light: light, deep: deep, rem: rem)
+            return s.total > 0 ? s : nil
         }
-        let s = Stages(awake: val("awake"), light: val("light"),
-                       deep: val("deep"), rem: val("rem"))
-        return s.total > 0 ? s : nil
+
+        // Shape #2 (legacy): dict of minutes.
+        if let dict = obj as? [String: Any] {
+            func val(_ key: String) -> Double {
+                if let n = dict[key] as? NSNumber { return n.doubleValue }
+                if let d = dict[key] as? Double { return d }
+                if let i = dict[key] as? Int { return Double(i) }
+                return 0
+            }
+            let s = Stages(awake: val("awake"), light: val("light"),
+                           deep: val("deep"), rem: val("rem"))
+            return s.total > 0 ? s : nil
+        }
+        return nil
     }
 
     /// yyyy-MM-dd → Date (en_US_POSIX, UTC), per task spec.
@@ -697,6 +925,9 @@ private struct Stages {
 private struct Night {
     let session: CachedSleepSession
     let stages: Stages
+    /// The REAL stage timeline parsed from the segment array, when the session has one. Preferred
+    /// over the synthetic reconstruction so the hypnogram shows actual stage transitions.
+    var realIntervals: [SleepInterval]? = nil
 
     /// Total time in bed in minutes (from reconstructed stages).
     var timeInBed: Double { stages.total }
@@ -704,9 +935,11 @@ private struct Night {
     /// The wall-clock start of the night (for the Hypnogram's clock labels).
     var onsetDate: Date { Date(timeIntervalSince1970: TimeInterval(session.startTs)) }
 
-    /// Stage intervals laid end-to-end across the night, in seconds from start.
-    /// Reconstructed from durations only (export has no per-epoch timeline).
+    /// Stage intervals across the night, in seconds from start. Uses the REAL timeline when present
+    /// (computed + modern imports carry it); otherwise falls back to a plausible reconstruction from
+    /// durations only (legacy dict-of-minutes exports have no per-epoch timeline).
     var intervals: [SleepInterval] {
+        if let realIntervals { return realIntervals }
         var t: TimeInterval = 0
         var out: [SleepInterval] = []
         func add(_ stage: SleepStage, _ minutes: Double) {
@@ -745,7 +978,7 @@ private struct Night {
         .environmentObject(Repository.previewSleep())
         .environmentObject(LiveState())
         .frame(width: 980, height: 1180)
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(.light)
 }
 
 @MainActor

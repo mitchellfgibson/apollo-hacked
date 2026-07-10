@@ -49,6 +49,11 @@ final class Backfiller {
     /// The clock reference set by BLEManager when GET_CLOCK confirms (required for decoding).
     var clockRef: ClockRef?
 
+    /// Device family — selects the frame-parse offsets. WHOOP 5/MG (puffin) frames put the packet
+    /// type + fields 4 bytes later than WHOOP 4, so parsing must be family-aware or every historical
+    /// record decodes to garbage (or nothing).
+    var family: DeviceFamily = .whoop4
+
     /// True while a historical offload session is active.
     private(set) var isBackfilling = false
 
@@ -159,5 +164,40 @@ final class Backfiller {
         isBackfilling = false
         chunk.removeAll(keepingCapacity: true)
         chunkOpen = false
+    }
+
+    // MARK: - OffloadEngine integration (fast-path persistence)
+
+    /// Durably persist one chunk's frames WITHOUT acking — used by the `OffloadEngine` fast path,
+    /// where the ack has already been sent (unconfirmed) the moment the chunk was snapshotted, and
+    /// this runs off the critical path. Returns `true` only when the chunk is fully durable (decoded
+    /// inserted, raw enqueued when enabled, and the `strap_trim` cursor advanced) — the caller then
+    /// calls `OffloadEngine.confirmDurable(trim:)` to move the safe resume cursor. Returns `false`
+    /// on any store error so the durable cursor stays behind and the next session re-pulls the chunk.
+    ///
+    /// This is the SAME decode→insert→enqueueRaw→setCursor sequence as `finishChunk`, minus the ack
+    /// (the engine owns acking now) — so the safe-trim invariant is preserved exactly.
+    @discardableResult
+    func persistChunk(frames: [[UInt8]], trim: UInt32) async -> Bool {
+        if !frames.isEmpty {
+            let ref = clockRef ?? { let now = Int(Date().timeIntervalSince1970); return ClockRef(device: now, wall: now) }()
+            let parsed = frames.map { parseFrame($0, family: family) }
+            let decoded = extract(parsed, ref.device, ref.wall)
+            do { try await store.insert(decoded, deviceId: deviceId) } catch { return false }
+            if enableRawCapture {
+                let meta = RawBatchMeta(
+                    batchId: "hist-\(deviceId)-\(trim)",
+                    deviceId: deviceId,
+                    clockRef: ref,
+                    capturedAt: Int(Date().timeIntervalSince1970),
+                    startTs: ref.wall,
+                    endTs: ref.wall,
+                    frameCount: frames.count,
+                    byteSize: frames.reduce(0) { $0 + $1.count })
+                do { try await store.enqueueRawBatch(meta, frames: frames) } catch { return false }
+            }
+        }
+        do { try await store.setCursor("strap_trim", Int(trim)) } catch { return false }
+        return true
     }
 }

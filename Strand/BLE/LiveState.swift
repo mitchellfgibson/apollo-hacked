@@ -33,11 +33,37 @@ public final class LiveState: ObservableObject {
     /// came — i.e. caught up). Drives the sync tile + the staleness nudge.
     @Published public var lastSyncedAt: TimeInterval?
 
+    /// True while a historical offload (backfill) is actively pulling the strap's stored data.
+    @Published public var backfilling = false
+
+    /// Sync progress 0…1 — the fraction of the strap's ~14-day stored window that we've actually
+    /// offloaded, measured by HOUR COVERAGE (distinct hours with data ÷ hours in the window). This
+    /// reflects real completeness including GAPS in the middle — unlike a frontier check, which reads
+    /// "caught up" whenever live HR keeps the newest record fresh even with a week of holes behind it.
+    /// Recomputed by BLEManager after each offload + on a timer; NOT derived per-render.
+    @Published public var syncProgress: Double = 0
+
+    /// True only when we've pulled essentially the whole stored window (the ring is "live" / full).
+    public var isLive: Bool { syncProgress >= 0.98 }
+
     /// Optional hook invoked on every battery update (wired by LiveViewModel to the alert monitor).
     /// Kept as a closure so LiveState stays a plain observable snapshot with no alert dependency.
     public var onBatteryUpdate: ((Double) -> Void)?
 
     public init() {}
+
+    /// True only while the strap link is CURRENTLY live enough to use the app. The gate waits on this.
+    ///
+    /// It must require `connected` (which drops to false on disconnect), because `heartRate`,
+    /// `lastFrameType` and `lastEvent` are sticky — they keep their last value after a disconnect,
+    /// so testing them alone would latch the gate open forever even once the strap is gone. So:
+    ///   • WHOOP 4: a real bond (`bonded`) while connected, OR
+    ///   • WHOOP 5/MG (never flips `bonded`): connected AND data actively relaying right now
+    ///     (a live heart rate present on the current connection).
+    public var gatePassed: Bool {
+        guard connected else { return false }
+        return bonded || heartRate != nil
+    }
 
     /// Single funnel for battery readings — updates the published value AND notifies the hook,
     /// so both write sites (FrameRouter, BLEManager) drive the alert monitor identically.

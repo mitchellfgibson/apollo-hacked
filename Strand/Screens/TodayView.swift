@@ -30,9 +30,6 @@ struct TodayView: View {
     @State private var workouts: [WorkoutRow] = []
     @State private var appleDays: [AppleDaily] = []
 
-    // Support sheet (donate + contact) — always reachable from the home toolbar.
-    @State private var showingSupport = false
-
     // THE single grid definition — every tile group reuses it so margins line up.
     private let grid = [GridItem(.adaptive(minimum: 168), spacing: NoopMetrics.gap)]
 
@@ -55,21 +52,9 @@ struct TodayView: View {
         .task(id: repo.today?.day) { await loadAll() }
         .toolbar {
             ToolbarItem {
-                Button { showingSupport = true } label: {
-                    Image(systemName: "heart.fill")
-                        .foregroundStyle(StrandPalette.metricRose)
-                        .attentionWiggle(period: 4)
-                }
-                .help("Support NOOP — donate or get in touch")
-                .accessibilityLabel("Support NOOP — donate or get in touch")
+                LiveStatusToolbar()
             }
         }
-        .overlay {
-            if showingSupport {
-                SupportModalOverlay(isPresented: $showingSupport)
-            }
-        }
-        .animation(.easeOut(duration: 0.18), value: showingSupport)
     }
 
     // MARK: (a) HERO — RecoveryRing + Synthesis, filling the width equally.
@@ -446,6 +431,6 @@ struct TodayView: View {
     return TodayView()
         .environmentObject(repo)
         .frame(width: 920, height: 940)
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(.light)
 }
 #endif
