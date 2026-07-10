@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="docs/assets/banner.svg" alt="NOOP — own your body's data, read from your WHOOP strap, fully local" width="860">
+  <img src="docs/assets/apollo-logo.png" alt="Apollo Hacked" width="140">
 </p>
 
-<h1 align="center">NOOP</h1>
+<h1 align="center">Apollo Hacked</h1>
 
 <p align="center"><b>A local-first iOS/macOS app that reads a WHOOP strap over Bluetooth and computes recovery, strain, and sleep entirely on-device.</b></p>
 
@@ -21,7 +21,7 @@
 
 ## What it is
 
-I own a WHOOP strap. WHOOP locks the data it collects behind a cloud account and a subscription. NOOP is my answer to that: a native **SwiftUI app** (iOS + macOS from one codebase) that pairs with the strap directly over **Bluetooth LE**, decodes its wire protocol, offloads the on-device history, and computes recovery / strain / sleep locally in **SQLite** — no account, no server, no network.
+I own a WHOOP strap. WHOOP locks the data it collects behind a cloud account and a subscription. Apollo Hacked is my answer to that: a native **SwiftUI app** (iOS + macOS from one codebase) that pairs with the strap directly over **Bluetooth LE**, decodes its wire protocol, offloads the on-device history, and computes recovery / strain / sleep locally in **SQLite** — no account, no server, no network.
 
 It's ~34k lines of Swift across **five platform-pure packages** and a thin per-platform app shell, with **359 tests** across the protocol, storage, and analytics layers.
 
@@ -92,8 +92,8 @@ The strap's day boundaries were being bucketed in UTC while the imported history
 **Requirements:** macOS 13+, Xcode 15+ (Swift 5.9). To pair live you need your own WHOOP strap; to just explore the UI, import a WHOOP CSV or Apple Health export.
 
 ```bash
-git clone https://github.com/mitchellfgibson/apollo-hacked NOOP
-cd NOOP
+git clone https://github.com/mitchellfgibson/apollo-hacked
+cd apollo-hacked
 brew install xcodegen        # if needed
 xcodegen generate            # builds Strand.xcodeproj from project.yml
 open Strand.xcodeproj         # Strand scheme → Run (⌘R)
