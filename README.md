@@ -17,15 +17,25 @@
 
 ---
 
-> **About this README.** This is a personal engineering project I built to own and read my own biometric data. I'm sharing it as a portfolio piece, so this document is written for an engineer reading the code: it leads with the architecture and the hard problems I solved. If you want the user-facing product overview instead, see [`docs/FEATURES.md`](docs/FEATURES.md).
+> **About this README.** Apollo Hacked is a personal engineering project and an ongoing platform for my own biometric research. I'm also sharing it as a portfolio piece, so this document is written for an engineer reading the code: after the "why," it leads with the architecture and the hard problems I solved. For the user-facing product tour, see [`docs/FEATURES.md`](docs/FEATURES.md).
+
+## Why I built it
+
+I bought the device. It sits on *my* wrist and measures *my* body. I believe the data it produces is mine to read — directly, in full, on hardware I own, without asking a cloud for permission or paying rent on my own heartbeat. That's the whole premise: if you can own a machine, you should be free to build on it. Apollo Hacked is me exercising that right on a device most people only ever get to *rent the data from*.
+
+But the deeper reason is research. Off-the-shelf wearables give you a polished score and hide the signal. I wanted the **raw stream** — beat-to-beat R-R intervals, accelerometer, skin temperature, the lot — landing in a database I control, so I can run my own analyses, test my own hypotheses about my own body, and keep every night of it forever. This is the substrate I'm building for personal bio-research: own the device → own the raw data → own the questions I get to ask of it.
+
+So this project has two goals I'm perfecting in parallel: a genuinely great **personal biometrics app**, and an open **research platform** underneath it — transparent math, local storage, no black boxes.
 
 ## What it is
 
-I own a WHOOP strap. WHOOP locks the data it collects behind a cloud account and a subscription. Apollo Hacked is my answer to that: a native **SwiftUI app** (iOS + macOS from one codebase) that pairs with the strap directly over **Bluetooth LE**, decodes its wire protocol, offloads the on-device history, and computes recovery / strain / sleep locally in **SQLite** — no account, no server, no network.
+A native **SwiftUI app** (iOS + macOS from one codebase) that pairs with a WHOOP strap directly over **Bluetooth LE**, reverse-engineers its wire protocol, offloads the device's on-board history, and computes recovery / strain / sleep locally in **SQLite** — no account, no server, no network. WHOOP locks that same data behind a cloud login and a subscription; Apollo Hacked reads it straight off the strap you already own.
 
 It's ~34k lines of Swift across **five platform-pure packages** and a thin per-platform app shell, with **359 tests** across the protocol, storage, and analytics layers.
 
-## Highlights (what I'd point a reviewer at)
+## Technical highlights
+
+The engineering that makes the "own your raw data" premise actually work — and what I'd point a reviewer at:
 
 - **Reverse-engineered BLE offload engine** — a pipelined historical-data transfer that acks each chunk fire-and-forget while persisting off the critical path, with dual (acked / durable) cursors so a crash mid-transfer never loses or double-counts data. → [`Packages/WhoopProtocol/Sources/WhoopProtocol/OffloadEngine.swift`](Packages/WhoopProtocol/Sources/WhoopProtocol/OffloadEngine.swift)
 - **Live device lifecycle over CoreBluetooth** — bonding, deferred characteristic subscription, clock sync, a continuous-drain backfill scheduler, and self-healing reconnect for a device that streams a ~2 Hz raw flood the whole time. → [`Strand/BLE/BLEManager.swift`](Strand/BLE/BLEManager.swift)
