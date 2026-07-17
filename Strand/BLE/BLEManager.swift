@@ -129,7 +129,8 @@ public final class BLEManager: NSObject, ObservableObject {
     /// in a row we fall back to the slow periodic timer instead of hammering the link forever. Reset
     /// to 0 whenever a session actually persisted new hours (see `sawChunkThisSession`).
     private var autoContinueStreak = 0
-    static let maxAutoContinues = 40
+    static let maxAutoContinues = 500   // multi-night backlogs need many small offload sessions;
+                                        // the cap only guards a truly-wedged strap serving nothing
     /// Set true by `onChunkReady` the moment a session persists at least one chunk. Distinguishes a
     /// productive timeout (strap is streaming, just bursty — keep going) from a dead one (strap
     /// served nothing this session — back off).
@@ -433,6 +434,13 @@ public final class BLEManager: NSObject, ObservableObject {
         backfilling = true
         sawChunkThisSession = false   // fresh session: no productive chunk yet
 
+        // Silence the continuous live realtime flood for the duration of the offload. On this
+        // firmware the strap streams type-40/43 frames UNPROMPTED, which eat BLE airtime the
+        // historical offload needs. `toggleRealtimeHR [0x00]` is the one mute that's actually framed
+        // for WHOOP 5/MG (stopRawData/toggleIMUMode aren't on the puffin allowlist — they'd be
+        // dropped); restored in exitBackfilling if the Live screen wants it.
+        send(.toggleRealtimeHR, payload: [0x00])
+
         // Build the fast engine. Its frames route back through THIS BLEManager (the WhoopTransport):
         // the SEND_HISTORICAL kickoff goes out .withResponse; per-chunk acks go out UNconfirmed +
         // paced. Payload MUST be [0x00], NOT empty (verified on-device: empty → 0 frames; the Mac
@@ -528,6 +536,14 @@ public final class BLEManager: NSObject, ObservableObject {
     /// is the primary metric source now, mirroring how WHOOP syncs. Live HR is opt-in only (the
     /// manual "Start HR" button in LiveView). Between backfills the Collector sees only the live
     /// type-43 flood, which extractStreams ignores — the data comes from the next periodic offload.
+    /// Restore the live stream after backfill muted it. Only re-arm the heavy realtime/raw flood if
+    /// the Live screen actually wants it (`wantsRealtime`); otherwise leave it off — the lightweight
+    /// standard 0x2A37 HR keeps recording regardless, and a muted flood means the NEXT backfill gets
+    /// full airtime. Called only when draining has actually stopped, never between auto-continue hops.
+    private func restoreLiveStreamAfterBackfill() {
+        if wantsRealtime { send(.toggleRealtimeHR, payload: [0x01]) }
+    }
+
     private func exitBackfilling(reason: String) {
         guard backfilling else { return }
         backfilling = false
@@ -555,16 +571,30 @@ public final class BLEManager: NSObject, ObservableObject {
         // a session ends on the idle watchdog (NOT HISTORY_COMPLETE) but it was productive (streamed
         // real chunks — the strap is just bursty behind the type-43 flood), re-kick immediately so
         // the drain runs back-to-back until the strap actually signals HISTORY_COMPLETE. Guards:
-        //   • only while still connected + not caught up (isLive) — never poll a live strap hard,
+        //   • only while still connected and the session actually produced data,
         //   • bounded by `maxAutoContinues` so a wedged strap that serves nothing can't hot-loop.
-        let caughtUp = reason == "HISTORY_COMPLETE"
-        if caughtUp || !wasProductive || !state.connected || state.isLive {
+        // NOTE: this used to also bail on `state.isLive`, but that was the "worn nights don't sync"
+        // bug — `isLive` is HR-freshness-based, and live HR keeps it TRUE even while GRAVITY (which
+        // only arrives via the type-47 offload) is still missing for whole nights. So a productive
+        // session would drain a little, `isLive` read true, and the drain stopped with nights still
+        // un-pulled. A productive session means the strap HAS more to give: keep going until it
+        // signals HISTORY_COMPLETE (genuinely caught up) or the streak cap trips.
+        //
+        // BUT the strap sends HISTORY_COMPLETE for the CURRENT offload window, not "you now have
+        // everything" — on a multi-night backlog it completes many small windows in a row. Treating
+        // every HISTORY_COMPLETE as "done" is why the drain went burst-then-die and worn nights never
+        // came in. So on a *productive* HISTORY_COMPLETE we re-kick anyway (it just gave us data →
+        // there may be more), bounded by the streak cap. Only a NON-productive completion (the strap
+        // served nothing new) is the real "caught up" signal that stops the loop.
+        if !state.connected || !wasProductive {
             autoContinueStreak = 0
+            restoreLiveStreamAfterBackfill()   // done draining — bring back live HR if the user wants it
             return
         }
         guard autoContinueStreak < BLEManager.maxAutoContinues else {
             log("Backfill: auto-continue cap reached (\(BLEManager.maxAutoContinues)) — deferring to periodic timer")
             autoContinueStreak = 0
+            restoreLiveStreamAfterBackfill()
             return
         }
         autoContinueStreak += 1
