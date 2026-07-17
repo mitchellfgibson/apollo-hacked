@@ -47,8 +47,14 @@ final class IntelligenceEngine: ObservableObject {
         let up = UserProfile(weightKg: profile.weightKg, heightCm: profile.heightCm,
                              age: Double(profile.age), sex: profile.sex)
 
-        // Baselines from the imported nightly history (ascending). foldHistory winsorizes outliers.
-        let hist = repo.days
+        // Baselines fold from ALL history, UNFILTERED by the past/present display toggle. A personal
+        // baseline IS your long-run norm — the imported 2024/2025 nights are exactly what calibrates
+        // "normal," so hiding them from the DISPLAY must not blind the baseline. Reading `repo.days`
+        // (the filtered view) meant that with "include past" OFF the baseline saw 0 valid nights →
+        // nil HRV baseline → recovery never computed at all. Read the full imported history directly.
+        let baseHist = await repo.dailyMetrics(fromDay: "2000-01-01",
+                                               toDay: AnalyticsEngine.dayString(Int(Date().timeIntervalSince1970) + 86_400))
+        let hist = baseHist.isEmpty ? repo.days : baseHist   // fall back to whatever we have
         let hrvBase = Baselines.foldHistory(hist.map { $0.avgHrv }, cfg: hrvCfg)
         let rhrBase = Baselines.foldHistory(hist.map { $0.restingHr.map(Double.init) }, cfg: rhrCfg)
         let baselines = AnalyticsEngine.ProfileBaselines(hrv: hrvBase, restingHR: rhrBase)

@@ -130,9 +130,30 @@ public enum HRVAnalyzer {
         return kept
     }
 
-    /// Full clean: range filter → ectopic rejection. Returns the clean NN series.
+    /// Max physiological beat-to-beat NN change (ms). A jump larger than this between consecutive
+    /// NN intervals is a missed/extra beat, not real HRV — and because RMSSD squares successive
+    /// differences, even a few such jumps dominate the result (they were pushing nightly RMSSD to
+    /// 115–560 ms). Kubios-style absolute successive-difference guard.
+    public static let maxSuccessiveDeltaMs: Double = 200.0
+
+    /// Drop a beat whose gap to the PREVIOUS kept beat exceeds `maxSuccessiveDeltaMs`. Runs after the
+    /// median-based ectopic rejection to catch artifact beats that survive it (a sustained artifact
+    /// run can drag the local median with it, so the 20% rule alone misses them).
+    public static func rejectSuccessiveJumps(_ nn: [Double]) -> [Double] {
+        guard let first = nn.first else { return nn }
+        var kept: [Double] = [first]
+        kept.reserveCapacity(nn.count)
+        for i in 1..<nn.count {
+            if abs(nn[i] - kept[kept.count - 1]) <= maxSuccessiveDeltaMs { kept.append(nn[i]) }
+            // else: drop as an artifact jump; keep comparing subsequent beats to the last GOOD one.
+        }
+        return kept
+    }
+
+    /// Full clean: range filter → ectopic rejection → successive-jump guard. Returns the clean NN
+    /// series used for all nightly HRV so a couple of artifact beats can't dominate RMSSD.
     public static func cleanRR(_ rr: [Double]) -> [Double] {
-        rejectEctopic(rangeFilter(rr))
+        rejectSuccessiveJumps(rejectEctopic(rangeFilter(rr)))
     }
 
     // MARK: - Windowed analysis

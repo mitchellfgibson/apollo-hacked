@@ -2,6 +2,9 @@ import Foundation
 import CoreBluetooth
 import WhoopProtocol
 import WhoopStore
+#if os(macOS)
+import IOKit.pwr_mgt
+#endif
 
 /// CoreBluetooth engine for the WHOOP 5.0 / MG: scan-by-service → connect → discover →
 /// BOND (one confirmed write) → subscribe → reassemble char-05 frames → FrameRouter.
@@ -101,6 +104,14 @@ public final class BLEManager: NSObject, ObservableObject {
         return opts
     }
     private var keepAliveTick = 0
+    #if os(macOS)
+    /// Power assertion that keeps the Mac from going to IDLE system sleep while the strap is
+    /// connected — otherwise a lid-closed / display-off Mac stops all BLE, the strap can't offload,
+    /// and worn nights don't sync until you're back at the machine (the "worn but empty night" bug).
+    /// Held only while connected; released on disconnect so it never keeps the Mac awake idly.
+    private var sleepAssertionID: IOPMAssertionID = 0
+    private var holdingSleepAssertion = false
+    #endif
     /// Last time ANY notification arrived — drives the liveness watchdog.
     private var lastDataAt = Date()
     /// True while the Live screen wants the (heavy) realtime stream; keep-alive re-arms it.
@@ -247,6 +258,33 @@ public final class BLEManager: NSObject, ObservableObject {
             withServices: [model.scanService],
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
         )
+    }
+
+    /// Hold an idle-system-sleep assertion so overnight offload keeps running with the lid closed.
+    /// Idempotent. macOS-only; no-op elsewhere. Reason string shows in `pmset -g assertions`.
+    private func acquireSleepAssertion() {
+        #if os(macOS)
+        guard !holdingSleepAssertion else { return }
+        let reason = "NOOP: syncing WHOOP data" as CFString
+        let ok = IOPMAssertionCreateWithName(
+            kIOPMAssertPreventUserIdleSystemSleep as CFString,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn), reason, &sleepAssertionID)
+        if ok == kIOReturnSuccess {
+            holdingSleepAssertion = true
+            log("Power: holding idle-sleep assertion (overnight sync)")
+        }
+        #endif
+    }
+
+    /// Release the idle-sleep assertion (on disconnect), so the Mac sleeps normally when idle.
+    private func releaseSleepAssertion() {
+        #if os(macOS)
+        guard holdingSleepAssertion else { return }
+        IOPMAssertionRelease(sleepAssertionID)
+        holdingSleepAssertion = false
+        sleepAssertionID = 0
+        log("Power: released idle-sleep assertion")
+        #endif
     }
 
     public func disconnect() {
@@ -856,6 +894,7 @@ extension BLEManager: CBCentralManagerDelegate {
     public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         restoredPeripheral = nil
         state.connected = true
+        acquireSleepAssertion()   // keep the Mac awake enough to drain the strap overnight
         log("Connected — discovering services")
         peripheral.discoverServices([
             selectedModel.scanService, BLEManager.heartRateService, BLEManager.batteryService,
@@ -867,6 +906,7 @@ extension BLEManager: CBCentralManagerDelegate {
                                error: Error?) {
         Task { @MainActor in await collector?.flush() }
         state.connected = false
+        releaseSleepAssertion()   // let the Mac sleep normally once the strap is gone
         didBond = false
         puffinSessionOpen = false
         whoop5SessionStarted = false

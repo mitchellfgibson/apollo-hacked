@@ -122,19 +122,50 @@ public enum StrainScorer {
         return deltaS > 0 ? deltaS / 60.0 : fallbackSampleMin
     }
 
+    /// Longest a single sample may represent (minutes). A real capture has gaps (strap off, sync
+    /// lulls); charging each sample the full gap would overcount idle time as sustained effort, so a
+    /// gap longer than this is treated as "not wearing / not accumulating" and capped.
+    static let maxSampleDurationMin: Double = 1.0
+
+    /// Per-sample durations (minutes): each sample spans the gap to the NEXT sample, capped at
+    /// `maxSampleDurationMin`; the last sample gets the median of the rest. This replaces the old
+    /// "one global delta from the first two timestamps applied to every sample" approach, which both
+    /// UNDERCOUNTED dense days with mid-day gaps (→ implausible ~0 strain) and OVERCOUNTED when the
+    /// first gap happened to be large (→ strain over 21). Now each sample carries its own real,
+    /// bounded duration, so accumulated TRIMP reflects actual worn-and-active time.
+    static func perSampleDurationsMin(_ hr: [HRSample]) -> [Double] {
+        let n = hr.count
+        if n == 0 { return [] }
+        if n == 1 { return [fallbackSampleMin] }
+        var durs = [Double](repeating: fallbackSampleMin, count: n)
+        var gaps: [Double] = []
+        for i in 0..<(n - 1) {
+            let gapMin = max(0, Double(hr[i + 1].ts - hr[i].ts)) / 60.0
+            let capped = min(gapMin, maxSampleDurationMin)
+            durs[i] = capped
+            if gapMin > 0 { gaps.append(capped) }
+        }
+        durs[n - 1] = gaps.isEmpty ? fallbackSampleMin : gaps.sorted()[gaps.count / 2]
+        return durs
+    }
+
     static func edwardsTRIMP(_ hr: [HRSample], restingHR: Double, hrReserve: Double,
                              sampleDurationMin: Double) -> Double {
-        var weighted = 0
-        for s in hr { weighted += zoneWeight(Double(s.bpm), restingHR: restingHR, hrReserve: hrReserve) }
-        return Double(weighted) * sampleDurationMin
+        let durs = perSampleDurationsMin(hr)
+        var acc = 0.0
+        for (i, s) in hr.enumerated() {
+            acc += Double(zoneWeight(Double(s.bpm), restingHR: restingHR, hrReserve: hrReserve)) * durs[i]
+        }
+        return acc
     }
 
     static func banisterTRIMP(_ hr: [HRSample], restingHR: Double, hrReserve: Double,
                               sampleDurationMin: Double, b: Double) -> Double {
+        let durs = perSampleDurationsMin(hr)
         var acc = 0.0
-        for s in hr {
+        for (i, s) in hr.enumerated() {
             let x = pctHRR(Double(s.bpm), restingHR: restingHR, hrReserve: hrReserve) / 100.0
-            if x > 0 { acc += sampleDurationMin * x * banisterScale * exp(b * x) }
+            if x > 0 { acc += durs[i] * x * banisterScale * exp(b * x) }
         }
         return acc
     }
@@ -146,7 +177,11 @@ public enum StrainScorer {
     public static func trimpToStrain(_ trimp: Double, denominator: Double = strainDenominator) -> Double {
         if trimp <= 0 { return 0 }
         let value = maxStrain * log(trimp + 1.0) / log(denominator)
-        return (value * 100).rounded() / 100
+        // Clamp to [0, maxStrain]. The log map only lands on exactly 21 when TRIMP == denominator; a
+        // very active day (or an over-long HR window) pushes TRIMP past D and the raw value exceeds
+        // 21 — the strain scale has no values above 21, so a "31.01" is a bug. Cap it.
+        let clamped = min(maxStrain, max(0, value))
+        return (clamped * 100).rounded() / 100
     }
 
     // MARK: - Denominator calibration

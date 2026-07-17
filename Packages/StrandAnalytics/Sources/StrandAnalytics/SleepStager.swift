@@ -68,8 +68,14 @@ public enum SleepStager {
     public static let stillWindowMin: Int = 15
     /// Fraction of still samples to call the window-center "sleep".
     public static let stillFraction: Double = 0.70
-    /// Data gap (minutes) that always breaks a run.
-    public static let maxGapMin: Int = 20
+    /// Data gap (minutes) that always breaks a run. Raised from 20 → 45 because real capture is
+    /// SPARSE: gravity lands at ~0.4 Hz with multi-minute holes, so a 20-min break shattered a
+    /// single night's sleep into sub-60-min fragments that then failed `minSleepMin` and vanished.
+    /// A person who is "still" before AND after a short data gap was almost certainly still THROUGH
+    /// it (missing data ≠ movement), so we bridge gaps up to this length inside a sleep run. 45 min
+    /// is deliberately below a shower/charge/off-wrist stretch, so a genuine daytime break still
+    /// splits the run (90 min over-merged daytime activity into the night — verified on real data).
+    public static let maxGapMin: Int = 45
     /// Runs shorter than this (minutes) are absorbed into neighbours.
     public static let mergeMin: Int = 15
     /// A sleep run must exceed this (minutes) to count as a session.
@@ -258,6 +264,25 @@ public enum SleepStager {
         return meanHR <= baseline * hrSleepBaselineMult
     }
 
+    /// HR-derived sleep efficiency for a run, used as a fallback when gravity is too sparse to stage.
+    /// A whole-day baseline would call ~all night HR "asleep" (→ implausible 100%), so instead we
+    /// anchor the threshold to the run's OWN heart rate: samples within a margin of the run's minimum
+    /// (its sleeping-HR floor) count as asleep, the elevated ones as restless/awake. Result is capped
+    /// at a realistic 0.97 so the fallback never claims a perfect night. nil without enough HR.
+    static let hrEffAwakeMarginBpm: Double = 12.0
+    static let hrEffMax: Double = 0.97
+    static func hrEfficiency(_ p: Period, hr: [HRSample], baseline: Double?) -> Double? {
+        let seg = rowsBetween(hr, start: p.start, end: p.end) { $0.ts }.filter { $0.bpm > 0 }
+        guard seg.count >= hrRefineMinSamples else { return nil }
+        let bpms = seg.map { Double($0.bpm) }
+        // Sleeping-HR floor = a low percentile (robust to the odd dropout), not the raw min.
+        let sorted = bpms.sorted()
+        let floor = sorted[max(0, Int(Double(sorted.count) * 0.05))]
+        let threshold = floor + hrEffAwakeMarginBpm
+        let asleep = bpms.filter { $0 <= threshold }.count
+        return min(hrEffMax, Double(asleep) / Double(bpms.count))
+    }
+
     // MARK: - detectSleep (public)
 
     /// Detect sleep sessions from biometric streams. Empty/absent gravity → [].
@@ -288,7 +313,19 @@ public enum SleepStager {
             if !confirmSleepWithHR(p, hr: hrS, baseline: baseline) { continue }
             let stages = stageSession(start: p.start, end: p.end, grav: grav,
                                       hr: hrS, rr: rrS, resp: respS)
-            let eff = efficiency(start: p.start, end: p.end, stages: stages)
+            var eff = efficiency(start: p.start, end: p.end, stages: stages)
+            // GRACEFUL DEGRADATION on sparse gravity: when a run has too little motion data to stage,
+            // the epoch grid defaults nearly everything to "wake" and efficiency collapses to a broken
+            // ~0.02 even though HR clearly shows the person was asleep. Detect that case (gravity too
+            // sparse to trust the staged efficiency) and fall back to an HR-derived efficiency — the
+            // fraction of the run whose HR sits at/below the sleep threshold. Better an approximate
+            // number than a nonsense 2%.
+            let gravInRun = rowsBetween(grav, start: p.start, end: p.end) { $0.ts }.count
+            let runMinutes = Double(p.end - p.start) / 60.0
+            let gravPerMin = runMinutes > 0 ? Double(gravInRun) / runMinutes : 0
+            if gravPerMin < 8, let hrEff = hrEfficiency(p, hr: hrS, baseline: baseline), hrEff > eff {
+                eff = hrEff
+            }
             let resting = sessionRestingHR(start: p.start, end: p.end, hr: hrS)
             let avgHrv = sessionAvgHRV(start: p.start, end: p.end, rr: rrS)
             sessions.append(SleepSession(start: p.start, end: p.end, efficiency: eff,
@@ -783,19 +820,17 @@ public enum SleepStager {
     /// Mean RMSSD over 5-min tumbling windows across the session (ms), or nil.
     /// Uses the same range-filter + ≥2-valid-interval rule as hrv.rmssd().
     static func sessionAvgHRV(start: Int, end: Int, rr: [RRInterval]) -> Double? {
-        let seg = rr.filter { $0.ts >= start && $0.ts <= end }
-        guard !seg.isEmpty else { return nil }
-        let windowS = 5 * 60
-        var vals: [Double] = []
-        var t = start
-        while t < end {
-            let bucket = seg.filter { $0.ts >= t && $0.ts < t + windowS }.map { Double($0.rrMs) }
-            let filtered = HRVAnalyzer.rangeFilter(bucket)
-            if filtered.count >= 2, let r = HRVAnalyzer.rmssdRaw(filtered) { vals.append(r) }
-            t += windowS
-        }
-        guard !vals.isEmpty else { return nil }
-        return vals.reduce(0, +) / Double(vals.count)
+        let seg = rr.filter { $0.ts >= start && $0.ts <= end }.map { Double($0.rrMs) }
+        guard seg.count >= 2 else { return nil }
+        // Clean over the WHOLE session, not per 5-min bucket. RMSSD is dominated by SUCCESSIVE
+        // differences, and the Malik ectopic filter needs a real neighborhood to spot artifact beats
+        // (a missed beat like 850→1600→850 ms); a 5-min bucket is too short for it to work, which is
+        // why nightly HRV was landing at an impossible 150–560 ms and making recovery swing / vanish.
+        // Filtering the full night first (range → ectopic → RMSSD) matches the verified pipeline that
+        // brings a real night from a bogus 223 ms down to a physiological ~66 ms.
+        let cleaned = HRVAnalyzer.cleanRR(seg)   // range → ectopic → successive-jump guard
+        guard cleaned.count >= 2 else { return nil }
+        return HRVAnalyzer.rmssdRaw(cleaned)
     }
 
     // MARK: - AASM hypnogram metrics
