@@ -181,10 +181,23 @@ final class Backfiller {
     func persistChunk(frames: [[UInt8]], trim: UInt32) async -> Bool {
         if !frames.isEmpty {
             let ref = clockRef ?? { let now = Int(Date().timeIntervalSince1970); return ClockRef(device: now, wall: now) }()
-            let parsed = frames.map { parseFrame($0, family: family) }
-            let decoded = extract(parsed, ref.device, ref.wall)
-            do { try await store.insert(decoded, deviceId: deviceId) } catch { return false }
+
+            // THROUGHPUT: on this firmware ~96% of the offloaded bytes are v20/v21 type-47 records —
+            // the bulk 100 Hz raw optical/PPG waveforms (1244–2140 B each). They carry NO named field
+            // our `extract` understands (HR/gravity/skin-temp/rr all live in the tiny v18 summary), so
+            // fully `parseFrame`-ing them was pure wasted CPU that starved the v18 summaries behind it.
+            // Split by version (a cheap header read, no full parse): fully decode+insert ONLY the
+            // summary frames (v18 and everything that isn't a known raw-waveform version); the raw
+            // v20/v21 frames are still stored verbatim below (nothing lost — they're preserved on disk
+            // for the future PPG-decode project), just not decoded here.
+            let summaryFrames = frames.filter { !Self.isRawWaveformFrame($0, family: family) }
+            if !summaryFrames.isEmpty {
+                let parsed = summaryFrames.map { parseFrame($0, family: family) }
+                let decoded = extract(parsed, ref.device, ref.wall)
+                do { try await store.insert(decoded, deviceId: deviceId) } catch { return false }
+            }
             if enableRawCapture {
+                // Store ALL frames raw (including v20/v21) so the 100 Hz PPG is preserved for later.
                 let meta = RawBatchMeta(
                     batchId: "hist-\(deviceId)-\(trim)",
                     deviceId: deviceId,
@@ -199,5 +212,22 @@ final class Backfiller {
         }
         do { try await store.setCursor("strap_trim", Int(trim)) } catch { return false }
         return true
+    }
+
+    /// True for a type-47 HISTORICAL_DATA frame whose layout version is a bulk raw-waveform record
+    /// (v20/v21 — the 100 Hz optical channels), which `extract` produces no usable named fields from.
+    /// Cheap header-only check: packet type at frame[8] (puffin) / frame[4] (whoop4), version at the
+    /// following byte. Anything else (v18 summary, v26 burst, non-type-47) returns false so it's
+    /// still fully decoded.
+    static func isRawWaveformFrame(_ frame: [UInt8], family: DeviceFamily) -> Bool {
+        let typeOffset: Int
+        switch family {
+        case .whoop5: typeOffset = 8
+        case .whoop4: typeOffset = 4
+        }
+        let verOffset = typeOffset + 1
+        guard frame.count > verOffset else { return false }
+        guard frame[typeOffset] == 47 else { return false }   // only HISTORICAL_DATA has these versions
+        return frame[verOffset] == 20 || frame[verOffset] == 21
     }
 }

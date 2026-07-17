@@ -184,6 +184,17 @@ public final class OffloadEngine {
     /// caller only routes genuine backlog-offload frames (packet types 47/48/49/50) to the engine,
     /// exactly as `BLEManager.didUpdateValueFor` already gates.
     public func ingest(_ frame: [UInt8]) {
+        // HOT-PATH FAST-SKIP: a type-47 HISTORICAL_DATA frame is ALWAYS `.other` (only the type-49
+        // METADATA frames carry START/END/COMPLETE). Type-47 records dominate the stream — and on
+        // this firmware most are the 1–2 KB v20/v21 raw waveforms — so fully `parseFrame`-ing each
+        // one just to reach the `.other` case was the offload's per-frame CPU sink. Read the packet
+        // type from the header (frame[8] puffin / frame[4] whoop4) and, if it's data, append raw and
+        // return without decoding. Metadata frames still take the full parse+classify path below.
+        let typeOffset = family == .whoop5 ? 8 : 4
+        if frame.count > typeOffset, frame[typeOffset] == 47 {
+            if chunkOpen { chunk.append(frame) }
+            return
+        }
         switch classifyHistoricalMeta(parseFrame(frame, family: family)) {
         case .start:
             isOffloading = true

@@ -751,8 +751,14 @@ public enum SleepStager {
 
         // WAKE: sustained motion + activated cardiac (or no HR to vet motion).
         if moving && (cardiacActivated || !hasHR) { return "wake" }
-        // DEEP: still + high parasympathetic tone + low HR + regular respiration.
-        if still && parasympHigh && hrLow && rrvRegular { return "deep" }
+        // DEEP (slow-wave): the physiological core is STILL body + LOW heart rate + HIGH vagal tone.
+        // The old gate ALSO required `rrvRegular` (regular respiration) as a hard AND, which — with
+        // RRV frequently NaN or noisy — was almost never all-true at once, so deep collapsed to ~0-2%
+        // (real deep is ~13-23%) and everything spilled into "light". Respiration regularity is now a
+        // SUPPORTING signal, not a requirement: deep needs still + low HR + (high RMSSD OR regular
+        // respiration). That restores physiological deep-sleep proportions while still keeping deep
+        // anchored to genuine low-HR stillness.
+        if still && hrLow && (parasympHigh || rrvRegular) { return "deep" }
         // REM: still body + activated cardiac + irregular respiration.
         if still && cardiacActivated && rrvIrregular { return "rem" }
         // REM fallback when respiration unavailable: require BOTH cardiac signals.
