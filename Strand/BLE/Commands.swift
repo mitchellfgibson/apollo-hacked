@@ -28,6 +28,9 @@ public enum WhoopCommand: UInt8, CaseIterable {
     case getExtendedBatteryInfo = 98
     case toggleIMUMode         = 106
     case enableOpticalData     = 107
+    // READ-ONLY recon (safe): report firmware/versions + read device-config values. Used to map
+    // what controls the historical offload content before any (risky) config WRITE.
+    case getDeviceConfigValue  = 121
     /// Fire a preset haptic pattern. Payload = `[patternId, numLoops, 0, 0, 0]` (5 bytes, from
     /// the device's preset table). patternId indexes the device's preset patterns (GET_ALL_HAPTICS_PATTERN
     /// reports 7 on harvard); the official app fires id=2. Safe/reversible — just buzzes the motor.
@@ -79,6 +82,7 @@ public enum WhoopCommand: UInt8, CaseIterable {
         case .enterHighFreqSync:     return "Enter High-Freq Sync"
         case .exitHighFreqSync:      return "Exit High-Freq Sync"
         case .getExtendedBatteryInfo:return "Get Extended Battery Info"
+        case .getDeviceConfigValue:  return "Get Device Config Value"
         case .toggleIMUMode:         return "Toggle IMU Mode"
         case .enableOpticalData:     return "Enable Optical Data"
         case .runHapticsPattern:     return "Run Haptics Pattern"

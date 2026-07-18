@@ -361,7 +361,10 @@ public final class BLEManager: NSObject, ObservableObject {
                 || command == .setAlarmTime || command == .getAlarmTime
                 || command == .runAlarm || command == .disableAlarm
                 || command == .sendHistoricalData || command == .historicalDataResult
-                || command == .setClock || command == .getClock else {
+                || command == .setClock || command == .getClock
+                // READ-ONLY recon commands (safe — they don't change device state).
+                || command == .reportVersionInfo || command == .getDeviceConfigValue
+                || command == .getExtendedBatteryInfo || command == .getDataRange else {
                 log("send(\(command.label)) skipped — no WHOOP 5/MG framing for this command yet")
                 return
             }
@@ -832,6 +835,22 @@ public final class BLEManager: NSObject, ObservableObject {
     /// with a single pattern-id byte. Verified on real MG hardware (2026-07-09): payload [2] buzzes.
     ///
     /// Haptic firing cannot be verified in the simulator (no strap motor). Test on-device only.
+    /// TEMP READ-ONLY RECON: fire the safe GET_* commands to map the device's config/version, so we
+    /// can learn what controls historical-offload content before any risky config WRITE. Responses
+    /// are dumped to stderr (see processDecodedFrame RECON-RESP). Purely read-only — no device state
+    /// changes. `getDeviceConfigValue` is probed across a few plausible config keys.
+    func runProtocolRecon() {
+        log("RECON: firing read-only version/config queries")
+        send(.reportVersionInfo, payload: [0x00])
+        send(.getExtendedBatteryInfo, payload: [0x00])
+        // GET_DEVICE_CONFIG_VALUE(121): payload is a config-key selector (unknown). Probe keys 0..15;
+        // each just READS a value back, changing nothing. We look for one whose response looks like a
+        // record-type / optical-save flag.
+        for key in 0..<16 {
+            send(.getDeviceConfigValue, payload: [UInt8(key)])
+        }
+    }
+
     func testAlarmBuzz() {
         // Send runHapticsPattern — for 5/MG, send() REMAPS this to the maverick buzz (cmd 0x13 + the
         // correct 12-byte payload); for WHOOP 4 it's the native pattern. Both confirmed writes, plus
