@@ -86,6 +86,7 @@ final class AppModel: ObservableObject {
             try? await Task.sleep(nanoseconds: 6_000_000_000)  // give the first offload a moment
             while !Task.isCancelled {
                 await self.intelligence.analyzeRecent()
+                await self.sheetExporter.autoExportIfDue()   // no-op until enabled + 3 real days exist
                 try? await Task.sleep(nanoseconds: 900_000_000_000)  // 15 min, matches the offload cadence
             }
         }
@@ -101,6 +102,7 @@ final class AppModel: ObservableObject {
             try? await Task.sleep(nanoseconds: 10_000_000_000)   // 10s settle
             guard !Task.isCancelled, let self else { return }
             await self.intelligence.analyzeRecent()
+            await self.sheetExporter.autoExportIfDue()   // push fresh nights automatically once eligible
         }
     }
 

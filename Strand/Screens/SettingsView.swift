@@ -549,6 +549,7 @@ private struct SheetExportCard: View {
     @ObservedObject var exporter: SheetExporter
     @AppStorage("sheet.exportURL") private var sheetURL = ""
     @AppStorage("sheet.exportToken") private var sheetToken = ""
+    @AppStorage("sheet.autoExport") private var autoExport = true
 
     var body: some View {
         SettingsSection(
@@ -586,6 +587,19 @@ private struct SheetExportCard: View {
                     if exporter.busy { ProgressView().controlSize(.small) }
                     Spacer(minLength: 0)
                 }
+
+                Toggle(isOn: $autoExport) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Auto-export daily")
+                            .font(StrandFont.body)
+                            .foregroundStyle(StrandPalette.textPrimary)
+                        Text("Pushes new nights automatically once you have 3 days of real data.")
+                            .font(StrandFont.footnote)
+                            .foregroundStyle(StrandPalette.textSecondary)
+                    }
+                }
+                .tint(StrandPalette.accent)
+                .disabled(sheetURL.isEmpty || sheetToken.isEmpty)
 
                 if let status = exporter.lastStatus ?? exporter.lastRunSummary {
                     HStack(alignment: .top, spacing: 10) {

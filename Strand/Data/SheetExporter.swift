@@ -24,9 +24,16 @@ final class SheetExporter: ObservableObject {
     private let tokenKey = "sheet.exportToken"
     private let watermarkKey = "sheet.lastExportedDay"     // "YYYY-MM-DD"
     private let lastRunKey = "sheet.lastRunAt"
+    private let autoKey = "sheet.autoExport"
+    private let lastAutoKey = "sheet.lastAutoAt"
 
     /// Days re-sent below the watermark so recomputed nights overwrite in the Sheet.
     private let overlapDays = 14
+    /// Auto-export holds off until this many days of REAL data (a scored night with resting HR + HRV)
+    /// exist, so the Sheet isn't seeded with sparse warmup days before there's a baseline to analyze.
+    private let minRealDays = 3
+    /// Don't auto-fire more than once per this interval (guards the analyzeRecent cadence).
+    private let autoMinInterval: TimeInterval = 30 * 60
 
     init(repo: Repository, deviceId: String) {
         self.repo = repo; self.deviceId = deviceId
@@ -41,6 +48,41 @@ final class SheetExporter: ObservableObject {
         set { UserDefaults.standard.set(newValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: tokenKey) }
     }
     var isConfigured: Bool { !exportURL.isEmpty && !exportToken.isEmpty }
+
+    /// Auto-export toggle. Defaults ON (the user asked for it) but only acts once configured AND the
+    /// 3-real-day gate is met; before that it's inert, so turning it on early does nothing surprising.
+    var autoExportEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: autoKey) as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: autoKey) }
+    }
+
+    // MARK: - Auto-export
+
+    /// Called after each recompute (app launch, the 15-min loop, and post-backfill). Fires an export
+    /// only when: enabled + configured, ≥3 real days exist, at least a new day has landed since the
+    /// last export, and the rate limit has elapsed. All cheap checks before any network use.
+    func autoExportIfDue() async {
+        guard autoExportEnabled, isConfigured, !busy else { return }
+        let last = UserDefaults.standard.object(forKey: lastAutoKey) as? Date ?? .distantPast
+        guard Date().timeIntervalSince(last) >= autoMinInterval else { return }
+        guard let store = await repo.storeHandle() else { return }
+
+        let today = Self.dayFormatter.string(from: Date())
+        let metrics = (try? await store.dailyMetrics(deviceId: computedDeviceId,
+                                                     from: "2000-01-01", to: today)) ?? []
+        // "Real" day = a scored night (both resting HR and HRV present).
+        let realDays = metrics.filter { $0.restingHr != nil && $0.avgHrv != nil }.count
+        guard realDays >= minRealDays else { return }
+
+        // Only auto-fire when there's genuinely a newer day than we've already pushed. Recompute-only
+        // changes to already-sent days ride along on the next new-day export via the overlap window.
+        let watermark = UserDefaults.standard.string(forKey: watermarkKey) ?? ""
+        let newest = metrics.map(\.day).max() ?? ""
+        guard newest > watermark else { return }
+
+        UserDefaults.standard.set(Date(), forKey: lastAutoKey)
+        await exportNow()
+    }
 
     // MARK: - Export
 
