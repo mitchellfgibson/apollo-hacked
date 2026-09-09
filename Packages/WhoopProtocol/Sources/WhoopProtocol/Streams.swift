@@ -77,6 +77,33 @@ public struct GravitySample: Equatable, Codable {
     }
 }
 
+/// Per-second motion summary derived from a v21 raw-IMU record (100 Hz, 6 axes). See `ImuFeatures`
+/// for why the summary is stored rather than the waveform.
+public struct ImuFeatureSample: Equatable, Codable {
+    public let ts: Int
+    public let accelMagMean: Double
+    public let accelMagSd: Double
+    public let jerkMean: Double
+    public let gyroMagMean: Double
+    public let activityCount: Int
+    public init(ts: Int, accelMagMean: Double, accelMagSd: Double,
+                jerkMean: Double, gyroMagMean: Double, activityCount: Int) {
+        self.ts = ts; self.accelMagMean = accelMagMean; self.accelMagSd = accelMagSd
+        self.jerkMean = jerkMean; self.gyroMagMean = gyroMagMean; self.activityCount = activityCount
+    }
+}
+
+/// One second of the WHOOP 5 v26 optical PPG waveform: 24 raw ADC samples @ 24 Hz.
+/// Raw AC-coupled counts — no absolute unit, no invented scale.
+public struct PPGWaveformSample: Equatable, Codable {
+    public let ts: Int
+    public let samples: [Int]
+    public let unit: String     // "raw_adc"
+    public init(ts: Int, samples: [Int], unit: String = "raw_adc") {
+        self.ts = ts; self.samples = samples; self.unit = unit
+    }
+}
+
 public struct Streams: Equatable, Codable {
     public var hr: [HRSample]
     public var rr: [RRInterval]
@@ -84,19 +111,23 @@ public struct Streams: Equatable, Codable {
     public var skinTemp: [SkinTempSample]
     public var resp: [RespSample]
     public var gravity: [GravitySample]
+    public var ppg: [PPGWaveformSample]
+    public var imu: [ImuFeatureSample]
     public var events: [WhoopEvent]
     public var battery: [BatterySample]
     public init(hr: [HRSample] = [], rr: [RRInterval] = [],
                 spo2: [SpO2Sample] = [], skinTemp: [SkinTempSample] = [],
                 resp: [RespSample] = [], gravity: [GravitySample] = [],
+                ppg: [PPGWaveformSample] = [], imu: [ImuFeatureSample] = [],
                 events: [WhoopEvent] = [], battery: [BatterySample] = []) {
         self.hr = hr; self.rr = rr
         self.spo2 = spo2; self.skinTemp = skinTemp; self.resp = resp; self.gravity = gravity
+        self.ppg = ppg; self.imu = imu
         self.events = events; self.battery = battery
     }
 
     private enum CodingKeys: String, CodingKey {
-        case hr, rr, spo2, skinTemp = "skin_temp", resp, gravity, events, battery
+        case hr, rr, spo2, skinTemp = "skin_temp", resp, gravity, ppg, imu, events, battery
     }
 
     // Custom decode so older fixtures (streams_golden.json / historical_golden.json) that
@@ -109,6 +140,8 @@ public struct Streams: Equatable, Codable {
         skinTemp = try c.decodeIfPresent([SkinTempSample].self, forKey: .skinTemp) ?? []
         resp = try c.decodeIfPresent([RespSample].self, forKey: .resp) ?? []
         gravity = try c.decodeIfPresent([GravitySample].self, forKey: .gravity) ?? []
+        ppg = try c.decodeIfPresent([PPGWaveformSample].self, forKey: .ppg) ?? []
+        imu = try c.decodeIfPresent([ImuFeatureSample].self, forKey: .imu) ?? []
         events = try c.decodeIfPresent([WhoopEvent].self, forKey: .events) ?? []
         battery = try c.decodeIfPresent([BatterySample].self, forKey: .battery) ?? []
     }

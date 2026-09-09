@@ -39,6 +39,7 @@ struct SettingsView: View {
             strapCard
             // The old "Data" nav page now lives here — embedded (no scaffold), with env + state intact.
             DataSourcesView(embedded: true)
+            SheetExportCard(exporter: model.sheetExporter)
             backupCard
 
             // Simple version footer (replaces the old About page).
@@ -537,6 +538,69 @@ private struct FormRow<Control: View>: View {
             control()
         }
         .frame(minHeight: 32)
+    }
+}
+
+// MARK: - Google Sheet export
+
+/// One-button push of the analysis-ready daily rows to a Google Sheet (via an Apps Script Web App).
+/// URL + token are pasted once; the button sends every new/changed day and advances the watermark.
+private struct SheetExportCard: View {
+    @ObservedObject var exporter: SheetExporter
+    @AppStorage("sheet.exportURL") private var sheetURL = ""
+    @AppStorage("sheet.exportToken") private var sheetToken = ""
+
+    var body: some View {
+        SettingsSection(
+            icon: "tablecells.badge.ellipsis",
+            title: "Export to Google Sheet",
+            blurb: "Send your daily numbers — resting HR, HRV, HR range, recovery, strain, sleep — to a Google Sheet for trend analysis. One tap ships every new or recomputed day; nothing leaves the device until you press it."
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                FormRow(label: "Web App URL") {
+                    TextField("https://script.google.com/…/exec", text: $sheetURL)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(maxWidth: 360)
+                        #if !os(macOS)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        #endif
+                }
+                FormRow(label: "Token") {
+                    SecureField("shared token", text: $sheetToken)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(maxWidth: 360)
+                }
+
+                HStack(spacing: 12) {
+                    Button {
+                        Task { await exporter.exportNow() }
+                    } label: {
+                        Label(exporter.busy ? "Sending…" : "Export now", systemImage: "square.and.arrow.up.on.square")
+                            .padding(.horizontal, 6)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(StrandPalette.accent)
+                    .disabled(exporter.busy || sheetURL.isEmpty || sheetToken.isEmpty)
+
+                    if exporter.busy { ProgressView().controlSize(.small) }
+                    Spacer(minLength: 0)
+                }
+
+                if let status = exporter.lastStatus ?? exporter.lastRunSummary {
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: "info.circle.fill")
+                            .foregroundStyle(StrandPalette.textTertiary)
+                            .font(.system(size: 13))
+                            .accessibilityHidden(true)
+                        Text(status)
+                            .font(StrandFont.footnote)
+                            .foregroundStyle(StrandPalette.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
     }
 }
 

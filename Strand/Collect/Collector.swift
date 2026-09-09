@@ -10,7 +10,7 @@ protocol StoreWriting: AnyObject {
     @discardableResult
     func insert(_ streams: Streams, deviceId: String) async throws
         -> (hr: Int, rr: Int, events: Int, battery: Int,
-            spo2: Int, skinTemp: Int, resp: Int, gravity: Int)
+            spo2: Int, skinTemp: Int, resp: Int, gravity: Int, ppg: Int, imu: Int)
     func enqueueRawBatch(_ meta: RawBatchMeta, frames: [[UInt8]]) async throws
 }
 extension WhoopStore: StoreWriting {}

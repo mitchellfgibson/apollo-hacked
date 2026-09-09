@@ -70,6 +70,7 @@ final class IntelligenceEngine: ObservableObject {
         let todayMidnight = Int(cal.startOfDay(for: Date()).timeIntervalSince1970)
         var out: [Computed] = []
         var dailies: [DailyMetric] = []
+        var nightlyTempC: [Double?] = []
         var cachedSleep: [CachedSleepSession] = []
 
         for offset in 0..<maxDays {
@@ -87,15 +88,35 @@ final class IntelligenceEngine: ObservableObject {
             let rr = (try? await store.rrIntervals(deviceId: deviceId, from: from, to: to, limit: 200_000)) ?? []
             let resp = (try? await store.respSamples(deviceId: deviceId, from: from, to: to, limit: 200_000)) ?? []
             let grav = (try? await store.gravitySamples(deviceId: deviceId, from: from, to: to, limit: 200_000)) ?? []
+            let ppg = (try? await store.ppgWaveforms(deviceId: deviceId, from: from, to: to, limit: 200_000)) ?? []
+            let skinTemp = (try? await store.skinTempSamples(deviceId: deviceId, from: from, to: to, limit: 200_000)) ?? []
 
             let res = AnalyticsEngine.analyzeDay(day: day, dayStart: dayStart,
                                                  hr: hr, rr: rr, resp: resp, gravity: grav,
+                                                 ppg: ppg, skinTemp: skinTemp,
                                                  profile: up, baselines: baselines, maxHROverride: maxHR)
             out.append(Computed(day: day, recovery: res.recovery, strain: res.strain,
                                 sleepMin: res.daily.totalSleepMin, hrv: res.daily.avgHrv,
                                 rhr: res.daily.restingHr))
             dailies.append(res.daily)
+            nightlyTempC.append(res.nightlySkinTempC)
             cachedSleep.append(contentsOf: res.cachedSleep)
+        }
+
+        // Skin-temperature DEVIATION: WHOOP reports skin temp as °C above/below the personal norm,
+        // not an absolute. Baseline = median of the nightly means across the analyzed window (a
+        // trailing personal norm that sharpens as history grows); rewrite each day's skinTempDevC as
+        // nightly − baseline. On cold start (one night) deviation is ~0, which is the honest reading.
+        let tempBaseline: Double? = {
+            let vals = nightlyTempC.compactMap { $0 }
+            guard !vals.isEmpty else { return nil }
+            return AnalyticsEngine.median(vals)
+        }()
+        if let base = tempBaseline {
+            dailies = zip(dailies, nightlyTempC).map { daily, nightly in
+                guard let n = nightly else { return daily }
+                return daily.withSkinTempDevC(n - base)
+            }
         }
 
         // Persist the computed scores under a dedicated "-noop" source so the WHOLE dashboard

@@ -583,18 +583,38 @@ private func decodeWhoop5HistoricalV2021(_ frame: [UInt8], fb: FieldBuilder, ver
         fb.add(15, 4, "unix", "time", value: .int(unix), note: "real unix seconds")
     }
     if version == 21 {
-        // Three 100-sample i16 channels, 200 B apart.
-        for (ch, start) in [(0, 28), (1, 228), (2, 428)] {
+        // v21 is the raw 6-axis IMU buffer, NOT an optical one. Earlier builds here read only the
+        // first three channels and named them `optical_ch0..2` while asserting no identity. Hardware
+        // validation on 1423 real buffers (fw 50.40.1.0) identifies them: the first three are the
+        // accelerometer (ax, ay, az) at 1/4096 g per LSB, and there are three MORE channels this
+        // decoder never read at all — the gyroscope (gx, gy, gz) at 2000/32768 (°/s) per LSB, ±2000
+        // dps. Evidence: accel magnitude forms a 1.01 g gravity shell (100% of samples within ±15% of
+        // the median, 4117 ± 11 LSB over 200 s) and gyro rests near zero, spikes on motion, and
+        // correlates 0.79 with accel motion. Columnar layout: all of one axis, then the next.
+        let axes: [(name: String, start: Int)] = [
+            ("imu_ax", 28), ("imu_ay", 228), ("imu_az", 428),
+            ("imu_gx", 640), ("imu_gy", 840), ("imu_gz", 1040),
+        ]
+        var decoded = 0
+        for axis in axes {
             var samples: [Int] = []
             for i in 0..<100 {
-                guard let v = readI16(frame, start + i * 2) else { break }
+                guard let v = readI16(frame, axis.start + i * 2) else { break }
                 samples.append(v)
             }
             if samples.count == 100 {
-                fb.add(start, 200, "optical_ch\(ch)", "ppg", value: .intArray(samples),
-                       note: "raw i16 channel samples (no absolute unit)")
+                fb.add(axis.start, 200, axis.name, "imu", value: .intArray(samples),
+                       note: "raw i16 columnar samples @100 Hz")
+                decoded += 1
             }
         }
+        if let countA = readDType(frame, 24, "u16") {
+            fb.add(24, 2, "imu_accel_count", "imu", value: .int(countA))
+        }
+        if let countB = readDType(frame, 630, "u16") {
+            fb.add(630, 2, "imu_gyro_count", "imu", value: .int(countB))
+        }
+        fb.parsed["imu_axes_present"] = .int(decoded)
         fb.parsed["sensor_channel_samples"] = .int(100)
         return
     }

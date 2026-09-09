@@ -94,13 +94,11 @@ public final class BLEManager: NSObject, ObservableObject {
             CBConnectPeripheralOptionNotifyOnConnectionKey: true,
             CBConnectPeripheralOptionNotifyOnDisconnectionKey: true,
         ]
-        // System-managed auto-reconnect is iOS 17+ only; on older iOS (and macOS) our own
-        // didDisconnect → connect(peripheral:) retry loop covers the same ground.
-        #if os(iOS)
-        if #available(iOS 17.0, *) {
-            opts[CBConnectPeripheralOptionEnableAutoReconnect] = true
-        }
-        #endif
+        // NOTE: CBConnectPeripheralOptionEnableAutoReconnect was set here for iOS 17+, but the
+        // 5/MG rejects the connect with "one or more parameters were invalid" — the strap never
+        // completes a bond (it answers pairing with Pairing Not Supported), and system-managed
+        // auto-reconnect is not valid for a peripheral that never bonds. Our own
+        // didDisconnect → connect(peripheral:) retry loop covers the same ground on every OS.
         return opts
     }
     private var keepAliveTick = 0
@@ -169,6 +167,14 @@ public final class BLEManager: NSObject, ObservableObject {
     /// Guards the once-per-connection 5/MG post-bond handshake (subscribe → SET_CLOCK → offload).
     /// didWriteValueFor re-fires on every later .withResponse ack, so the handshake must run once.
     private var whoop5SessionStarted = false
+    /// BOND REVIVAL (5/MG, once per connection): since ~2026-08 the strap security-gates the whole
+    /// fd4b service — even CLIENT_HELLO is refused with ATT 5/15 until the link is encrypted, and
+    /// fresh pairing attempts are answered "Pairing Not Supported". A STORED bond re-encrypts
+    /// without pairing, so on that refusal we deliberately touch the auth-gated notify chars to
+    /// make iOS elevate link security from its keystore, then re-send CLIENT_HELLO on success.
+    private var bondRevivalAttempted = false
+    private var helloRetriedPostEncrypt = false
+    private var revivalProbeFailures = 0
     private var clockRequested = false
     private var intentionalDisconnect = false
     /// The strap family the user chose to pair. Drives which service we scan for
@@ -224,6 +230,12 @@ public final class BLEManager: NSObject, ObservableObject {
                                     self?.ackHistoricalChunk(trim: trim, endData: endData)
                                 },
                                 enableRawCapture: enableRawCapture)
+        // Set the decode family AT CONSTRUCTION. It was previously only assigned in `connect()` and
+        // `didDiscoverServices`, both via `backfiller?.` optional-chains — and this bootstrap runs in
+        // a detached Task that opens and migrates a 36MB SQLite file. If discovery won that race both
+        // assignments no-op'd, leaving the Backfiller on the WHOOP-4 parser: puffin chunks then
+        // decoded to zero rows, were acked, and the strap trimmed them away for good.
+        backfiller?.family = selectedModel.deviceFamily
         // Strand: no server uploader/sync — all data stays on-device.
     }
 
@@ -254,11 +266,36 @@ public final class BLEManager: NSObject, ObservableObject {
             log("Bluetooth not powered on (state=\(central.state.rawValue)); cannot scan yet")
             return
         }
+        // A strap already connected system-side does NOT advertise, so a scan can never see it.
+        // Retrieve it directly instead. Match on the standard HR service: the 5/MG exposes 180D
+        // bond-free, while the custom service is bond-gated and may not be visible yet.
+        let attached = central.retrieveConnectedPeripherals(
+            withServices: [model.scanService, BLEManager.heartRateService]
+        )
+        if let p = attached.first {
+            log("Already connected system-side — attaching \(p.name ?? p.identifier.uuidString)")
+            peripheral = p
+            p.delegate = self
+            central.connect(p, options: BLEManager.reconnectOptions)
+            return
+        }
+
+        // Scan UNFILTERED. The WHOOP 5/MG advertises only its local name and 180D — it does NOT
+        // put fd4b0001-… in its advertisement packet, so `withServices: [scanService]` matches
+        // nothing (verified by passive capture: `name=WHOOP 5B00130737 services=180D`).
+        // Candidates are filtered by name in `didDiscover` instead.
         log("Scanning for \(model.displayName)…")
         central.scanForPeripherals(
-            withServices: [model.scanService],
+            withServices: nil,
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
         )
+    }
+
+    /// Whether an advertisement looks like the strap we're pairing. The custom service is
+    /// accepted when present, but the 5/MG normally identifies itself by name alone.
+    private func isStrapCandidate(name: String, advertisedServices: [CBUUID]) -> Bool {
+        if advertisedServices.contains(selectedModel.scanService) { return true }
+        return name.uppercased().hasPrefix("WHOOP")
     }
 
     /// Hold an idle-system-sleep assertion so overnight offload keeps running with the lid closed.
@@ -480,7 +517,12 @@ public final class BLEManager: NSObject, ObservableObject {
             Task { @MainActor in
                 if await self.backfiller?.persistChunk(frames: frames, trim: trim) == true {
                     engine.confirmDurable(trim: trim)
-                    await self.recomputeSyncProgress()   // fill the sync ring as history lands
+                    // PERF: recomputeSyncProgress runs two non-indexable full scans of the 14-day
+                    // hrSample window (GROUP BY ts/3600, plus a LAG window query) on the SAME serial
+                    // DatabaseQueue as the inserts. A chunk arrives every ~50 records, so this
+                    // queued the next chunk's write behind two ~100k-row scans. Throttle it — the
+                    // sync ring is a progress indicator, not a correctness surface.
+                    await self.recomputeSyncProgressThrottled()
                 }
             }
         }
@@ -561,6 +603,9 @@ public final class BLEManager: NSObject, ObservableObject {
             UserDefaults.standard.set(state.lastSyncedAt, forKey: "lastSyncedAt")
         }
         checkStrapLiveness()         // safety-net: strap ahead of us AND our frontier frozen ⇒ stuck?
+        // The per-chunk recompute is throttled, so settle the ring on an exact value now that the
+        // write queue is free.
+        Task { @MainActor in await self.recomputeSyncProgress() }
 
         // Recompute dashboard scores (recovery / strain / SLEEP) from the biometrics we just landed.
         // The IntelligenceEngine (AppModel) owns this — it stages sleep AND scores strain/recovery
@@ -638,6 +683,18 @@ public final class BLEManager: NSObject, ObservableObject {
     /// strap we haven't heard from in days can't sit at a high number. nil data → 0.
     static let liveWithinSeconds = 90 * 60
     @MainActor
+    /// Timestamp of the last sync-ring recompute, so the per-chunk path can rate-limit it.
+    private var lastSyncProgressAt: Date = .distantPast
+
+    /// Rate-limited `recomputeSyncProgress` for the offload hot path. The full recompute is two
+    /// full-table scans; at one chunk per ~50 records it dominated the write queue. Callers that
+    /// need an exact value (e.g. `exitBackfilling`) should call `recomputeSyncProgress()` directly.
+    func recomputeSyncProgressThrottled(minInterval: TimeInterval = 5) async {
+        guard Date().timeIntervalSince(lastSyncProgressAt) >= minInterval else { return }
+        lastSyncProgressAt = Date()
+        await recomputeSyncProgress()
+    }
+
     func recomputeSyncProgress() async {
         let now = Int(Date().timeIntervalSince1970)
         guard let behind = await collector?.secondsBehind(now: now) else {
@@ -787,6 +844,10 @@ public final class BLEManager: NSObject, ObservableObject {
 
     private func log(_ s: String) {
         state.append(log: "[\(timestamp())] \(s)")
+        // Mirror to stderr so `devicectl device process launch --console` can stream the BLE
+        // handshake live from a tethered Mac — the in-app log is unreachable mid-diagnosis.
+        // stderr, not print/stdout: piped stdout is fully buffered on-device and never flushes.
+        FileHandle.standardError.write(Data("[NOOP-BLE] [\(timestamp())] \(s)\n".utf8))
     }
     private func timestamp() -> String {
         BLEManager.logTimeFormatter.string(from: Date())
@@ -933,6 +994,9 @@ extension BLEManager: CBCentralManagerDelegate {
                                advertisementData: [String: Any],
                                rssi RSSI: NSNumber) {
         let name = (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? peripheral.name ?? "unknown"
+        // The scan is unfiltered (see `connect()`), so reject everything that isn't the strap.
+        let advertised = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
+        guard isStrapCandidate(name: name, advertisedServices: advertised) else { return }
         log("Discovered \(name) (rssi \(RSSI)) — connecting")
         central.stopScan()
         self.peripheral = peripheral
@@ -960,6 +1024,9 @@ extension BLEManager: CBCentralManagerDelegate {
         puffinSessionOpen = false
         whoop5SessionStarted = false
         whoop5NotifyCharacteristics.removeAll()
+        bondRevivalAttempted = false
+        helloRetriedPostEncrypt = false
+        revivalProbeFailures = 0
         clockRequested = false
         connectHandshakeDone = false
         // Reset backfill state so the next connect starts a fresh offload.
@@ -1143,6 +1210,27 @@ extension BLEManager: CBPeripheralDelegate {
                            error: Error?) {
         if let error = error {
             log("Confirmed write failed: \(error.localizedDescription)")
+            // BOND REVIVAL step 1 (5/MG): CLIENT_HELLO security-refused. Deliberately subscribe the
+            // auth-gated puffin chars: iOS responds to the ATT security error by elevating link
+            // security with its STORED keys (no pairing dialog if a bond survives from the era when
+            // this strap worked). Success lands in didUpdateNotificationStateFor, which re-sends
+            // CLIENT_HELLO on the now-encrypted link. One attempt per connection.
+            if selectedModel.deviceFamily == .whoop5,
+               characteristic.uuid == BLEManager.whoop5CmdWriteChar,
+               let att = error as? CBATTError,
+               att.code == .insufficientEncryption || att.code == .insufficientAuthentication,
+               !bondRevivalAttempted {
+                bondRevivalAttempted = true
+                puffinSessionOpen = false   // the hello write-site set it optimistically; it did NOT open
+                if whoop5NotifyCharacteristics.isEmpty {
+                    log("BOND REVIVAL: no retained puffin notify chars to probe — cannot elevate security")
+                } else {
+                    log("BOND REVIVAL: CLIENT_HELLO refused (ATT \(att.code.rawValue)) — probing \(whoop5NotifyCharacteristics.count) auth-gated chars to trigger link encryption")
+                    for c in whoop5NotifyCharacteristics {
+                        peripheral.setNotifyValue(true, for: c)
+                    }
+                }
+            }
             return
         }
 
@@ -1232,30 +1320,47 @@ extension BLEManager: CBPeripheralDelegate {
          0, 0, 0, 0]
     }
 
-    /// Newest plausible-unix marker in a GET_DATA_RANGE COMMAND_RESPONSE = the strap's newest stored
-    /// record. Mirrors re/diagnose_biometrics.py: scan u32 LE words in the response body (data starts at
-    /// frame[7], after [type,seq,cmd]), keep those in the unix range, return the max. nil if none.
-    static func dataRangeNewestUnix(from frame: [UInt8]) -> Int? {
-        dataRangeUnixExtremes(from: frame)?.newest
-    }
-
-    /// Both ends of the strap's stored range from a GET_DATA_RANGE response: the MIN and MAX u32 LE
-    /// words that fall in the plausible-unix band. `oldest` is the crucial one for "is there history
-    /// left to pull" — if the strap's oldest is earlier than OUR oldest persisted record, the strap
-    /// is still holding data we've never offloaded. Returns nil if the body has no unix-like words.
-    static func dataRangeUnixExtremes(from frame: [UInt8]) -> (oldest: Int, newest: Int)? {
-        guard frame.count > 7 else { return nil }
-        let body = Array(frame[7...]); var oldest: Int? = nil; var newest: Int? = nil; var i = 0
-        while i + 4 <= body.count {
-            let w = Int(body[i]) | Int(body[i+1]) << 8 | Int(body[i+2]) << 16 | Int(body[i+3]) << 24
-            if w >= 1_700_000_000 && w <= 1_900_000_000 {
-                oldest = min(oldest ?? w, w)
-                newest = max(newest ?? 0, w)
+    /// GET_DATA_RANGE answer → the strap's banked window. Every outcome is accounted for: a decoded
+    /// window, the PENDING ack (silent — it always precedes the real answer), or an explicit decode
+    /// FAILURE carrying the raw frame. Failing loudly is the point: the previous scan-based decoder
+    /// silently printed a date the strap never sent (a real MG capture decoded to "oldest 2029-10-06"),
+    /// and a wrong date is worse than no date — it also latched `strapNewestTs`, leaving the
+    /// stuck-strap watchdog permanently convinced the strap was ahead of us.
+    private func handleDataRangeResponse(_ frame: [UInt8], cmdOff: Int) {
+        switch DataRange.parse(frame, cmdOff: cmdOff, now: Int(Date().timeIntervalSince1970)) {
+        case .pending:
+            return                                        // short ack; the payload frame follows
+        case .unrecognised(let reason):
+            // Leave strapNewestTs untouched — an undecodable frame must not move the watchdog.
+            log("Data range: could NOT decode this GET_DATA_RANGE reply — \(reason). Raw: \(hex(frame))")
+        case .window(let range):
+            strapNewestTs = range.newest                  // feeds the liveness watchdog
+            let oldest = range.oldest, newest = range.newest, pages = range.pagesBehind
+            // Ground-truth completeness check: compare the strap's OLDEST stored record to ours. If
+            // the strap holds data older than our oldest persisted HR, there's still history to pull
+            // (the ring's in-DB completeness can't see this — it only measures holes WITHIN what we
+            // already have). Logged so "is it 100% synced?" has a real answer, not an inference.
+            Task { @MainActor in
+                let f = DateFormatter(); f.dateFormat = "MMM d HH:mm"
+                let newestStr = f.string(from: Date(timeIntervalSince1970: TimeInterval(newest)))
+                let backlog = pages.map { " [\($0) ring page\($0 == 1 ? "" : "s") pending]" } ?? ""
+                guard let oldest else {
+                    self.log("Data range: strap newest \(newestStr)\(backlog); strap reports no oldest-record date")
+                    return
+                }
+                let strapOld = f.string(from: Date(timeIntervalSince1970: TimeInterval(oldest)))
+                if let ourOldest = await self.collector?.oldestHRSampleTs() {
+                    let behindOlderHours = (ourOldest - oldest) / 3600
+                    if behindOlderHours > 1 {
+                        self.log("Data range: strap oldest \(strapOld) is \(behindOlderHours)h BEFORE our oldest — MORE HISTORY TO PULL (newest \(newestStr))\(backlog)")
+                    } else {
+                        self.log("Data range: strap oldest \(strapOld) ≈ our oldest — no older history left on strap (newest \(newestStr))\(backlog)")
+                    }
+                } else {
+                    self.log("Data range: strap oldest \(strapOld); we have no data yet (newest \(newestStr))\(backlog)")
+                }
             }
-            i += 4
         }
-        guard let o = oldest, let n = newest else { return nil }
-        return (o, n)
     }
 
     public func peripheral(_ peripheral: CBPeripheral,
@@ -1290,32 +1395,29 @@ extension BLEManager: CBPeripheralDelegate {
     /// backfill) or the live Collector. Shared by the WHOOP 4 data channels and the WHOOP 5/MG
     /// puffin channels so both families feed the same type-47 decode + persistence path.
     private func processDecodedFrame(_ frame: [UInt8]) {
-        router.handle(frame: frame)                       // UI (always)
-        if frame.count > 6, frame[6] == WhoopCommand.getDataRange.rawValue,
-           let range = BLEManager.dataRangeUnixExtremes(from: frame) {
-            strapNewestTs = range.newest                  // feeds the liveness watchdog
-            // Ground-truth completeness check: compare the strap's OLDEST stored record to ours. If
-            // the strap holds data older than our oldest persisted HR, there's still history to pull
-            // (the ring's in-DB completeness can't see this — it only measures holes WITHIN what we
-            // already have). Logged so "is it 100% synced?" has a real answer, not an inference.
-            Task { @MainActor in
-                let f = DateFormatter(); f.dateFormat = "MMM d HH:mm"
-                let strapOld = f.string(from: Date(timeIntervalSince1970: TimeInterval(range.oldest)))
-                if let ourOldest = await collector?.oldestHRSampleTs() {
-                    let behindOlderHours = (ourOldest - range.oldest) / 3600
-                    if behindOlderHours > 1 {
-                        self.log("Data range: strap oldest \(strapOld) is \(behindOlderHours)h BEFORE our oldest — MORE HISTORY TO PULL")
-                    } else {
-                        self.log("Data range: strap oldest \(strapOld) ≈ our oldest — no older history left on strap")
-                    }
-                } else {
-                    self.log("Data range: strap oldest \(strapOld); we have no data yet")
-                }
-            }
+        // PERF: an offload frame is 1244–2140 B and the router discards it anyway (its switch only
+        // acts on REALTIME_DATA / COMMAND_RESPONSE / EVENT). Routing it anyway cost a full CRC32
+        // plus 300–500 boxed Ints per frame on the main actor, which defeated the OffloadEngine's
+        // own fast-skip. Skip the router for frames we already know are offload traffic.
+        let isOffload = BLEManager.isOffloadFrame(frame, family: selectedModel.deviceFamily)
+        if !isOffload {
+            router.handle(frame: frame)                   // UI (live + command/event frames only)
+        }
+        // GET_DATA_RANGE's answer. Gated on the packet TYPE as well as the command byte: matching the
+        // command byte alone reads live traffic as a range reply — on 5/MG a REALTIME_DATA frame
+        // carries its unix timestamp at [10], so that byte reads 34 once every 256 seconds forever;
+        // on WHOOP 4 a BLE_REALTIME_HR_OFF EVENT carries event number 34 at [6].
+        if !isOffload,
+           let cmdOff = DataRange.responseCommandOffset(in: frame, family: selectedModel.deviceFamily) {
+            handleDataRangeResponse(frame, cmdOff: cmdOff)
         }
         // Clock correlation runs in both live and backfill modes. Once established it
         // unblocks both the Collector (live path) and the Backfiller (chunk decoding).
-        if clockRef == nil {
+        // WHOOP 4 only. `parseFrame` here is the WHOOP-4 parser, and on 5/MG GET_CLOCK is left
+        // undecoded by design, so clockRef can never be established from a puffin frame — this ran
+        // a full schema load + parse on every frame for the whole connection and could never
+        // succeed. Gate it on the family that can actually satisfy it.
+        if clockRef == nil, selectedModel.deviceFamily == .whoop4 {
             let parsed = parseFrame(frame)
             if let ref = ClockCorrelation.clockRef(from: parsed, wall: Int(Date().timeIntervalSince1970)) {
                 clockRef = ref
@@ -1352,6 +1454,32 @@ extension BLEManager: CBPeripheralDelegate {
                            error: Error?) {
         if let error = error {
             log("Notify enable failed for \(characteristic.uuid): \(error.localizedDescription)")
+            // BOND REVIVAL verdict: every probe refused ⇒ this phone holds no usable keys either.
+            // The lock is strap-side and only a device the strap already trusts (or a strap
+            // reset/re-provision) can open the fd4b service. Say so, once, in plain terms.
+            if bondRevivalAttempted, !helloRetriedPostEncrypt,
+               BLEManager.whoop5NotifyChars.contains(characteristic.uuid) {
+                revivalProbeFailures += 1
+                if revivalProbeFailures == whoop5NotifyCharacteristics.count {
+                    log("BOND REVIVAL FAILED: all \(revivalProbeFailures) probes security-refused — no stored bond on this phone; strap-side lock (R22/firmware) still closed")
+                }
+            }
+            return
+        }
+        // BOND REVIVAL step 2: a security-gated puffin char subscribed successfully ⇒ the link is
+        // NOW encrypted (iOS re-keyed from a stored bond, or the wearer approved a pairing).
+        // Re-send CLIENT_HELLO; its ack drives the normal didWriteValueFor session-open path
+        // (remaining subscribes → SET_CLOCK → offload), and the drained backfill follows.
+        if selectedModel.deviceFamily == .whoop5,
+           BLEManager.whoop5NotifyChars.contains(characteristic.uuid),
+           characteristic.isNotifying,
+           bondRevivalAttempted, !helloRetriedPostEncrypt,
+           let cmd = cmdCharacteristic,
+           let hello = selectedModel.deviceFamily.clientHello {
+            helloRetriedPostEncrypt = true
+            puffinSessionOpen = true
+            log("BOND REVIVAL: \(characteristic.uuid) subscribed — link encrypted; re-sending CLIENT_HELLO")
+            peripheral.writeValue(Data(hello), for: cmd, type: .withResponse)
         }
     }
 

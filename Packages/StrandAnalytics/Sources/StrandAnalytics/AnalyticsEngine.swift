@@ -44,13 +44,18 @@ public enum AnalyticsEngine {
         public let recovery: Double?
         /// Day strain [0,21] or nil (insufficient HR samples / invalid HRR).
         public let strain: Double?
+        /// Median in-sleep skin temperature (°C) for the night, or nil. ABSOLUTE — the caller turns
+        /// this into `skinTempDevC` (deviation from the personal baseline), which needs cross-day
+        /// context this per-day function doesn't have.
+        public let nightlySkinTempC: Double?
 
         public init(daily: DailyMetric, sleepSessions: [SleepSession],
                     cachedSleep: [CachedSleepSession], workouts: [ExerciseSession],
-                    recovery: Double?, strain: Double?) {
+                    recovery: Double?, strain: Double?, nightlySkinTempC: Double? = nil) {
             self.daily = daily; self.sleepSessions = sleepSessions
             self.cachedSleep = cachedSleep; self.workouts = workouts
             self.recovery = recovery; self.strain = strain
+            self.nightlySkinTempC = nightlySkinTempC
         }
     }
 
@@ -72,6 +77,15 @@ public enum AnalyticsEngine {
     /// importers' local-calendar bucketing so computed and imported days line up).
     public static func dayString(_ ts: Int) -> String {
         isoDay.string(from: Date(timeIntervalSince1970: TimeInterval(ts)))
+    }
+
+    /// Median of a value list (public helper for callers assembling cross-day baselines, e.g. the
+    /// skin-temperature deviation). Empty → 0.
+    public static func median(_ values: [Double]) -> Double {
+        guard !values.isEmpty else { return 0 }
+        let s = values.sorted()
+        let m = s.count / 2
+        return s.count % 2 == 0 ? (s[m - 1] + s[m]) / 2 : s[m]
     }
 
     /// JSON-encode stage segments to the verbatim array shape CachedSleepSession stores.
@@ -101,6 +115,8 @@ public enum AnalyticsEngine {
                                   rr: [RRInterval] = [],
                                   resp: [RespSample] = [],
                                   gravity: [GravitySample] = [],
+                                  ppg: [PPGWaveformSample] = [],
+                                  skinTemp: [SkinTempSample] = [],
                                   profile: UserProfile,
                                   baselines: ProfileBaselines = ProfileBaselines(),
                                   maxHROverride: Double? = nil) -> DayResult {
@@ -109,6 +125,31 @@ public enum AnalyticsEngine {
         let allSessions = SleepStager.detectSleep(hr: hr, rr: rr, resp: resp, gravity: gravity)
         // Sessions attributed to `day` = those whose end falls on `day` (UTC).
         let matched = allSessions.filter { dayString($0.end) == day }
+
+        // ── Nightly respiration rate from v26 PPG waveforms (WHOOP 5) ─────────
+        // Median over clean 60 s windows inside the matched in-sleep spans. nil when the
+        // strap serves no v26 records (WHOOP 4, or the night predates the v10 persistence).
+        let respRateNightly: Double? = {
+            guard !ppg.isEmpty, !matched.isEmpty else { return nil }
+            let spans = matched.map { ($0.start, $0.end) }
+            let inSleep = ppg.filter { s in spans.contains { s.ts >= $0.0 && s.ts <= $0.1 } }
+            return RespRateAnalyzer.analyze(inSleep).breathsPerMin
+        }()
+
+        // ── Nightly skin temperature (°C) from the in-sleep raw ADC samples ───
+        // Median °C over the matched in-sleep spans. raw/100 = °C (Interpreter's skin_temp_raw
+        // scale). ABSOLUTE here; the caller converts to a baseline deviation. nil when no in-sleep
+        // temp samples (WHOOP 4, or the night's temp hasn't offloaded yet).
+        let nightlySkinTempC: Double? = {
+            guard !skinTemp.isEmpty, !matched.isEmpty else { return nil }
+            let spans = matched.map { ($0.start, $0.end) }
+            let inSleepC = skinTemp
+                .filter { s in spans.contains { s.ts >= $0.0 && s.ts <= $0.1 } }
+                .map { Double($0.raw) / 100.0 }
+                .filter { (20.0...42.0).contains($0) }   // physiologic skin-temp guard
+            guard inSleepC.count >= 10 else { return nil }
+            return HRVAnalyzer.median(inSleepC)
+        }()
 
         // ── Daily sleep aggregates (AASM, in-bed weighted) ────────────────────
         var deepS = 0.0, remS = 0.0, lightS = 0.0, tstS = 0.0
@@ -151,7 +192,7 @@ public enum AnalyticsEngine {
             recovery = RecoveryScorer.recovery(
                 hrv: hrvVal,
                 rhr: Double(rhrVal),
-                resp: nil,                 // raw resp not aggregated to a nightly scalar here
+                resp: respRateNightly,     // PPG-derived nightly respiration (nil when no v26 data)
                 hrvBaseline: hrvBase,
                 rhrBaseline: baselines.restingHR,
                 respBaseline: baselines.resp,
@@ -199,7 +240,7 @@ public enum AnalyticsEngine {
             exerciseCount: workouts.count,
             spo2Pct: nil,
             skinTempDevC: nil,
-            respRateBpm: nil)
+            respRateBpm: respRateNightly)
         _ = sleepStart; _ = sleepEnd  // available for callers wiring sleep_start/end columns
 
         // ── Cache rows ────────────────────────────────────────────────────────
@@ -213,6 +254,7 @@ public enum AnalyticsEngine {
         }
 
         return DayResult(daily: daily, sleepSessions: matched, cachedSleep: cachedSleep,
-                         workouts: workouts, recovery: recovery, strain: strain)
+                         workouts: workouts, recovery: recovery, strain: strain,
+                         nightlySkinTempC: nightlySkinTempC)
     }
 }

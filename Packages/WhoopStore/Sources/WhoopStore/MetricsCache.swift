@@ -54,6 +54,16 @@ public struct DailyMetric: Equatable, Codable {
         self.recovery = recovery; self.strain = strain; self.exerciseCount = exerciseCount
         self.spo2Pct = spo2Pct; self.skinTempDevC = skinTempDevC; self.respRateBpm = respRateBpm
     }
+
+    /// Copy with `skinTempDevC` replaced. Used to fill the skin-temperature deviation after the
+    /// per-day analysis, once the cross-day personal baseline is known.
+    public func withSkinTempDevC(_ dev: Double?) -> DailyMetric {
+        DailyMetric(day: day, totalSleepMin: totalSleepMin, efficiency: efficiency,
+                    deepMin: deepMin, remMin: remMin, lightMin: lightMin,
+                    disturbances: disturbances, restingHr: restingHr, avgHrv: avgHrv,
+                    recovery: recovery, strain: strain, exerciseCount: exerciseCount,
+                    spo2Pct: spo2Pct, skinTempDevC: dev, respRateBpm: respRateBpm)
+    }
 }
 
 extension WhoopStore {

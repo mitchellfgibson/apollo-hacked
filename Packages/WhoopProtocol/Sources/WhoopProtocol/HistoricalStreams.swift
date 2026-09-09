@@ -40,6 +40,28 @@ public func extractHistoricalStreams(_ parsed: [ParsedFrame],
                 out.gravity.append(GravitySample(ts: ts, x: gx,
                     y: p["gravity_y"]?.doubleValue ?? 0, z: p["gravity_z"]?.doubleValue ?? 0))
             }
+            // v26 records (WHOOP 5): 24 Hz optical PPG waveform. The decoder surfaces it as
+            // `ppg_waveform`; v18 frames lack the key, so this is a no-op for them.
+            if let wf = p["ppg_waveform"]?.intArrayValue, !wf.isEmpty {
+                out.ppg.append(PPGWaveformSample(ts: ts, samples: wf))
+            }
+            // v21 records (WHOOP 5/MG): 100 Hz 6-axis IMU. Summarised to per-second motion features
+            // rather than banked as a waveform — see `ImuFeatures`. v18/v20/v26 lack these keys, so
+            // this is a no-op for them.
+            if let ax = p["imu_ax"]?.intArrayValue,
+               let ay = p["imu_ay"]?.intArrayValue,
+               let az = p["imu_az"]?.intArrayValue,
+               let gx = p["imu_gx"]?.intArrayValue,
+               let gy = p["imu_gy"]?.intArrayValue,
+               let gz = p["imu_gz"]?.intArrayValue,
+               let f = ImuFeatures.summarise(ax: ax, ay: ay, az: az, gx: gx, gy: gy, gz: gz) {
+                out.imu.append(ImuFeatureSample(ts: ts,
+                                                accelMagMean: f.accelMagMean,
+                                                accelMagSd: f.accelMagSd,
+                                                jerkMean: f.jerkMean,
+                                                gyroMagMean: f.gyroMagMean,
+                                                activityCount: f.activityCount))
+            }
         case "REALTIME_RAW_DATA":
             let ts = wall(p["timestamp"]?.intValue)
             if let ts = ts, let bpm = p["heart_rate"]?.intValue {

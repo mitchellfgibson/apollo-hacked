@@ -10,7 +10,7 @@ protocol BackfillStoreWriting: AnyObject {
     @discardableResult
     func insert(_ streams: Streams, deviceId: String) async throws
         -> (hr: Int, rr: Int, events: Int, battery: Int,
-            spo2: Int, skinTemp: Int, resp: Int, gravity: Int)
+            spo2: Int, skinTemp: Int, resp: Int, gravity: Int, ppg: Int, imu: Int)
     func enqueueRawBatch(_ meta: RawBatchMeta, frames: [[UInt8]]) async throws
     func setCursor(_ name: String, _ value: Int) async throws
     func cursor(_ name: String) async throws -> Int?
@@ -194,6 +194,21 @@ final class Backfiller {
             if !summaryFrames.isEmpty {
                 let parsed = summaryFrames.map { parseFrame($0, family: family) }
                 let decoded = extract(parsed, ref.device, ref.wall)
+                // INTEGRITY: a chunk of real summary frames that DECODED to nothing must not be
+                // reported as persisted. The ack is fire-and-forget and the strap trims on it, so
+                // returning true here discards the chunk permanently. Zero decoded samples from
+                // non-empty summary frames means we decoded them wrong (e.g. wrong device family),
+                // so fail and let the durable cursor stay put for the next session to re-pull.
+                //
+                // Deliberately tests the DECODE, not the insert count: `insert` returns rows newly
+                // written, and a legitimately re-pulled chunk of already-stored data returns zero.
+                // Gating on that would refuse to ever make progress.
+                let decodedAnything = !decoded.hr.isEmpty || !decoded.rr.isEmpty
+                    || !decoded.gravity.isEmpty || !decoded.skinTemp.isEmpty
+                    || !decoded.events.isEmpty || !decoded.battery.isEmpty
+                    || !decoded.spo2.isEmpty || !decoded.resp.isEmpty || !decoded.ppg.isEmpty
+                    || !decoded.imu.isEmpty
+                guard decodedAnything else { return false }
                 do { try await store.insert(decoded, deviceId: deviceId) } catch { return false }
             }
             if enableRawCapture {
@@ -228,6 +243,10 @@ final class Backfiller {
         let verOffset = typeOffset + 1
         guard frame.count > verOffset else { return false }
         guard frame[typeOffset] == 47 else { return false }   // only HISTORICAL_DATA has these versions
-        return frame[verOffset] == 20 || frame[verOffset] == 21
+        // v21 is NO LONGER skipped: it is the 100 Hz 6-axis IMU buffer, and it is now decoded into
+        // per-second motion features (see `ImuFeatures`) — the motion input this strap otherwise
+        // never provides. Only v20 (2140 B raw optical, 10 channels, no established channel identity
+        // or unit) is still filtered out, which is where the bulk of the CPU saving came from anyway.
+        return frame[verOffset] == 20
     }
 }

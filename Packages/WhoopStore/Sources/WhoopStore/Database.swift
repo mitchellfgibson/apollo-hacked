@@ -214,6 +214,36 @@ extension WhoopStore {
             try db.create(index: "idx_metricSeries_device_key_day",
                           on: "metricSeries", columns: ["deviceId", "key", "day"])
         }
+        migrator.registerMigration("v10") { db in
+            // WHOOP 5 v26 optical PPG waveforms: one row per record (1/sec), 24 LE-i16 samples
+            // packed into a 48-byte blob. Raw ADC counts, no scale — the substrate for on-device
+            // pulse / respiration-rate derivation. Natural key (deviceId, ts).
+            try db.create(table: "ppgWaveform") { t in
+                t.column("deviceId", .text).notNull()
+                t.column("ts", .integer).notNull()
+                t.column("samples", .blob).notNull()
+                t.primaryKey(["deviceId", "ts"])
+            }
+        }
+        migrator.registerMigration("v11") { db in
+            // WHOOP 5/MG v21 raw-IMU (100 Hz, 6-axis) reduced to a per-second motion summary.
+            // Additive: a new table only, so an existing database keeps every row it already has.
+            //
+            // The summary — not the waveform — is stored because a v21 record is 1244 B for one
+            // second of wear (~100 MB/day raw), while the consumers that exist (sleep staging, wake
+            // detection) want per-epoch motion intensity. See `ImuFeatures` for the full rationale
+            // and the hardware-validated scales. Natural key (deviceId, ts), one row per second.
+            try db.create(table: "imuFeature") { t in
+                t.column("deviceId", .text).notNull()
+                t.column("ts", .integer).notNull()
+                t.column("accelMagMean", .double).notNull()   // g, ~1.0 at rest (gravity shell)
+                t.column("accelMagSd", .double).notNull()     // g, movement intensity
+                t.column("jerkMean", .double).notNull()       // g, movement onset
+                t.column("gyroMagMean", .double).notNull()    // deg/s
+                t.column("activityCount", .integer).notNull() // actigraphy count, 0...100
+                t.primaryKey(["deviceId", "ts"])
+            }
+        }
         return migrator
     }
 }

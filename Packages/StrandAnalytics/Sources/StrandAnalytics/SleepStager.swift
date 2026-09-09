@@ -183,9 +183,14 @@ public enum SleepStager {
     /// Collapse per-record flags into contiguous runs, breaking on class change
     /// or a gap > maxGapMin minutes.
     static func buildRuns(_ grav: [GravitySample], _ flags: [Bool]) -> [Period] {
-        let n = grav.count
+        buildRuns(times: grav.map { $0.ts }, flags: flags)
+    }
+
+    /// Generic run builder over any timestamped flag series (gravity stillness OR HR quiescence):
+    /// collapse per-sample flags into contiguous runs, breaking on class change or a gap > maxGapMin.
+    static func buildRuns(times: [Int], flags: [Bool]) -> [Period] {
+        let n = times.count
         if n == 0 { return [] }
-        let times = grav.map { $0.ts }
         let maxGapS = maxGapMin * 60
         var periods: [Period] = []
         var runStart = 0
@@ -283,20 +288,123 @@ public enum SleepStager {
         return min(hrEffMax, Double(asleep) / Double(bpms.count))
     }
 
+    // MARK: - HR-only fallback spine
+
+    /// Minimum fraction of the HR window that gravity must temporally cover for the gravity
+    /// stillness spine to be trusted. Below this, gravity is treated as absent and sleep is
+    /// detected from HR quiescence instead. This is THE fix for live nights: HR + R-R arrive over
+    /// the standard channel in near-real-time, but gravity trails ~a day behind on the historical
+    /// offload — so without a motion-free path, every just-slept night yields no session (hence no
+    /// resting HR / HRV / recovery) until its gravity finally drains.
+    public static let gravityCoverageMinFraction: Double = 0.5
+    /// A smoothed-HR sample counts as "asleep" if it sits within this margin (bpm) of the window's
+    /// nightly low. Loose enough to hold light sleep, tight enough to drop awake/active stretches.
+    public static let hrQuiescenceMarginBpm: Double = 10.0
+    /// Rolling window (seconds) for smoothing HR before building the quiescence spine.
+    public static let hrSpineSmoothS: Int = 5 * 60
+    /// Percentile of smoothed HR taken as the nightly low (robust to the odd dropout).
+    public static let hrQuiescenceLowPct: Double = 10.0
+
+    /// Does gravity densely cover the span where HR exists? When HR is absent there is nothing to
+    /// fall back to, so keep the legacy "≥2 gravity samples" rule (gravity path handles the rest).
+    static func gravityCoversHRWindow(_ grav: [GravitySample], _ hrS: [HRSample]) -> Bool {
+        guard let h0 = hrS.first?.ts, let h1 = hrS.last?.ts, h1 > h0 else {
+            return grav.count >= 2   // no HR window to measure against → legacy behaviour
+        }
+        let inWin = grav.filter { $0.ts >= h0 && $0.ts <= h1 }
+        guard let g0 = inWin.first?.ts, let g1 = inWin.last?.ts, inWin.count >= 2 else { return false }
+        return Double(g1 - g0) / Double(h1 - h0) >= gravityCoverageMinFraction
+    }
+
+    /// Per-HR-sample "asleep" flags from HR quiescence: samples whose 5-min smoothed HR sits within
+    /// `hrQuiescenceMarginBpm` of the window's nightly low. The motion-free analogue of the gravity
+    /// stillness spine, used when gravity has not yet offloaded for the night.
+    static func hrQuiescenceFlags(_ hrS: [HRSample]) -> [Bool] {
+        let n = hrS.count
+        if n == 0 { return [] }
+        let bpm = hrS.map { Double($0.bpm) }
+        let times = hrS.map { $0.ts }
+        let half = hrSpineSmoothS / 2
+        var smooth = [Double](repeating: 0, count: n)
+        for i in 0..<n {
+            let lo = times[i] - half, hi = times[i] + half
+            var win: [Double] = []
+            var j = i
+            while j >= 0 && times[j] >= lo { if bpm[j] > 0 { win.append(bpm[j]) }; j -= 1 }
+            j = i + 1
+            while j < n && times[j] <= hi { if bpm[j] > 0 { win.append(bpm[j]) }; j += 1 }
+            smooth[i] = win.isEmpty ? bpm[i] : HRVAnalyzer.median(win)
+        }
+        let low = percentile(smooth, hrQuiescenceLowPct) ?? (smooth.min() ?? 0)
+        let threshold = low + hrQuiescenceMarginBpm
+        return smooth.map { $0 <= threshold }
+    }
+
+    /// Coarse motion-free hypnogram for a fallback run: contiguous asleep stretches → "light",
+    /// the rest → "wake". Deliberately does NOT invent deep/REM (impossible without motion + the
+    /// full feature set) — it yields honest total-sleep-time + efficiency so recovery can compute.
+    static func coarseStages(start: Int, end: Int, times: [Int], flags: [Bool]) -> [StageSegment] {
+        let idx = (0..<times.count).filter { times[$0] >= start && times[$0] <= end }
+        guard let first = idx.first else { return [StageSegment(start: start, end: end, stage: "light")] }
+        var segs: [StageSegment] = []
+        var segStart = start
+        var cur = flags[first]
+        for k in idx.dropFirst() where flags[k] != cur {
+            let boundary = times[k]
+            segs.append(StageSegment(start: segStart, end: boundary, stage: cur ? "light" : "wake"))
+            segStart = boundary; cur = flags[k]
+        }
+        segs.append(StageSegment(start: segStart, end: end, stage: cur ? "light" : "wake"))
+        return segs
+    }
+
+    /// Sleep detection from HR quiescence alone — no gravity. Reuses the run/merge/confirm machinery
+    /// and the pure-HR/RR resting-HR + HRV extractors, so a live night yields recovery the same
+    /// morning instead of waiting a day for gravity to offload.
+    static func detectSleepHRFallback(hrS: [HRSample], rrS: [RRInterval]) -> [SleepSession] {
+        guard hrS.count >= hrRefineMinSamples else { return [] }
+        let times = hrS.map { $0.ts }
+        let flags = hrQuiescenceFlags(hrS)
+        var runs = buildRuns(times: times, flags: flags)
+        runs = mergePeriods(runs)
+        let baseline = hrBaseline(hrS)
+        let minSleepS = minSleepMin * 60
+        var sessions: [SleepSession] = []
+        for p in runs where p.stage == "sleep" {
+            if (p.end - p.start) <= minSleepS { continue }
+            if !confirmSleepWithHR(p, hr: hrS, baseline: baseline) { continue }
+            let eff = hrEfficiency(p, hr: hrS, baseline: baseline) ?? hrEffMax
+            let resting = sessionRestingHR(start: p.start, end: p.end, hr: hrS)
+            let avgHrv = sessionAvgHRV(start: p.start, end: p.end, rr: rrS)
+            let stages = coarseStages(start: p.start, end: p.end, times: times, flags: flags)
+            sessions.append(SleepSession(start: p.start, end: p.end, efficiency: eff,
+                                         stages: stages, restingHR: resting, avgHRV: avgHrv))
+        }
+        sessions.sort { $0.start < $1.start }
+        return sessions
+    }
+
     // MARK: - detectSleep (public)
 
-    /// Detect sleep sessions from biometric streams. Empty/absent gravity → [].
-    /// Gravity-only input degrades gracefully (HR/RR/resp refinements skipped).
+    /// Detect sleep sessions from biometric streams.
+    ///
+    /// Primary path: gravity stillness spine (full 4-class staging). Fallback path: when gravity
+    /// does not cover the HR window (a live night whose gravity has not yet offloaded), sleep is
+    /// detected from HR quiescence with coarse staging. Both empty → [].
     public static func detectSleep(hr: [HRSample] = [],
                                    rr: [RRInterval] = [],
                                    resp: [RespSample] = [],
                                    gravity: [GravitySample]) -> [SleepSession] {
         let grav = gravity.sorted { $0.ts < $1.ts }
-        if grav.count < 2 { return [] }
-
         let hrS = hr.sorted { $0.ts < $1.ts }
         let rrS = rr.sorted { $0.ts < $1.ts }
         let respS = resp.sorted { $0.ts < $1.ts }
+
+        // No usable gravity spine over the HR span → detect from HR quiescence instead.
+        guard gravityCoversHRWindow(grav, hrS) else {
+            return detectSleepHRFallback(hrS: hrS, rrS: rrS)
+        }
+        if grav.count < 2 { return [] }
 
         let deltas = gravityDeltas(grav)
         let flags = classifyStill(grav, deltas)

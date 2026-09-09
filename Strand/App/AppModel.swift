@@ -26,6 +26,8 @@ final class AppModel: ObservableObject {
     let intelligence: IntelligenceEngine
     /// Opt-in AI coach (bring-your-own-key) — the one networked feature, off until the user enables it.
     let coach: AICoachEngine
+    /// One-button export of daily rows (RHR/HRV/HR-range/recovery/sleep) to a Google Sheet.
+    let sheetExporter: SheetExporter
 
     /// Timestamps of moments marked via a double-tap (persisted).
     @Published var moments: [Date] = []
@@ -55,6 +57,7 @@ final class AppModel: ObservableObject {
         self.repo = Repository(deviceId: "my-whoop")
         self.intelligence = IntelligenceEngine(repo: repo, profile: profile, deviceId: "my-whoop")
         self.coach = AICoachEngine(repo: repo)
+        self.sheetExporter = SheetExporter(repo: repo, deviceId: "my-whoop")
         // Smooth HR centrally so it's solid everywhere it's shown.
         live.$heartRate.sink { [weak self] _ in self?.ingestHR() }.store(in: &hrCancellables)
         live.$rr.sink { [weak self] _ in self?.ingestHR() }.store(in: &hrCancellables)

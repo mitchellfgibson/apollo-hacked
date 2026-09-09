@@ -36,10 +36,10 @@ extension WhoopStore {
     @discardableResult
     public func insert(_ streams: Streams, deviceId: String) async throws
         -> (hr: Int, rr: Int, events: Int, battery: Int,
-            spo2: Int, skinTemp: Int, resp: Int, gravity: Int) {
+            spo2: Int, skinTemp: Int, resp: Int, gravity: Int, ppg: Int, imu: Int) {
         return try syncWrite { db in
             var hr = 0, rr = 0, ev = 0, bat = 0
-            var spo2 = 0, skin = 0, resp = 0, grav = 0
+            var spo2 = 0, skin = 0, resp = 0, grav = 0, ppg = 0, imu = 0
             // Reuse one prepared statement per table instead of recompiling the same SQL on every
             // row. This is the hottest write path (every Collector.flush + every Backfiller chunk
             // over potentially millions of historical rows). cachedStatement persists the compiled
@@ -126,24 +126,79 @@ extension WhoopStore {
                     grav += db.changesCount
                 }
             }
-            return (hr, rr, ev, bat, spo2, skin, resp, grav)
+            if !streams.ppg.isEmpty {
+                let stmt = try db.cachedStatement(sql: """
+                    INSERT INTO ppgWaveform (deviceId, ts, samples) VALUES (?, ?, ?)
+                    ON CONFLICT(deviceId, ts) DO NOTHING
+                    """)
+                for s in streams.ppg {
+                    try stmt.execute(arguments: [deviceId, s.ts, WhoopStore.packPPGSamples(s.samples)])
+                    ppg += db.changesCount
+                }
+            }
+            if !streams.imu.isEmpty {
+                let stmt = try db.cachedStatement(sql: """
+                    INSERT INTO imuFeature
+                        (deviceId, ts, accelMagMean, accelMagSd, jerkMean, gyroMagMean, activityCount)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(deviceId, ts) DO NOTHING
+                    """)
+                for s in streams.imu {
+                    try stmt.execute(arguments: [deviceId, s.ts, s.accelMagMean, s.accelMagSd,
+                                                 s.jerkMean, s.gyroMagMean, s.activityCount])
+                    imu += db.changesCount
+                }
+            }
+            return (hr, rr, ev, bat, spo2, skin, resp, grav, ppg, imu)
         }
+    }
+
+    /// Pack raw PPG ADC counts into a little-endian i16 blob (2 bytes/sample) for the
+    /// `ppgWaveform.samples` column. Values are clamped to i16 range; the v26 decoder only
+    /// ever produces i16-range reads, so clamping is a no-op safety net.
+    static func packPPGSamples(_ samples: [Int]) -> Data {
+        var d = Data(); d.reserveCapacity(samples.count * 2)
+        for s in samples {
+            let v = Int16(clamping: s)
+            d.append(UInt8(truncatingIfNeeded: v))
+            d.append(UInt8(truncatingIfNeeded: v >> 8))
+        }
+        return d
+    }
+
+    /// Inverse of `packPPGSamples` — odd trailing bytes are ignored.
+    static func unpackPPGSamples(_ blob: Data) -> [Int] {
+        var out: [Int] = []; out.reserveCapacity(blob.count / 2)
+        var i = blob.startIndex
+        while i + 1 < blob.endIndex {
+            let v = Int16(bitPattern: UInt16(blob[i]) | (UInt16(blob[i + 1]) << 8))
+            out.append(Int(v))
+            i += 2
+        }
+        return out
     }
 
     // MARK: - Test helpers
 
     public func storageStats_rowCountsForTest() async throws
         -> (hr: Int, rr: Int, events: Int, battery: Int,
-            spo2: Int, skinTemp: Int, resp: Int, gravity: Int) {
+            spo2: Int, skinTemp: Int, resp: Int, gravity: Int, ppg: Int, imu: Int) {
+        // Broken into named locals: as a single 10-element tuple literal the type checker times out.
         try syncRead { db in
-            (try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM hrSample") ?? 0,
-             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM rrInterval") ?? 0,
-             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM event") ?? 0,
-             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM battery") ?? 0,
-             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM spo2Sample") ?? 0,
-             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM skinTempSample") ?? 0,
-             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM respSample") ?? 0,
-             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM gravitySample") ?? 0)
+            func count(_ table: String) throws -> Int {
+                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM \(table)") ?? 0
+            }
+            let hr = try count("hrSample")
+            let rr = try count("rrInterval")
+            let ev = try count("event")
+            let bat = try count("battery")
+            let spo2 = try count("spo2Sample")
+            let skin = try count("skinTempSample")
+            let resp = try count("respSample")
+            let grav = try count("gravitySample")
+            let ppg = try count("ppgWaveform")
+            let imu = try count("imuFeature")
+            return (hr, rr, ev, bat, spo2, skin, resp, grav, ppg, imu)
         }
     }
 

@@ -2,6 +2,19 @@ import Foundation
 import GRDB
 import WhoopProtocol
 
+/// Per-local-day heart-rate aggregate for the export ("HR range"). `count` doubles as the day's
+/// coverage flag: a low sample count marks a partial day worth filtering out in analysis.
+public struct DailyHRStats: Equatable, Sendable {
+    public let day: String       // YYYY-MM-DD, local calendar
+    public let min: Int
+    public let max: Int
+    public let avg: Double
+    public let count: Int
+    public init(day: String, min: Int, max: Int, avg: Double, count: Int) {
+        self.day = day; self.min = min; self.max = max; self.avg = avg; self.count = count
+    }
+}
+
 extension WhoopStore {
     /// Shared decoder — JSONDecoder is stateless across decodes and was previously allocated once
     /// per event row. Battery events are dense (~every 8 min), so a multi-year read decodes
@@ -88,6 +101,25 @@ extension WhoopStore {
         }
     }
 
+    /// Per-local-day HR aggregate (min / max / mean bpm + sample count) for the Google-Sheet export.
+    /// Bucketed by the wearer's LOCAL calendar day so it lines up with the computed dailyMetric rows.
+    /// `count` is the coverage flag — a low count means a partial day the analyst can filter out.
+    public func dailyHRStats(deviceId: String, fromDay: String, toDay: String) async throws -> [DailyHRStats] {
+        try syncRead { db in
+            try Row.fetchAll(db, sql: """
+                SELECT date(ts, 'unixepoch', 'localtime') AS day,
+                       MIN(bpm) AS lo, MAX(bpm) AS hi, AVG(bpm) AS mean, COUNT(*) AS n
+                FROM hrSample
+                WHERE deviceId = ? AND bpm > 0
+                GROUP BY day
+                HAVING day >= ? AND day <= ?
+                ORDER BY day ASC
+                """, arguments: [deviceId, fromDay, toDay])
+                .map { DailyHRStats(day: $0["day"], min: $0["lo"], max: $0["hi"],
+                                    avg: $0["mean"], count: $0["n"]) }
+        }
+    }
+
     public func rrIntervals(deviceId: String, from: Int, to: Int, limit: Int) async throws -> [RRInterval] {
         try syncRead { db in
             try Row.fetchAll(db, sql: """
@@ -168,6 +200,18 @@ extension WhoopStore {
                 ORDER BY ts ASC LIMIT ?
                 """, arguments: [deviceId, from, to, limit])
                 .map { GravitySample(ts: $0["ts"], x: $0["x"], y: $0["y"], z: $0["z"]) }
+        }
+    }
+
+    public func ppgWaveforms(deviceId: String, from: Int, to: Int, limit: Int) async throws -> [PPGWaveformSample] {
+        try syncRead { db in
+            try Row.fetchAll(db, sql: """
+                SELECT ts, samples FROM ppgWaveform
+                WHERE deviceId = ? AND ts >= ? AND ts <= ?
+                ORDER BY ts ASC LIMIT ?
+                """, arguments: [deviceId, from, to, limit])
+                .map { PPGWaveformSample(ts: $0["ts"],
+                                         samples: WhoopStore.unpackPPGSamples($0["samples"])) }
         }
     }
 

@@ -4,6 +4,9 @@ import SwiftUI
 /// and a bond gate that blocks all use until the strap is bonded and data is flowing.
 struct ContentView: View {
     @AppStorage("noop.onboarded") private var onboarded = false
+    /// Escape hatch: lets the app be used (history, trends, settings) while the strap link is
+    /// down, instead of the bond gate blocking every screen. Off by default.
+    @AppStorage("noop.bypassBondGate") private var bypassBondGate = false
     @EnvironmentObject private var live: LiveState
 
     var body: some View {
@@ -18,7 +21,7 @@ struct ContentView: View {
             // requires connected + bonded/streaming). It is driven purely by live state — NOT a
             // sticky flag — so it correctly re-appears if the strap disconnects or was never bonded,
             // and only disappears while the link is actually relaying data.
-            if onboarded && !live.gatePassed {
+            if onboarded && !live.gatePassed && !bypassBondGate {
                 BondGateView(onPassed: {})
                     .transition(.opacity)
                     .zIndex(2)
