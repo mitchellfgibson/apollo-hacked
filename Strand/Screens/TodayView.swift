@@ -53,7 +53,7 @@ struct TodayView: View {
         }
     }
 
-    // MARK: (a) HERO — RecoveryRing + Synthesis, filling the width equally.
+    // MARK: (a) HERO — RecoveryRing above the Synthesis read-out, each full width.
 
     @ViewBuilder
     private var heroSection: some View {
@@ -62,19 +62,25 @@ struct TodayView: View {
         VStack(alignment: .leading, spacing: NoopMetrics.gap) {
             SectionHeader("Today’s Synthesis", overline: "At a glance",
                           trailing: greetingWord)
-            HStack(alignment: .top, spacing: NoopMetrics.gap) {
-                // Left: the signature ring in a card.
+            // Stacked, not side by side: at phone width two half-width cards squeezed the ring down
+            // and wrapped the read-out to a column of two-word lines. Full width each, ring first.
+            VStack(alignment: .leading, spacing: NoopMetrics.gap) {
+                // The signature ring in a card, spanning the full width.
                 NoopCard {
                     RecoveryRing(
                         score: score ?? 0,
                         supporting: ringSupporting(d),
-                        diameter: 168
+                        diameter: 210,
+                        // Off deliberately: the wordmark sits ABOVE the number and is meant to make the
+                        // ring's centre read as the "O" in NOOP, but at this diameter the number is large
+                        // enough that the two collide — the documented case for disabling it.
+                        showsWordmark: false
                     )
                     .frame(maxWidth: .infinity)
                 }
                 .frame(maxWidth: .infinity, alignment: .center)
 
-                // Right: the plain-English read-out, equal width.
+                // The plain-English read-out, beneath the ring it describes.
                 InsightCard(
                     category: "Recovery",
                     status: LocalizedStringKey(synthesisWord(score)),
