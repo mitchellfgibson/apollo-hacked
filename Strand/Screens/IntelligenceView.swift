@@ -35,7 +35,6 @@ struct IntelligenceView: View {
                        // frosted cards below sit on the opaque canvas and stay legible.
                        topBackground: liquidScaffoldSky()) {
             if let f = forecast { forecastCard(f) }
-            explainerCard
             if intelligence.computing {
                 NoopCard(padding: 20, tint: StrandPalette.chargeColor) {
                     HStack(spacing: NoopMetrics.rowSpacing) {
@@ -91,6 +90,9 @@ struct IntelligenceView: View {
                     }
                 }
             }
+            // Last, not first: the method note is reference material, so it sits under the days
+            // rather than between the forecast and the scores it explains.
+            explainerCard
         }
         .task { if intelligence.results.isEmpty { await intelligence.analyzeRecent() } }
         .toolbar {

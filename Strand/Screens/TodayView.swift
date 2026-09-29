@@ -34,15 +34,11 @@ struct TodayView: View {
     private let grid = [GridItem(.adaptive(minimum: 168), spacing: NoopMetrics.gap)]
 
     var body: some View {
-        ScreenScaffold(title: "Control Center", subtitle: LocalizedStringKey(dateLine)) {
+        // No title: the date line alone heads the dashboard. The screen is the app's home, so a
+        // "Control Center" heading only repeated what the user already knew and pushed the ring down.
+        ScreenScaffold(title: nil, subtitle: LocalizedStringKey(dateLine)) {
             VStack(alignment: .leading, spacing: NoopMetrics.sectionGap) {
                 HealthAlertBanner()
-                if repo.today?.recovery == nil {
-                    DataPendingNote(
-                        title: "Live now. Your scores are building.",
-                        message: "Your live heart rate is working from the strap, and recovery, strain and sleep build from it over your next few nights of wear, sharpening as it learns your baseline. Want your full history instantly? Import your WHOOP export in Data Sources and it backfills in about a minute."
-                    )
-                }
                 heroSection
                 metricsSection
                 workoutsSection
