@@ -32,7 +32,7 @@ struct SleepView: View {
     /// resolved once, the seven metric series, the trend points, the typical means). Rebuilt
     /// only when the underlying repo data actually changes — NOT on hover/animation/1Hz HR
     /// ticks that merely re-evaluate `body`. `nil` until first build or when there's no night.
-    @State private var model: SleepModel?
+    @State private var model: ApolloSleepModel?
     /// The repo signature the cached `model` was built from. Cheap to compute every render;
     /// when it differs from the current inputs we rebuild the model.
     @State private var modelKey: SleepInputKey?
@@ -60,7 +60,7 @@ struct SleepView: View {
         // 1Hz HR ticks pay nothing. When it differs (or on first render) we build once, here,
         // synchronously, so the very first frame already shows content (no empty-state flash).
         let key = dataKey
-        let resolved: SleepModel? = (key == modelKey) ? model : buildModel()
+        let resolved: ApolloSleepModel? = (key == modelKey) ? model : buildModel()
         ScreenScaffold(title: "Sleep") {
             Group {
                 if let resolved {
@@ -96,7 +96,7 @@ struct SleepView: View {
 
     /// Pull the real heart-rate samples spanning the night's window (merged live + imported).
     /// Resets the highlighted stage so a night change starts on the full trace.
-    private func loadNightHR(_ night: Night?) async {
+    private func loadNightHR(_ night: ApolloNight?) async {
         guard let night else { nightHR = []; loadedNightTs = nil; return }
         if loadedNightTs == night.session.startTs { return }
         selectedStage = nil
@@ -107,14 +107,14 @@ struct SleepView: View {
 
     /// True when this night should show the live HR chart — i.e. we actually captured real
     /// heart-rate samples across it. Imported-only nights (no HR) fall back to the stage view.
-    private func showsHRChart(_ night: Night) -> Bool {
+    private func showsHRChart(_ night: ApolloNight) -> Bool {
         !nightHR.isEmpty
     }
 
     // MARK: - 1. HERO — stage breakdown
 
     @ViewBuilder
-    private func hero(_ model: SleepModel) -> some View {
+    private func hero(_ model: ApolloSleepModel) -> some View {
         let night = model.night
         if showsHRChart(night) {
             hrHero(model)
@@ -127,7 +127,7 @@ struct SleepView: View {
     /// bottom, and a row of stage chips beneath. Hover a chip → that stage's HR lights up on the
     /// trace; click to lock it (click again to release). No dropdown — the chips are the control.
     @ViewBuilder
-    private func hrHero(_ model: SleepModel) -> some View {
+    private func hrHero(_ model: ApolloSleepModel) -> some View {
         let night = model.night
         let s = night.stages
         VStack(alignment: .leading, spacing: NoopMetrics.gap) {
@@ -173,7 +173,7 @@ struct SleepView: View {
     /// trace, TAP locks it (tap again or tap another to change). The currently-active chip is filled
     /// in its stage color so it's obvious what's highlighted.
     @ViewBuilder
-    private func stageChips(_ s: Stages) -> some View {
+    private func stageChips(_ s: ApolloStages) -> some View {
         HStack(spacing: 8) {
             stageChip(.rem,   "REM",   s.rem,   s.total)
             stageChip(.deep,  "Deep",  s.deep,  s.total)
@@ -220,7 +220,7 @@ struct SleepView: View {
     /// Legacy / toggle-off hero: the original stage breakdown. Shows a small note for nights
     /// recorded before NOOP began capturing live heart rate.
     @ViewBuilder
-    private func stageHero(_ model: SleepModel) -> some View {
+    private func stageHero(_ model: ApolloSleepModel) -> some View {
         let night = model.night
         let s = night.stages
         let intervals = model.intervals
@@ -276,7 +276,7 @@ struct SleepView: View {
 
     /// Full-width proportional stacked stage bar (fallback when no intervals).
     @ViewBuilder
-    private func stageBar(_ s: Stages) -> some View {
+    private func stageBar(_ s: ApolloStages) -> some View {
         let total = max(1, s.total)
         VStack(alignment: .leading, spacing: 10) {
             Spacer(minLength: 0)
@@ -323,7 +323,7 @@ struct SleepView: View {
     // MARK: - 2. Metric grid (UNIFORM fixed-height StatTiles, each with sparkline)
 
     @ViewBuilder
-    private func metricGrid(_ model: SleepModel) -> some View {
+    private func metricGrid(_ model: ApolloSleepModel) -> some View {
         // Per-tile latest value + history series (for the sparkline) + typical mean.
         // All seven series are computed ONCE in the model build (each is a full pass over
         // repo.days/repo.sleeps) — here we only read the memoized results.
@@ -336,7 +336,7 @@ struct SleepView: View {
         let debt  = model.sleepDebt
 
         VStack(alignment: .leading, spacing: NoopMetrics.gap) {
-            SectionHeader("Night detail", overline: "Metrics", trailing: "vs typical")
+            SectionHeader("ApolloNight detail", overline: "Metrics", trailing: "vs typical")
             LazyVGrid(columns: tileColumns, alignment: .leading, spacing: NoopMetrics.gap) {
 
                 StatTile(
@@ -401,12 +401,12 @@ struct SleepView: View {
     // MARK: - 3. Stages vs typical
 
     @ViewBuilder
-    private func stagesVsTypical(_ model: SleepModel) -> some View {
+    private func stagesVsTypical(_ model: ApolloSleepModel) -> some View {
         let s = model.night.stages
         // Per-stage typical means are computed ONCE in the model build (each a full pass
         // over repo.days) and read here.
         VStack(alignment: .leading, spacing: NoopMetrics.gap) {
-            SectionHeader("Stages vs typical", overline: "Last night",
+            SectionHeader("ApolloStages vs typical", overline: "Last night",
                           trailing: "marker = your mean")
             NoopCard {
                 VStack(alignment: .leading, spacing: 14) {
@@ -471,7 +471,7 @@ struct SleepView: View {
     // MARK: - 4. 30-day asleep-hours trend
 
     @ViewBuilder
-    private func durationTrend(_ model: SleepModel) -> some View {
+    private func durationTrend(_ model: ApolloSleepModel) -> some View {
         // Trailing-30 trend points and the typical total are precomputed in the model build
         // (full passes over repo.days) — read here, not recomputed per render.
         let pts = model.trendPoints
@@ -527,9 +527,9 @@ struct SleepView: View {
     /// Build every expensive derivation exactly once. Called only when `dataKey` changes,
     /// so each full pass over repo.days / repo.sleeps runs once per data change rather than
     /// once per render. Returns nil when there is no usable latest night (renders empty state).
-    private func buildModel() -> SleepModel? {
+    private func buildModel() -> ApolloSleepModel? {
         guard let night = latestNight else { return nil }
-        return SleepModel(
+        return ApolloSleepModel(
             night: night,
             intervals: night.intervals,
             performance: performanceSeries,
@@ -552,11 +552,11 @@ struct SleepView: View {
     /// timeline. Both computed and imported sessions store a `[{start,end,stage}]` segment array
     /// with absolute unix timestamps, so we can show the true hypnogram instead of a synthetic
     /// deep-early/rem-later reconstruction.
-    private var latestNight: Night? {
+    private var latestNight: ApolloNight? {
         guard let s = repo.sleeps.last,
               let stages = decodeStages(s.stagesJSON),
               stages.total > 0 else { return nil }
-        return Night(session: s, stages: stages,
+        return ApolloNight(session: s, stages: stages,
                      realIntervals: decodeRealIntervals(s.stagesJSON, nightStartTs: s.startTs))
     }
 
@@ -773,13 +773,13 @@ struct SleepView: View {
         }
     }
 
-    private func efficiencyText(_ night: Night) -> String {
+    private func efficiencyText(_ night: ApolloNight) -> String {
         let e = efficiencyPct(night)
         return e.map { "\(Int($0.rounded()))%" } ?? "—"
     }
 
     /// Efficiency in percent. Prefer the stored session value, else asleep / time-in-bed.
-    private func efficiencyPct(_ night: Night) -> Double? {
+    private func efficiencyPct(_ night: ApolloNight) -> Double? {
         if let stored = night.session.efficiency ?? repo.today?.efficiency {
             return stored <= 1.0 ? stored * 100 : stored
         }
@@ -814,7 +814,7 @@ struct SleepView: View {
     ///      the old code only understood shape #2, so every real night decoded to nil → empty state.
     ///   2. A legacy DICT of minutes `{"light","deep","rem","awake"}` — kept as a fallback.
     /// Stage names are matched loosely ("wake"/"awake", "rem", "deep"/"sws", "light"/other).
-    private func decodeStages(_ json: String?) -> Stages? {
+    private func decodeStages(_ json: String?) -> ApolloStages? {
         guard let json, let data = json.data(using: .utf8) else { return nil }
         guard let obj = try? JSONSerialization.jsonObject(with: data) else { return nil }
 
@@ -837,7 +837,7 @@ struct SleepView: View {
                 default:                     light += mins   // "light", "core", "n1", "n2", unknown
                 }
             }
-            let s = Stages(awake: awake, light: light, deep: deep, rem: rem)
+            let s = ApolloStages(awake: awake, light: light, deep: deep, rem: rem)
             return s.total > 0 ? s : nil
         }
 
@@ -849,7 +849,7 @@ struct SleepView: View {
                 if let i = dict[key] as? Int { return Double(i) }
                 return 0
             }
-            let s = Stages(awake: val("awake"), light: val("light"),
+            let s = ApolloStages(awake: val("awake"), light: val("light"),
                            deep: val("deep"), rem: val("rem"))
             return s.total > 0 ? s : nil
         }
@@ -886,11 +886,11 @@ private struct SleepInputKey: Equatable {
 /// Memoized result of every expensive SleepView derivation. Built once per data change in
 /// `buildModel()` and read by the subviews, so full passes over repo.days / repo.sleeps and
 /// the Night.intervals reconstruction no longer run on every render.
-private struct SleepModel {
+private struct ApolloSleepModel {
     /// (latest, typical mean, full history) per metric — mirrors SleepView.Metric.
     typealias Metric = (latest: Double?, typical: Double?, series: [Double])
 
-    let night: Night
+    let night: ApolloNight
     /// Reconstructed stage intervals for the hypnogram — computed once (Night.intervals is a
     /// computed property; it was previously re-derived on each access during render).
     let intervals: [SleepInterval]
@@ -911,7 +911,7 @@ private struct SleepModel {
     let trendPoints: [TrendPoint]
 }
 
-private struct Stages {
+private struct ApolloStages {
     var awake: Double
     var light: Double
     var deep: Double
@@ -922,9 +922,9 @@ private struct Stages {
     var asleep: Double { light + deep + rem }
 }
 
-private struct Night {
+private struct ApolloNight {
     let session: CachedSleepSession
-    let stages: Stages
+    let stages: ApolloStages
     /// The REAL stage timeline parsed from the segment array, when the session has one. Preferred
     /// over the synthetic reconstruction so the hypnogram shows actual stage transitions.
     var realIntervals: [SleepInterval]? = nil
@@ -958,9 +958,9 @@ private struct Night {
         return out
     }
 
-    var onsetText: String { Night.timeFmt.string(from: Date(timeIntervalSince1970: TimeInterval(session.startTs))) }
-    var wakeText: String { Night.timeFmt.string(from: Date(timeIntervalSince1970: TimeInterval(session.endTs))) }
-    var dateLabel: String { Night.dateFmt.string(from: Date(timeIntervalSince1970: TimeInterval(session.startTs))) }
+    var onsetText: String { ApolloNight.timeFmt.string(from: Date(timeIntervalSince1970: TimeInterval(session.startTs))) }
+    var wakeText: String { ApolloNight.timeFmt.string(from: Date(timeIntervalSince1970: TimeInterval(session.endTs))) }
+    var dateLabel: String { ApolloNight.dateFmt.string(from: Date(timeIntervalSince1970: TimeInterval(session.startTs))) }
 
     private static let timeFmt: DateFormatter = {
         let f = DateFormatter(); f.dateFormat = "HH:mm"; return f

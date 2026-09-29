@@ -56,11 +56,11 @@ final class StrandDesignTests: XCTestCase {
     }
 
     func testStrainColorScaleAndEndpoints() {
-        // Strain samples the 0...21 ramp; endpoints match ember/magenta.
+        // Effort samples the 0...100 ramp; endpoints match ember/magenta.
         let ember = StrandPalette.strainColor(0).rgbaComponents
         let start = StrandPalette.strain000.rgbaComponents
         XCTAssertEqual(ember.r, start.r, accuracy: 0.02)
-        let magenta = StrandPalette.strainColor(21).rgbaComponents
+        let magenta = StrandPalette.strainColor(100).rgbaComponents
         let end = StrandPalette.strain100.rgbaComponents
         XCTAssertEqual(magenta.b, end.b, accuracy: 0.02)
     }
@@ -168,5 +168,77 @@ final class StrandDesignTests: XCTestCase {
     func testSparklineDefaultValueString() {
         XCTAssertEqual(Sparkline.defaultValueString(64), "64")
         XCTAssertEqual(Sparkline.defaultValueString(64.5), "64.5")
+    }
+
+    // MARK: - TrendChart Y domain (#974 top-headroom fix)
+
+    /// With no explicit yDomain the axis falls back to the gradient's valueRange.
+    func testTrendChartResolvedDomainDefaultsToValueRange() {
+        let pts = [
+            TrendPoint(date: Date(timeIntervalSince1970: 0), value: 10),
+            TrendPoint(date: Date(timeIntervalSince1970: 86_400), value: 40),
+        ]
+        let chart = TrendChart(points: pts, valueRange: 0...100)
+        XCTAssertEqual(chart.resolvedYDomain.lowerBound, 0, accuracy: 0.0001)
+        XCTAssertEqual(chart.resolvedYDomain.upperBound, 100, accuracy: 0.0001)
+    }
+
+    /// An explicit yDomain (a data-fitted axis with top headroom) overrides valueRange, and its
+    /// top sits ABOVE the highest reading so a peak curve + the top axis label clear the plot clip.
+    func testTrendChartExplicitYDomainProvidesTopHeadroom() {
+        let peak = 2.4
+        let pts = [
+            TrendPoint(date: Date(timeIntervalSince1970: 0), value: 0.5),
+            TrendPoint(date: Date(timeIntervalSince1970: 86_400), value: peak),
+        ]
+        // Mirrors StressView's fitted axis: round the peak up, add headroom, floor at 1.
+        let yTop = max(1, peak.rounded(.up) + 0.3)
+        let chart = TrendChart(points: pts, valueRange: 0...3, yDomain: 0...yTop)
+        XCTAssertEqual(chart.resolvedYDomain.lowerBound, 0, accuracy: 0.0001)
+        // 2.4 → ceil 3 → +0.3 = 3.3, comfortably above the peak.
+        XCTAssertGreaterThan(chart.resolvedYDomain.upperBound, peak)
+        XCTAssertEqual(chart.resolvedYDomain.upperBound, 3.3, accuracy: 0.0001)
+    }
+
+    /// A flat, all-calm history (max 0) must not collapse to a zero-height axis: the floor holds it at 1.
+    func testTrendChartFittedDomainFloorsAtOne() {
+        let peak = 0.0
+        let yTop = max(1, peak.rounded(.up) + 0.3)
+        let pts = [
+            TrendPoint(date: Date(timeIntervalSince1970: 0), value: 0),
+            TrendPoint(date: Date(timeIntervalSince1970: 86_400), value: 0),
+        ]
+        let chart = TrendChart(points: pts, valueRange: 0...3, yDomain: 0...yTop)
+        XCTAssertEqual(chart.resolvedYDomain.upperBound, 1, accuracy: 0.0001)
+        XCTAssertGreaterThan(chart.resolvedYDomain.upperBound, chart.resolvedYDomain.lowerBound)
+    }
+
+    // MARK: - TrendChart bar mode (#85: sleep duration as a bar histogram)
+
+    /// Bar mode must floor the plotted domain at 0 even when the data-fitted `resolvedYDomain` sits
+    /// entirely above it (e.g. a trailing-30-days sleep-hours window like 5...9h) — otherwise a
+    /// BarMark's length would no longer be proportional to its value.
+    func testTrendChartBarModeFloorsPlotDomainAtZero() {
+        let pts = [
+            TrendPoint(date: Date(timeIntervalSince1970: 0), value: 6.5),
+            TrendPoint(date: Date(timeIntervalSince1970: 86_400), value: 7.8),
+        ]
+        let chart = TrendChart(points: pts, valueRange: 5...9, showsBars: true)
+        XCTAssertEqual(chart.resolvedYDomain.lowerBound, 5, accuracy: 0.0001,
+                       "the gradient/axis-fitted domain itself is untouched")
+        XCTAssertEqual(chart.plotYDomain.lowerBound, 0, accuracy: 0.0001,
+                       "but the domain actually applied to the plot floors at 0 for bars")
+        XCTAssertEqual(chart.plotYDomain.upperBound, chart.resolvedYDomain.upperBound, accuracy: 0.0001)
+    }
+
+    /// Line mode (the default) must NOT floor at 0 — `plotYDomain` should equal `resolvedYDomain`
+    /// unchanged, preserving the data-fitted-axis behavior the other tests above pin.
+    func testTrendChartLineModeDoesNotFloorPlotDomain() {
+        let pts = [
+            TrendPoint(date: Date(timeIntervalSince1970: 0), value: 6.5),
+            TrendPoint(date: Date(timeIntervalSince1970: 86_400), value: 7.8),
+        ]
+        let chart = TrendChart(points: pts, valueRange: 5...9)
+        XCTAssertEqual(chart.plotYDomain.lowerBound, chart.resolvedYDomain.lowerBound, accuracy: 0.0001)
     }
 }

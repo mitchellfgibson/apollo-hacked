@@ -7,6 +7,21 @@ import Foundation
 public enum DataSourceKind: String, Sendable, Codable, Equatable, CaseIterable {
     case appleHealth
     case whoopExport
+    /// Xiaomi Smart Band (Mi Band) — imported from the Mi Fitness iOS app's
+    /// on-device SQLite store (`DataBase/<user_id>/de/<user_id>.db`). Account-free,
+    /// fully offline: NOOP reads the file the user already owns.
+    case xiaomiBand
+    /// Oura Ring — the user's own Account data export (JSON), imported from the file
+    /// Oura hands them. Sleep periods + daily readiness/activity → daily metrics + sleep
+    /// sessions. Fully offline, no Oura cloud/API.
+    case ouraImport
+    /// Fitbit — the user's own Google Takeout → Fitbit JSON export (per-day sleep /
+    /// resting_heart_rate / steps / heart_rate files). Fully offline, no Fitbit/Google API.
+    case fitbitImport
+    /// Garmin — the user's own Garmin Connect "Export Your Data" (GDPR) wellness JSON/CSV
+    /// (sleep / resting HR / stress / steps). The FIT activity files inside the same ZIP are
+    /// handled by the wave-1 FIT parser; this path does the WELLNESS daily + sleep only.
+    case garminImport
 }
 
 // MARK: - Generic health sample (Apple Health Record sink)
@@ -80,6 +95,10 @@ public struct HealthWorkout: Sendable, Equatable {
     public var distanceM: Double?
     /// Total active energy burned in kilocalories, when present.
     public var energyKcal: Double?
+    /// Average heart rate over the workout, when present (iOS 16+ `<WorkoutStatistics>` only).
+    public var avgHr: Double?
+    /// Peak heart rate over the workout, when present (iOS 16+ `<WorkoutStatistics>` only).
+    public var maxHr: Double?
     public var start: Date
     public var end: Date
     public var tzOffsetMin: Int
@@ -90,6 +109,8 @@ public struct HealthWorkout: Sendable, Equatable {
         durationS: Double?,
         distanceM: Double?,
         energyKcal: Double?,
+        avgHr: Double? = nil,
+        maxHr: Double? = nil,
         start: Date,
         end: Date,
         tzOffsetMin: Int,
@@ -99,6 +120,8 @@ public struct HealthWorkout: Sendable, Equatable {
         self.durationS = durationS
         self.distanceM = distanceM
         self.energyKcal = energyKcal
+        self.avgHr = avgHr
+        self.maxHr = maxHr
         self.start = start
         self.end = end
         self.tzOffsetMin = tzOffsetMin
@@ -296,6 +319,305 @@ public struct WhoopJournalRow: Sendable, Equatable {
     }
 }
 
+// MARK: - Xiaomi Smart Band (Mi Fitness export)
+
+/// The canonical sleep stages NOOP recognises from the Mi Fitness `sleep` table's
+/// per-segment `state` codes. Verified against a real Mi Band 10 export:
+/// `1 = awake, 2 = light, 3 = deep, 4 = REM, 5 = awake-in-bed`.
+public enum XiaomiSleepStage: String, Sendable, Equatable, CaseIterable {
+    case awake
+    case light
+    case deep
+    case rem
+    case awakeInBed
+    case unknown
+
+    public static func from(state: Int) -> XiaomiSleepStage {
+        switch state {
+        case 1: return .awake
+        case 2: return .light
+        case 3: return .deep
+        case 4: return .rem
+        case 5: return .awakeInBed
+        default: return .unknown
+        }
+    }
+}
+
+/// One contiguous sleep-stage interval (`items[]` entry) from a Mi Fitness `sleep` row.
+public struct XiaomiSleepStageInterval: Sendable, Equatable {
+    public var stage: XiaomiSleepStage
+    public var start: Date
+    public var end: Date
+
+    public init(stage: XiaomiSleepStage, start: Date, end: Date) {
+        self.stage = stage
+        self.start = start
+        self.end = end
+    }
+}
+
+/// One sleep session reconstructed from a Mi Fitness `sleep` interval row, including
+/// its full hypnogram (`stages`). Durations are minutes, as the band reports them.
+public struct XiaomiSleepSession: Sendable, Equatable {
+    public var bedtime: Date
+    public var wakeTime: Date
+    public var deepMin: Double?
+    public var lightMin: Double?
+    public var remMin: Double?
+    public var awakeMin: Double?
+    public var avgHr: Int?
+    public var minHr: Int?
+    public var maxHr: Int?
+    public var awakeCount: Int?
+    public var sleepScore: Int?
+    public var stages: [XiaomiSleepStageInterval]
+
+    public init(
+        bedtime: Date,
+        wakeTime: Date,
+        deepMin: Double? = nil,
+        lightMin: Double? = nil,
+        remMin: Double? = nil,
+        awakeMin: Double? = nil,
+        avgHr: Int? = nil,
+        minHr: Int? = nil,
+        maxHr: Int? = nil,
+        awakeCount: Int? = nil,
+        sleepScore: Int? = nil,
+        stages: [XiaomiSleepStageInterval] = []
+    ) {
+        self.bedtime = bedtime
+        self.wakeTime = wakeTime
+        self.deepMin = deepMin
+        self.lightMin = lightMin
+        self.remMin = remMin
+        self.awakeMin = awakeMin
+        self.avgHr = avgHr
+        self.minHr = minHr
+        self.maxHr = maxHr
+        self.awakeCount = awakeCount
+        self.sleepScore = sleepScore
+        self.stages = stages
+    }
+}
+
+/// One calendar day rolled up from the Mi Fitness `*_day` tables. `day` is the
+/// band's local calendar day (`YYYY-MM-DD`, derived from the row's `zone_offset`).
+/// All metric fields are optional — a given day only carries what the band recorded.
+public struct XiaomiDailyRow: Sendable, Equatable {
+    public var day: String
+    public var dayStart: Date
+
+    // Activity (steps_day / calories_day / intensity_day / valid_stand_day)
+    public var steps: Int?
+    public var distanceM: Double?
+    public var activeKcal: Double?
+    public var intensityMin: Double?
+    public var standCount: Int?
+
+    // Heart rate (heart_rate_day)
+    public var restingHr: Int?
+    public var avgHr: Int?
+    public var minHr: Int?
+    public var maxHr: Int?
+
+    // Sleep rollup (sleep_day)
+    public var totalSleepMin: Double?
+    public var deepMin: Double?
+    public var lightMin: Double?
+    public var remMin: Double?
+    public var awakeMin: Double?
+    public var sleepScore: Int?
+
+    // Wellbeing (stress_day / spo2_day / vitality)
+    public var avgStress: Int?
+    public var avgSpo2: Double?
+    public var vitality: Int?
+
+    public init(day: String, dayStart: Date) {
+        self.day = day
+        self.dayStart = dayStart
+    }
+}
+
+/// Normalized output of parsing a Mi Fitness export (the iOS app sandbox folder,
+/// a zip of it, or the bare `<user_id>.db`).
+public struct XiaomiImportResult: Sendable, Equatable {
+    public var days: [XiaomiDailyRow]
+    public var sleeps: [XiaomiSleepSession]
+    public var summary: ImportSummary
+
+    public init(days: [XiaomiDailyRow], sleeps: [XiaomiSleepSession], summary: ImportSummary) {
+        self.days = days
+        self.sleeps = sleeps
+        self.summary = summary
+    }
+}
+
+// MARK: - Wearable file-export import (Oura / Fitbit / Garmin own-data exports)
+
+/// Which third-party wearable an export came from. Used to pick the right parser and to
+/// tag every imported row with an honest per-source label (`oura-import` / `fitbit-import` /
+/// `garmin-import`), so the UI never confuses Oura/Fitbit/Garmin data with WHOOP's.
+public enum WearableBrand: String, Sendable, Equatable, CaseIterable {
+    case oura
+    case fitbit
+    case garmin
+
+    /// The per-source partition / provenance id written as the Data Source device id (mirrors
+    /// `"my-whoop"` / `"apple-health"` / `"xiaomi-band"`). Honest: imported, not live.
+    public var sourceId: String {
+        switch self {
+        case .oura:   return "oura-import"
+        case .fitbit: return "fitbit-import"
+        case .garmin: return "garmin-import"
+        }
+    }
+
+    /// Human label for the import summary / Data Source card.
+    public var displayName: String {
+        switch self {
+        case .oura:   return "Oura"
+        case .fitbit: return "Fitbit"
+        case .garmin: return "Garmin"
+        }
+    }
+
+    public var dataSourceKind: DataSourceKind {
+        switch self {
+        case .oura:   return .ouraImport
+        case .fitbit: return .fitbitImport
+        case .garmin: return .garminImport
+        }
+    }
+}
+
+/// One contiguous sleep-stage interval reconstructed from a wearable export's hypnogram, when
+/// the export carried per-segment staging (Fitbit `levels.data`, Garmin `sleepLevels`). Oura's
+/// account export gives stage DURATIONS but not a per-segment timeline, so its sessions carry the
+/// duration breakdown without a stage list — honest: we never synthesize a fake hypnogram.
+public struct WearableSleepStageInterval: Sendable, Equatable {
+    /// Normalized stage name written into the stage JSON: "deep" / "light" / "rem" / "wake".
+    public var stage: String
+    public var start: Date
+    public var end: Date
+
+    public init(stage: String, start: Date, end: Date) {
+        self.stage = stage
+        self.start = start
+        self.end = end
+    }
+}
+
+/// One sleep session imported from a wearable export. Durations are MINUTES (as NOOP's
+/// `DailyMetric` / sleep model use). A field is nil when the export didn't carry it — never
+/// fabricated. `stages` is empty when the export gave only a duration breakdown (Oura).
+public struct WearableSleepSession: Sendable, Equatable {
+    public var start: Date          // bedtime / sleep onset (UTC)
+    public var end: Date            // wake (UTC)
+    public var deepMin: Double?
+    public var lightMin: Double?
+    public var remMin: Double?
+    public var awakeMin: Double?
+    public var totalSleepMin: Double?
+    public var efficiencyPct: Double?
+    public var avgHr: Int?
+    public var lowestHr: Int?       // Oura/Garmin lowest sleeping HR ≈ resting
+    public var avgHrvMs: Double?    // Oura "average_hrv" (rMSSD ms); others nil
+    public var respRateBpm: Double? // Oura "average_breath"; others nil
+    public var sleepScore: Int?     // the brand's OWN score — stored as reference only, never Charge
+    public var stages: [WearableSleepStageInterval]
+
+    public init(
+        start: Date,
+        end: Date,
+        deepMin: Double? = nil,
+        lightMin: Double? = nil,
+        remMin: Double? = nil,
+        awakeMin: Double? = nil,
+        totalSleepMin: Double? = nil,
+        efficiencyPct: Double? = nil,
+        avgHr: Int? = nil,
+        lowestHr: Int? = nil,
+        avgHrvMs: Double? = nil,
+        respRateBpm: Double? = nil,
+        sleepScore: Int? = nil,
+        stages: [WearableSleepStageInterval] = []
+    ) {
+        self.start = start
+        self.end = end
+        self.deepMin = deepMin
+        self.lightMin = lightMin
+        self.remMin = remMin
+        self.awakeMin = awakeMin
+        self.totalSleepMin = totalSleepMin
+        self.efficiencyPct = efficiencyPct
+        self.avgHr = avgHr
+        self.lowestHr = lowestHr
+        self.avgHrvMs = avgHrvMs
+        self.respRateBpm = respRateBpm
+        self.sleepScore = sleepScore
+        self.stages = stages
+    }
+}
+
+/// One calendar day rolled up from a wearable export. `day` is the export's own calendar day
+/// string (`YYYY-MM-DD`). Every metric is optional — a day only carries what the export recorded.
+///
+/// HONEST DATA: `readinessScore` (Oura) is THEIR score, kept for reference only — it is NEVER shown
+/// as NOOP's Charge. NOOP recomputes its own scores downstream from the raw inputs (RHR / HRV /
+/// sleep) that are present, exactly as it does for any imported source.
+public struct WearableDailyRow: Sendable, Equatable {
+    public var day: String
+
+    // Activity
+    public var steps: Int?
+    public var distanceM: Double?
+    public var activeKcal: Double?
+    public var totalKcal: Double?
+
+    // Heart / recovery inputs
+    public var restingHr: Int?
+    public var avgHrvMs: Double?
+    public var respRateBpm: Double?   // night respiration (breaths/min) folded from the session, so it reaches the day rollup (#17)
+    public var skinTempDevC: Double?  // Oura "temperature_deviation" (°C from baseline)
+    public var spo2Pct: Double?
+    public var avgStress: Int?        // Garmin daily average stress (0..100), reference
+    public var vo2max: Double?        // Oura "vo2_max" (mL/kg/min); feeds Fitness Age, same as Apple Health VO2max
+
+    // Sleep rollup (mirrors the night's session, for the daily metric)
+    public var totalSleepMin: Double?
+    public var deepMin: Double?
+    public var lightMin: Double?
+    public var remMin: Double?
+    public var awakeMin: Double?
+    public var efficiencyPct: Double?
+
+    // The brand's OWN reference scores — stored under reference keys, never NOOP Charge/Effort/Rest.
+    public var readinessScore: Int?   // Oura daily readiness (reference)
+    public var sleepScore: Int?       // brand sleep score (reference)
+
+    public init(day: String) {
+        self.day = day
+    }
+}
+
+/// Normalized output of parsing a wearable export (Oura / Fitbit / Garmin own-data export).
+public struct WearableImportResult: Sendable, Equatable {
+    public var brand: WearableBrand
+    public var days: [WearableDailyRow]
+    public var sleeps: [WearableSleepSession]
+    public var summary: ImportSummary
+
+    public init(brand: WearableBrand, days: [WearableDailyRow], sleeps: [WearableSleepSession], summary: ImportSummary) {
+        self.brand = brand
+        self.days = days
+        self.sleeps = sleeps
+        self.summary = summary
+    }
+}
+
 // MARK: - Import results & summary
 
 /// Lightweight summary of an import: how many normalized rows were produced and
@@ -308,19 +630,28 @@ public struct ImportSummary: Sendable, Equatable {
     /// Per-category counts (e.g. `["HeartRate": 1200, "SleepAnalysis": 88]` for
     /// Apple Health, or `["cycles": 30, "workouts": 12]` for Whoop).
     public var countsByCategory: [String: Int]
+    /// Number of XML spans dropped during a tolerant import: either a single
+    /// hard parse error after which we kept the partial result (counts as 1), or
+    /// the number of illegal-byte runs the pre-parse sanitizer scrubbed. Surfaced
+    /// honestly in the UI so a partial import never silently looks complete.
+    /// `0` for a fully clean import. Defaulted so other sources (Whoop) and older
+    /// call sites stay source-compatible.
+    public var skippedSpans: Int
 
     public init(
         sourceKind: DataSourceKind,
         recordCount: Int,
         earliest: Date?,
         latest: Date?,
-        countsByCategory: [String: Int]
+        countsByCategory: [String: Int],
+        skippedSpans: Int = 0
     ) {
         self.sourceKind = sourceKind
         self.recordCount = recordCount
         self.earliest = earliest
         self.latest = latest
         self.countsByCategory = countsByCategory
+        self.skippedSpans = skippedSpans
     }
 }
 
@@ -330,17 +661,27 @@ public struct AppleHealthImportResult: Sendable, Equatable {
     public var workouts: [HealthWorkout]
     public var sleepIntervals: [SleepStageInterval]
     public var summary: ImportSummary
+    /// Pre-aggregated per-day sample rows, folded incrementally by the importer
+    /// so a multi-year export never has to retain the raw `samples` array in RAM
+    /// (issue #355). When the importer kept raw samples (`retainRawSamples:true`,
+    /// the default) this is empty and `AppleHealthAggregator.aggregate` re-folds
+    /// `samples`; when it dropped them (the app path) this carries the folded
+    /// result and `samples` is empty. Defaulted to `[]` for source-compatibility
+    /// with existing call sites that build a result from raw `samples`.
+    public var sampleDailies: [AppleDailyAggregate]
 
     public init(
         samples: [HealthSample],
         workouts: [HealthWorkout],
         sleepIntervals: [SleepStageInterval],
-        summary: ImportSummary
+        summary: ImportSummary,
+        sampleDailies: [AppleDailyAggregate] = []
     ) {
         self.samples = samples
         self.workouts = workouts
         self.sleepIntervals = sleepIntervals
         self.summary = summary
+        self.sampleDailies = sampleDailies
     }
 }
 
@@ -369,7 +710,7 @@ public struct WhoopImportResult: Sendable, Equatable {
 
 // MARK: - Errors
 
-public enum ImportError: Error, Equatable, Sendable, CustomStringConvertible {
+public enum ImportError: Error, Equatable, Sendable, CustomStringConvertible, LocalizedError {
     case fileNotFound(String)
     case notAZipOrFolder(String)
     case missingEntry(String)
@@ -385,4 +726,10 @@ public enum ImportError: Error, Equatable, Sendable, CustomStringConvertible {
         case .emptyExport(let m):     return "Export contained no usable data: \(m)"
         }
     }
+
+    /// Honest, human-readable failure text surfaced in the import UI. Without this the enum bridges to
+    /// NSError positionally and the user sees an opaque "…ImportError erreur 4" with no clue what went
+    /// wrong (#857). `LocalizedError.errorDescription` is what `Error.localizedDescription` returns, so
+    /// the Data Sources screen now shows the same plain sentence `description` carries.
+    public var errorDescription: String? { description }
 }

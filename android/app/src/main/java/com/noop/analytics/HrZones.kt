@@ -1,6 +1,7 @@
 package com.noop.analytics
 
 import com.noop.data.HrSample
+import kotlin.math.min
 
 /*
  * HrZones.kt — HR-max + 5 heart-rate zones and time-in-zone from an HR stream.
@@ -47,7 +48,7 @@ data class HrZoneSet(
     val zones: List<HrZone>,
     /** Max HR (bpm) the zones were built from. */
     val maxHR: Double,
-    /** "tanaka" (age formula) or "manual" (caller override). */
+    /** "tanaka" (age formula), "manual" (caller override), or "custom" (personalized boundaries). */
     val source: String,
 ) {
     /** Return the zone number (1..5) for a bpm value, or 0 when below Zone 1. */
@@ -89,6 +90,12 @@ object HrZones {
     /** %HRmax band edges for zones 1..5: [0.50, 0.60, 0.70, 0.80, 0.90, 1.00]. */
     val zoneEdges: List<Double> = listOf(0.50, 0.60, 0.70, 0.80, 0.90, 1.00)
 
+    /**
+     * Sensible editable BPM range for personalized zone starts. The analytics API accepts any
+     * positive finite values; the app UIs use this range to keep steppers practical.
+     */
+    val customBPMRange: IntRange = 30..250
+
     /** Tanaka (2001) age-predicted max HR: 208 − 0.7 × age (gender-independent). */
     fun tanakaMaxHR(age: Double): Double = 208.0 - 0.7 * age
 
@@ -98,7 +105,7 @@ object HrZones {
      * @param age age in years (used only when [maxHROverride] is null).
      * @param maxHROverride explicit HRmax (bpm); when provided, `source == "manual"`.
      */
-    fun zones(age: Double, maxHROverride: Double? = null): HrZoneSet {
+    fun zones(age: Double, maxHROverride: Double? = null, customLowerBounds: List<Double>? = null): HrZoneSet {
         val maxHR: Double
         val source: String
         if (maxHROverride != null) {
@@ -108,26 +115,50 @@ object HrZones {
             maxHR = tanakaMaxHR(age)
             source = "tanaka"
         }
-        return zones(maxHR, source)
+        return zones(maxHR, source, customLowerBounds)
     }
 
-    /** Build the 5-zone set directly from a known max HR. */
-    fun zones(maxHR: Double, source: String = "manual"): HrZoneSet {
+    /**
+     * Build the 5-zone set directly from a known max HR, optionally replacing the conventional
+     * percentage edges with five personalized inclusive lower bounds in BPM. Invalid custom input
+     * falls back to the conventional model, so malformed restored preferences can never create gaps.
+     */
+    fun zones(maxHR: Double, source: String = "manual", customLowerBounds: List<Double>? = null): HrZoneSet {
+        val custom = customLowerBounds?.let(::validCustomLowerBounds)
         val built = ArrayList<HrZone>(5)
         for (i in 0 until 5) {
-            val loPct = zoneEdges[i]
-            val hiPct = zoneEdges[i + 1]
+            val lower = custom?.get(i) ?: (zoneEdges[i] * maxHR)
+            val upper = custom?.let { if (i < 4) it[i + 1] else maxOf(maxHR, it[i]) } ?: (zoneEdges[i + 1] * maxHR)
+            val loPct = if (maxHR > 0) lower / maxHR else 0.0
+            val hiPct = if (maxHR > 0) upper / maxHR else 0.0
             built.add(
                 HrZone(
                     number = i + 1,
-                    lower = loPct * maxHR,
-                    upper = hiPct * maxHR,
+                    lower = lower,
+                    upper = upper,
                     lowerPct = loPct,
                     upperPct = hiPct,
                 )
             )
         }
-        return HrZoneSet(zones = built, maxHR = maxHR, source = source)
+        return HrZoneSet(zones = built, maxHR = maxHR, source = if (custom == null) source else "custom")
+    }
+
+    /**
+     * The conventional five inclusive lower bounds, rounded up to whole BPM for an editor. Rounding
+     * up preserves the existing integer-sample classification (e.g. a 93.5 edge starts at 94 bpm).
+     */
+    fun defaultLowerBounds(maxHR: Double): List<Int> = zoneEdges.take(5).map { kotlin.math.ceil(it * maxHR).toInt() }
+
+    /**
+     * Return a valid five-boundary custom model, or null unless values are positive, finite, and
+     * strictly increasing. Kept public so persistence layers can reject hand-edited backup values
+     * using the exact same invariant as the analytics engine.
+     */
+    fun validCustomLowerBounds(values: List<Double>): List<Double>? {
+        if (values.size != 5 || !values.all { it.isFinite() && it > 0 }) return null
+        for (i in 1 until values.size) if (values[i] <= values[i - 1]) return null
+        return values
     }
 
     /**
@@ -158,7 +189,7 @@ object HrZones {
                 val gap = (sorted[i + 1].ts - sorted[i].ts).toDouble()
                 // Guard against zero/negative or pathological gaps; cap at the median
                 // so a single huge wall-clock gap doesn't blow up one bucket.
-                if (gap > 0) gap else tailDuration
+                if (gap > 0) min(gap, tailDuration) else tailDuration
             } else {
                 tailDuration
             }
@@ -186,5 +217,31 @@ object HrZones {
         if (gaps.isEmpty()) return 1.0
         gaps.sort()
         return maxOf(gaps[gaps.size / 2], 1.0)
+    }
+}
+
+/**
+ * Single-entry memo for [HrZones.zones]. The zone set is a pure function of maxHR (the [HrZones.zoneEdges]
+ * are constant), and maxHR changes only when the user edits their profile — orders of magnitude less often
+ * than [com.noop.ui.AppViewModel.coachZone] runs, which is every ~1 Hz live-HR sample while zone coaching
+ * is active. Rebuilds the 5-zone set only when maxHR changes, so a streaming tick reuses it instead of
+ * allocating six objects a second. Not thread-safe by design: touched only from the single coachZone call
+ * on the live-state collector.
+ */
+internal class HrZoneSetCache {
+    private var maxHR = Double.NaN
+    private var custom: List<Double>? = null
+    private var set: HrZoneSet? = null
+
+    /**
+     * The effective zone set for [maxHR] and optional [customLowerBounds], rebuilt only when an input
+     * differs from the last call — so the 1 Hz coach path reuses it, and personalized zones (#531) are
+     * honoured instead of the maxHR-only default.
+     */
+    fun zones(maxHR: Double, customLowerBounds: List<Double>? = null): HrZoneSet {
+        set?.let { if (maxHR == this.maxHR && customLowerBounds == custom) return it }
+        return HrZones.zones(maxHR = maxHR, customLowerBounds = customLowerBounds).also {
+            this.maxHR = maxHR; custom = customLowerBounds; set = it
+        }
     }
 }

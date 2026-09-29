@@ -39,7 +39,8 @@
       "36": "START_FIRMWARE_LOAD", "37": "LOAD_FIRMWARE_DATA", "38": "PROCESS_FIRMWARE_IMAGE",
       "39": "SET_LED_DRIVE", "40": "GET_LED_DRIVE", "41": "SET_TIA_GAIN", "42": "GET_TIA_GAIN",
       "43": "SET_BIAS_OFFSET", "44": "GET_BIAS_OFFSET", "45": "ENTER_BLE_DFU",
-      "52": "SET_DP_TYPE", "53": "FORCE_DP_TYPE", "63": "SEND_R10_R11_REALTIME",
+      "48": "SEND_EVENT_PACKETS", "52": "SET_DP_TYPE", "53": "FORCE_DP_TYPE",
+      "61": "SET_AFE_PARAMETERS", "62": "GET_AFE_PARAMETERS", "63": "SEND_R10_R11_REALTIME",
       "66": "SET_ALARM_TIME", "67": "GET_ALARM_TIME", "68": "RUN_ALARM", "69": "DISABLE_ALARM",
       "76": "GET_ADVERTISING_NAME_HARVARD", "77": "SET_ADVERTISING_NAME_HARVARD",
       "79": "RUN_HAPTICS_PATTERN", "80": "GET_ALL_HAPTICS_PATTERN",
@@ -56,7 +57,8 @@
       "140": "SET_ADVERTISING_NAME", "141": "GET_ADVERTISING_NAME",
       "142": "START_FIRMWARE_LOAD_NEW", "143": "LOAD_FIRMWARE_DATA_NEW",
       "144": "PROCESS_FIRMWARE_IMAGE_NEW", "145": "GET_HELLO", "151": "GET_BATTERY_PACK_INFO",
-      "153": "TOGGLE_PERSISTENT_R20", "154": "TOGGLE_PERSISTENT_R21"}
+      "153": "TOGGLE_PERSISTENT_R20", "154": "TOGGLE_PERSISTENT_R21"},
+    "CommandResult": {"0": "FAILURE", "1": "SUCCESS", "2": "PENDING", "3": "UNSUPPORTED"}
   },
   "envelope": [
     {"off": 0, "len": 1, "name": "SOF", "cat": "frame"},
@@ -128,7 +130,7 @@
             {"off": 64, "len": 4, "dtype": "f32", "name": "gravity2_z", "cat": "accel", "note": "2nd accel/gravity triplet (g)"},
             {"off": 68, "len": 2, "dtype": "u16", "name": "spo2_red", "cat": "spo2", "note": "raw ADC; SpO2 % computed server-side"},
             {"off": 70, "len": 2, "dtype": "u16", "name": "spo2_ir", "cat": "spo2", "note": "raw ADC; SpO2 % computed server-side"},
-            {"off": 72, "len": 2, "dtype": "u16", "name": "skin_temp_raw", "cat": "temp", "note": "raw ADC; degC computed server-side"},
+            {"off": 72, "len": 2, "dtype": "u16", "name": "skin_temp_raw", "cat": "temp", "note": "raw ADC; NOT centidegrees (that is the 5/MG v18 @73 scale). Convert family-aware via skinTempCelsius(raw:.whoop4) (#938); worn ~826, no-contact floor ~510"},
             {"off": 74, "len": 2, "dtype": "u16", "name": "ambient", "cat": "optical", "note": "ambient light ADC"},
             {"off": 76, "len": 2, "dtype": "u16", "name": "led_drive_1", "cat": "optical"},
             {"off": 78, "len": 2, "dtype": "u16", "name": "led_drive_2", "cat": "optical"},

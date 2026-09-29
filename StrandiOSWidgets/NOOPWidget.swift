@@ -1,0 +1,440 @@
+import WidgetKit
+import SwiftUI
+import StrandDesign
+
+/// Timeline entry backed by the latest `WidgetSnapshot` the app published into the App Group.
+struct NOOPEntry: TimelineEntry {
+    let date: Date
+    let snapshot: WidgetSnapshot
+}
+
+struct NOOPProvider: TimelineProvider {
+    func placeholder(in context: Context) -> NOOPEntry {
+        NOOPEntry(date: Date(), snapshot: .placeholder)
+    }
+
+    func getSnapshot(in context: Context, completion: @escaping (NOOPEntry) -> Void) {
+        let fallback: WidgetSnapshot = context.isPreview ? .placeholder : .unavailable
+        completion(NOOPEntry(date: Date(), snapshot: WidgetSnapshot.load() ?? fallback))
+    }
+
+    func getTimeline(in context: Context, completion: @escaping (Timeline<NOOPEntry>) -> Void) {
+        // Gallery previews use `placeholder(in:)` / getSnapshot's preview branch. A real timeline
+        // with no shared snapshot must show missing data honestly, never plausible sample numbers.
+        let snap = WidgetSnapshot.load() ?? .unavailable
+        // Refresh roughly every 15 minutes; the app also forces a reload when it publishes fresh data.
+        let next = Calendar.current.date(byAdding: .minute, value: 15, to: Date()) ?? Date().addingTimeInterval(900)
+        completion(Timeline(entries: [NOOPEntry(date: Date(), snapshot: snap)], policy: .after(next)))
+    }
+}
+
+/// The glanceable widget — the iOS analogue of the macOS menu-bar extra.
+/// Home Screen families mirror Today's hero trio (Charge · Effort · Rest) as score rings. Lock Screen
+/// accessories are compact: a single line, a gauge, or the rectangular glyph-over-value trio.
+struct NOOPWidgetView: View {
+    @Environment(\.widgetFamily) private var family
+    /// `.fullColor` on the home screen and in the gallery; `.vibrant` or `.accented` on the lock screen,
+    /// where the system desaturates any colour it is handed. The accessory cells check this rather than
+    /// tinting unconditionally — see `accessoryScore`.
+    @Environment(\.widgetRenderingMode) private var renderingMode
+    let entry: NOOPEntry
+
+    private var snap: WidgetSnapshot { entry.snapshot }
+
+    var body: some View {
+        switch family {
+        case .accessoryCircular:
+            recoveryGauge
+        case .accessoryInline:
+            Text(inlineText)
+        case .accessoryRectangular:
+            rectangular
+        case .systemLarge:
+            large
+        case .systemMedium:
+            medium
+        default:
+            // systemSmall (and any future compact family)
+            small
+        }
+    }
+
+    // MARK: - Colours (match Today's GlowRing domain constants)
+
+    private var chargeColor: Color {
+        snap.recovery != nil ? StrandPalette.chargeColor : StrandPalette.textTertiary
+    }
+
+    /// Fixed domain accent — same as `TodayView.effortRing` (`StrandPalette.effortColor`), not the
+    /// value-sampled `effortTint` ramp the old footer bolt used.
+    private var effortColor: Color {
+        snap.effort != nil ? StrandPalette.effortColor : StrandPalette.textTertiary
+    }
+
+    private var restColor: Color {
+        snap.rest != nil ? StrandPalette.restColor : StrandPalette.textTertiary
+    }
+
+    /// Effort centre/accessory text: pre-formatted #313 display when present, else whole-number 0–100.
+    private var effortText: String? {
+        snap.effortDisplay ?? snap.effort.map(String.init)
+    }
+
+    private var inlineText: String {
+        var parts: [String] = []
+        if let r = snap.recovery { parts.append("Charge \(r)%") }
+        if let b = snap.bpm { parts.append("\(b) bpm") }
+        return parts.isEmpty ? "NOOP" : parts.joined(separator: " · ")
+    }
+
+    // MARK: - Lock Screen accessories
+
+    private var recoveryGauge: some View {
+        Gauge(value: Double(snap.recovery ?? 0), in: 0...100) {
+            Image(systemName: "heart.fill")
+        } currentValueLabel: {
+            Text(snap.recovery.map { "\($0)" } ?? "–")
+        }
+        .gaugeStyle(.accessoryCircular)
+        .tint(chargeColor)
+    }
+
+    /// Lock-Screen rectangular accessory: Charge · Effort · Rest, same trio as the Home Screen rings.
+    private var rectangular: some View {
+        // The lock screen gives this family roughly 72pt of height for everything. A "NOOP" title spent
+        // a whole row of that restating which widget the user chose to add, leaving the three scores —
+        // the only reason to add it — squeezed underneath. The title is gone and the heart-rate line is
+        // now conditional, so with no live HR the scores get the entire area.
+        VStack(spacing: 2) {
+            if let bpm = snap.bpm {
+                Text("\(bpm) bpm")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            }
+            HStack(alignment: .top, spacing: 0) {
+                accessoryScore("Charge", symbol: "figure.mind.and.body",
+                               text: snap.recovery.map { "\($0)%" }, tint: chargeColor)
+                accessoryScore("Effort", symbol: "figure.strengthtraining.traditional",
+                               text: effortText, tint: effortColor)
+                accessoryScore("Rest", symbol: "moon.fill",
+                               text: snap.rest.map { "\($0)%" }, tint: restColor)
+            }
+        }
+    }
+
+    /// One score cell. On the LOCK SCREEN the domain tint is deliberately dropped; it survives only
+    /// where the system actually renders full colour, which for this family means a gallery preview.
+    ///
+    /// Lock-screen widgets render in `.vibrant` (or `.accented`), where the system desaturates whatever
+    /// colour it is given and maps it onto the wallpaper. A domain colour handed to it does not survive
+    /// as that colour — it lands as an arbitrary grey whose luminance nobody chose, so Charge, Effort and
+    /// Rest stopped being distinguishable AND stopped being legible. `.primary`/`.secondary` are the two
+    /// levels the system is designed to map, so the value reads at full strength and the glyph above it
+    /// recedes, which is the hierarchy the tint was there to express in the first place.
+    ///
+    /// The `.fullColor` branch is defensive rather than hot: this family renders `.vibrant` on the lock
+    /// screen and in StandBy, so the tint realistically only reaches a gallery preview.
+    private func accessoryScore(_ label: String, symbol: String, text: String?, tint: Color) -> some View {
+        VStack(spacing: 1) {
+            // Glyph over value, the shape the request asked for. A 9pt word under each number was
+            // spending scarce height on text nobody needs twice — the icons carry the metric identity.
+            Image(systemName: symbol)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(renderingMode == .fullColor
+                                 ? AnyShapeStyle(StrandPalette.textTertiary)
+                                 : AnyShapeStyle(HierarchicalShapeStyle.secondary))
+            Text(text ?? "–")
+                .font(.system(size: 15, weight: .semibold, design: .rounded))
+                .foregroundStyle(scoreStyle(hasValue: text != nil, tint: tint))
+                .minimumScaleFactor(0.7)
+        }
+        .frame(maxWidth: .infinity)
+        // An icon says nothing to VoiceOver, and the word it replaced was the only thing naming this
+        // metric. Collapse the cell to one element that still speaks "Charge, 68 percent".
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(label))
+        // Plain literal, not String(localized:). This extension's sources are StrandiOSWidgets +
+        // StrandiOSShared only — Strand/Resources/Localizable.xcstrings is NOT in the target, and
+        // String(localized:) resolves against Bundle.main, which for an app extension is the extension's
+        // own bundle. It would compile, look localized, and render English in every locale. Every other
+        // string in this file is a bare literal for the same reason: the widget is not localized yet.
+        .accessibilityValue(Text(text ?? "No data"))
+    }
+
+    private func scoreStyle(hasValue: Bool, tint: Color) -> AnyShapeStyle {
+        // Spelled out rather than leaning on leading-dot inference through AnyShapeStyle's generic
+        // init, which is the kind of expression that type-checks in a playground and not in a build.
+        guard renderingMode == .fullColor else {
+            return hasValue ? AnyShapeStyle(HierarchicalShapeStyle.primary)
+                            : AnyShapeStyle(HierarchicalShapeStyle.secondary)
+        }
+        return hasValue ? AnyShapeStyle(tint) : AnyShapeStyle(StrandPalette.textTertiary)
+    }
+
+    // MARK: - Home Screen: systemSmall
+
+    /// Compact three-ring hero. Diameter is capped so three hard-framed circles fit the narrowest
+    /// systemSmall content width (SE ~128pt after padding) without overlapping — see review on #1022.
+    private var small: some View {
+        VStack(spacing: 6) {
+            headerRow
+            // 40pt × 3 = 120 ≤ 128 (SE) / 138 (15 Pro) content widths after 10pt padding.
+            scoreRings(diameter: 40, lineWidth: 4, labelFont: .system(size: 9, weight: .medium))
+            Spacer(minLength: 0)
+            vitalsFooter(compact: true)
+        }
+        .padding(10)
+    }
+
+    // MARK: - Home Screen: systemMedium
+
+    /// Wider three-ring row with room for a fuller vitals footer (live HR + strap battery).
+    private var medium: some View {
+        VStack(spacing: 8) {
+            headerRow
+            scoreRings(diameter: 72, lineWidth: 7, labelFont: .caption2)
+            Spacer(minLength: 0)
+            vitalsFooter(compact: false)
+        }
+        .padding(12)
+    }
+
+    // MARK: - Home Screen: systemLarge
+
+    /// Rings on top, then the richer stat grid (HRV, RHR, live HR, battery) — "show me more".
+    private var large: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            headerRow
+            scoreRings(diameter: 88, lineWidth: 8, labelFont: .caption)
+            Divider()
+            HStack(alignment: .top, spacing: 0) {
+                statCell("HRV", value: snap.hrv.map { "\($0)" }, unit: "ms",
+                         name: "Heart rate variability",
+                         spoken: snap.hrv.map { "\($0) milliseconds" })
+                statCell("Rest HR", value: snap.restingHr.map { "\($0)" }, unit: "bpm",
+                         name: "Resting heart rate",
+                         spoken: snap.restingHr.map { "\($0) beats per minute" })
+                statCell("HR", value: snap.bpm.map { "\($0)" }, unit: "bpm",
+                         name: "Heart rate",
+                         spoken: snap.bpm.map { "\($0) beats per minute" })
+                statCell("Battery", value: snap.batteryPct.map { "\($0)%" },
+                         name: "Strap battery",
+                         spoken: snap.batteryPct.map { "\($0) percent" })
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(16)
+    }
+
+    // MARK: - Shared pieces
+
+    private var headerRow: some View {
+        HStack {
+            Text("NOOP")
+                .font(.system(size: 13, weight: .bold))
+                .foregroundStyle(StrandPalette.textSecondary)
+            Spacer()
+            Circle()
+                .fill(snap.bonded ? StrandPalette.statusPositive : StrandPalette.statusCritical)
+                .frame(width: 8, height: 8)
+                .accessibilityLabel(snap.bonded ? Text("Connected") : Text("Disconnected"))
+        }
+    }
+
+    /// The Today hero trio as static score rings (widget-safe: no draw-in animation / onAppear race).
+    /// Order matches TodayView: Charge · Effort · Rest. Each cell is honest-null ("–") until scored.
+    private func scoreRings(diameter: CGFloat, lineWidth: CGFloat, labelFont: Font) -> some View {
+        HStack(alignment: .top, spacing: 0) {
+            WidgetScoreRing(
+                text: snap.recovery.map(String.init),
+                fraction: snap.recovery.map { Double($0) / 100 },
+                label: "Charge",
+                color: chargeColor,
+                diameter: diameter,
+                lineWidth: lineWidth,
+                labelFont: labelFont,
+                accessibilityOutOf: 100
+            )
+            WidgetScoreRing(
+                text: effortText,
+                // Fill is always the stored 0–100 axis so WHOOP 0–21 and native 0–100 agree on arc length.
+                fraction: snap.effort.map { Double($0) / 100 },
+                label: "Effort",
+                color: effortColor,
+                diameter: diameter,
+                lineWidth: lineWidth,
+                labelFont: labelFont,
+                accessibilityOutOf: (snap.effortWhoop == true) ? 21 : 100
+            )
+            WidgetScoreRing(
+                text: snap.rest.map(String.init),
+                fraction: snap.rest.map { Double($0) / 100 },
+                label: "Rest",
+                color: restColor,
+                diameter: diameter,
+                lineWidth: lineWidth,
+                labelFont: labelFont,
+                accessibilityOutOf: 100
+            )
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    /// Home-Screen footer: heart rate, HRV, strap battery, under the score rings.
+    ///
+    /// `heart.fill` is HR and `waveform.path.ecg` is HRV, which is the metric pairing the rest of the app
+    /// uses — `TodayView` renders them as adjacent rows that way, and `DashboardCards`,
+    /// `TodayCustomizationMetadata`, `MetricCatalog` and this extension's own Live Activity all agree.
+    /// The two were inverted here from #1022 until #1795 reported it.
+    ///
+    /// The inversion was an easy one to make and is worth naming so it is not "corrected" back:
+    /// `waveform.path.ecg` IS the right symbol for Live HR as a FEATURE — `RootView`, `RootTabView` and
+    /// `HomeScreenQuickActions` all use it for the Live screen. As a METRIC icon it belongs to HRV, and
+    /// this footer is the one place that renders both metrics side by side, where the collision is the
+    /// entire problem: nothing here carries a text label, so the glyph is the only thing naming a number.
+    private func vitalsFooter(compact: Bool) -> some View {
+        HStack {
+            vital(symbol: "heart.fill", text: snap.bpm.map(String.init),
+                  name: "Heart rate", spoken: snap.bpm.map { "\($0) beats per minute" })
+            Spacer()
+            if !compact, let hrv = snap.hrv {
+                vital(symbol: "waveform.path.ecg", text: "\(hrv)",
+                      name: "Heart rate variability", spoken: "\(hrv) milliseconds")
+                Spacer()
+            }
+            vital(symbol: "battery.50", text: snap.batteryPct.map { "\($0)%" },
+                  name: "Strap battery", spoken: snap.batteryPct.map { "\($0) percent" })
+        }
+        .font(.caption2)
+        .foregroundStyle(StrandPalette.textSecondary)
+        .labelStyle(.titleAndIcon)
+    }
+
+    /// One footer vital. `spoken` is carried separately from the rendered `text` because VoiceOver gets
+    /// neither of the two things a sighted reader uses here: the glyph that names the metric, and the
+    /// unit, which the footer shows for none of them. Without this a reader hears "58", "64", "84 percent"
+    /// — three anonymous numbers. Same reasoning as `accessoryScore`, which #1715 fixed for the lock
+    /// screen; this footer predates it.
+    ///
+    /// Plain literals rather than `String(localized:)`, for the reason spelled out on `accessoryScore`:
+    /// this extension does not carry the app's string catalog, so `String(localized:)` would look
+    /// localized and render English anyway.
+    private func vital(symbol: String, text: String?, name: String, spoken: String?) -> some View {
+        Label(text ?? "–", systemImage: symbol)
+            // Collapse first, like `accessoryScore` and `WidgetScoreRing` already do. A `Label` under
+            // `.titleAndIcon` renders an image beside a text, so without this the bare number stays its
+            // own element and whether the label below wins is SwiftUI container semantics rather than
+            // something this file decides. Every other labelled graphic here ignores its children.
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(Text(name))
+            .accessibilityValue(Text(spoken ?? "No data"))
+    }
+
+    /// One labelled stat in the large grid — value over a caption, equal-width so the columns align.
+    ///
+    /// `name` and `spoken` exist because the on-screen caption is abbreviated for width and the unit is a
+    /// separate view: read as-is, VoiceOver produces "64", "ms", "HRV" — three fragments, value before
+    /// label, with "ms" and "bpm" spelled out letter by letter. Collapsing to one element lets the cell
+    /// speak "Heart rate variability, 64 milliseconds". `spoken` falls back to the rendered value rather
+    /// than to "No data", so a caller that omits it degrades to the old reading instead of lying.
+    private func statCell(_ label: String, value: String?, unit: String? = nil,
+                          tint: Color = StrandPalette.textPrimary,
+                          name: String? = nil, spoken: String? = nil) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .firstTextBaseline, spacing: 2) {
+                Text(value ?? "–")
+                    .font(.system(size: 20, weight: .semibold, design: .rounded))
+                    .foregroundStyle(value == nil ? StrandPalette.textTertiary : tint)
+                if let unit, value != nil {
+                    Text(unit).font(.caption2).foregroundStyle(StrandPalette.textTertiary)
+                }
+            }
+            Text(label).font(.caption2).foregroundStyle(StrandPalette.textTertiary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(name ?? label))
+        .accessibilityValue(Text(spoken ?? value ?? "No data"))
+    }
+}
+
+// MARK: - WidgetScoreRing
+
+/// A static, widget-safe score ring: full-circle track + solid arc + centre number + caption.
+/// Deliberately avoids `GlowRing`'s draw-in `@State` animation — WidgetKit timelines don't reliably
+/// fire `onAppear`, so an animated ring can freeze empty (0 fill) until the next timeline rebuild.
+private struct WidgetScoreRing: View {
+    /// Centre read-out already formatted (whole number, or one-decimal WHOOP Effort).
+    let text: String?
+    /// Arc fill 0…1; nil draws the empty track only (unscored).
+    let fraction: Double?
+    let label: String
+    let color: Color
+    let diameter: CGFloat
+    let lineWidth: CGFloat
+    let labelFont: Font
+    let accessibilityOutOf: Int
+
+    private var clampedFraction: CGFloat {
+        guard let fraction else { return 0 }
+        return CGFloat(min(max(fraction, 0), 1))
+    }
+
+    var body: some View {
+        VStack(spacing: 4) {
+            ZStack {
+                Circle()
+                    .stroke(StrandPalette.textPrimary.opacity(0.10),
+                            style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
+                if fraction != nil {
+                    Circle()
+                        // A genuine zero still draws a round-cap bead so scored-0 reads as data, not absence.
+                        .trim(from: 0, to: max(0.0001, clampedFraction))
+                        .stroke(color, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                }
+                Text(text ?? "–")
+                    .font(StrandFont.rounded(diameter * 0.34, weight: .bold))
+                    .foregroundStyle(text == nil ? StrandPalette.textTertiary : StrandPalette.textPrimary)
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.5)
+                    .padding(.horizontal, lineWidth + 2)
+            }
+            .frame(width: diameter, height: diameter)
+            Text(label)
+                .font(labelFont)
+                .foregroundStyle(StrandPalette.textTertiary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+        }
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(label))
+        .accessibilityValue(Text(text.map { "\($0) out of \(accessibilityOutOf)" } ?? "unavailable"))
+    }
+}
+
+struct NOOPWidget: Widget {
+    let kind = "NOOPWidget"
+
+    var body: some WidgetConfiguration {
+        StaticConfiguration(kind: kind, provider: NOOPProvider()) { entry in
+            if #available(iOS 17.0, *) {
+                NOOPWidgetView(entry: entry)
+                    .containerBackground(StrandPalette.surfaceBase, for: .widget)
+            } else {
+                NOOPWidgetView(entry: entry)
+                    .padding()
+                    .background(StrandPalette.surfaceBase)
+            }
+        }
+        .configurationDisplayName("NOOP")
+        .description("Charge, Effort and Rest as score rings, plus live HR and strap battery at a glance.")
+        .supportedFamilies([
+            .systemSmall, .systemMedium, .systemLarge,
+            .accessoryCircular, .accessoryInline, .accessoryRectangular
+        ])
+    }
+}

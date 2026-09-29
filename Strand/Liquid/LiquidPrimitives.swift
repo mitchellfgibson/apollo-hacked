@@ -1,0 +1,620 @@
+//  LiquidPrimitives.swift
+//  NOOP · Liquid design language
+//
+//  The Canvas renderers + SwiftUI view wrappers for the signature elements:
+//  the circular vessel gauge, the horizontal tube, and the live heart-rate thread.
+//  Each view owns a LiquidSim, steps it from a TimelineView clock, and reads the
+//  one shared tilt source. Colours come from StrandDesign tokens at the call site.
+
+import SwiftUI
+import StrandDesign   // NoopMotionState — the shared quiet-motion gate
+
+// MARK: - Renderers (pure GraphicsContext drawing)
+
+enum LiquidRender {
+
+    /// A softly sculpted circular progress ring. Geometry is fixed (`radius`, `lineWidth`, arc span);
+    /// this pass only deepens the material — recessed track, frosted inner disc, semantic progress
+    /// gradient — without neon bloom, tip dots, or layout changes.
+    static func vessel(_ base: GraphicsContext, _ size: CGSize, _ sim: LiquidSim, now: Double, tint: Color) {
+        let diameter = max(2, min(size.width, size.height) - 3)
+        let rect = CGRect(x: (size.width - diameter) / 2, y: (size.height - diameter) / 2,
+                          width: diameter, height: diameter)
+        let center = CGPoint(x: size.width / 2, y: size.height / 2)
+        let radius = diameter * 0.39
+        let lineWidth = max(5, diameter * 0.105)
+        let cap = StrokeStyle(lineWidth: lineWidth, lineCap: .round)
+        var ctx = base
+
+        // Restrained outer lift — light gray shadow, not deep black.
+        let shadowRect = rect.offsetBy(dx: 0, dy: max(1, diameter * 0.010))
+        ctx.fill(Path(ellipseIn: shadowRect), with: .color(Color.black.opacity(0.14)))
+
+        // One continuous centre disc — soft 3D: light top face, gentle rim shade.
+        // No separate inset circle / hard ring line.
+        ctx.fill(Path(ellipseIn: rect), with: .linearGradient(
+            Gradient(colors: [
+                NoopVisualStyle.surfaceTop,
+                NoopVisualStyle.surfaceBottom
+            ]),
+            startPoint: CGPoint(x: rect.midX, y: rect.minY),
+            endPoint: CGPoint(x: rect.midX, y: rect.maxY)
+        ))
+        // Soft radial lift — brighter near the upper face, slightly deeper at the rim.
+        ctx.fill(Path(ellipseIn: rect), with: .radialGradient(
+            Gradient(stops: [
+                .init(color: Color.white.opacity(0.07), location: 0.00),
+                .init(color: Color.white.opacity(0.02), location: 0.42),
+                .init(color: Color.clear, location: 0.72),
+                .init(color: Color.black.opacity(0.10), location: 1.00)
+            ]),
+            center: CGPoint(x: rect.midX, y: rect.minY + diameter * 0.32),
+            startRadius: 0,
+            endRadius: diameter * 0.52
+        ))
+        // Very soft lower-edge shade for a lightly recessed read.
+        ctx.fill(Path(ellipseIn: rect), with: .linearGradient(
+            Gradient(stops: [
+                .init(color: Color.clear, location: 0.00),
+                .init(color: Color.clear, location: 0.55),
+                .init(color: Color.black.opacity(0.06), location: 1.00)
+            ]),
+            startPoint: CGPoint(x: rect.midX, y: rect.minY),
+            endPoint: CGPoint(x: rect.midX, y: rect.maxY)
+        ))
+
+        let track = fullArc(center: center, radius: radius)
+
+        // Recessed track — gray channel (original border tone), not black.
+        ctx.stroke(track, with: .linearGradient(
+            Gradient(colors: [
+                Color.white.opacity(0.08),
+                NoopVisualStyle.border.opacity(0.18),
+                NoopVisualStyle.border.opacity(0.50)
+            ]),
+            startPoint: CGPoint(x: rect.midX, y: rect.minY),
+            endPoint: CGPoint(x: rect.midX, y: rect.maxY)
+        ), style: StrokeStyle(lineWidth: lineWidth + 1.6, lineCap: .round))
+
+        ctx.stroke(track, with: .color(NoopVisualStyle.border.opacity(0.72)), style: cap)
+
+        let level = max(0, min(1, sim.level))
+        if level > 0.004 {
+            let progress = partialArc(center: center, radius: radius, level: level)
+
+            // Contained under-lift — wider stroke, low opacity, no blur.
+            ctx.stroke(progress, with: .color(tint.opacity(0.18)),
+                       style: StrokeStyle(lineWidth: lineWidth + 2.0, lineCap: .round))
+
+            // Progress arc — harsh semantic gradient (visible dark ↔ light bands).
+            ctx.stroke(progress, with: .linearGradient(
+                progressGradient(tint),
+                startPoint: CGPoint(x: rect.minX, y: rect.maxY),
+                endPoint: CGPoint(x: rect.maxX, y: rect.minY)
+            ), style: cap)
+        }
+
+        // Outer instrument rim (unchanged placement).
+        ctx.stroke(Path(ellipseIn: rect.insetBy(dx: 0.5, dy: 0.5)),
+                   with: .color(NoopVisualStyle.borderHighlight.opacity(0.55)), lineWidth: 1)
+    }
+
+    /// Full-span track arc — geometry unchanged from the original vessel.
+    private static func fullArc(center: CGPoint, radius: CGFloat) -> Path {
+        var p = Path()
+        p.addArc(center: center, radius: radius, startAngle: .degrees(-90),
+                 endAngle: .degrees(270), clockwise: false)
+        return p
+    }
+
+    private static func partialArc(center: CGPoint, radius: CGFloat, level: Double) -> Path {
+        var p = Path()
+        p.addArc(center: center, radius: radius, startAngle: .degrees(-90),
+                 endAngle: .degrees(-90 + 360 * level), clockwise: false)
+        return p
+    }
+
+    /// Harsh semantic gradient — tight stops so dark/light bands read clearly on the arc.
+    private static func progressGradient(_ tint: Color) -> Gradient {
+        Gradient(stops: [
+            .init(color: tint.liquidDarker(0.48), location: 0.00),
+            .init(color: tint.liquidLighter(0.38), location: 0.34),
+            .init(color: tint.liquidDarker(0.22), location: 0.58),
+            .init(color: tint.liquidLighter(0.28), location: 0.82),
+            .init(color: tint.liquidDarker(0.35), location: 1.00)
+        ])
+    }
+
+    /// A horizontal capsule tube filled to `frac`; tilt pushes the liquid along it.
+    static func tube(_ base: GraphicsContext, _ size: CGSize, _ sim: LiquidSim, now: Double,
+                     frac: Double, tint: Color, showsHighlight: Bool = true,
+                     usesCleanFill: Bool = false) {
+        let w = size.width, h = size.height, r = h / 2
+        let outline = Path(roundedRect: CGRect(x: 0.5, y: 0.5, width: w - 1, height: h - 1), cornerRadius: r)
+        var ctx = base
+        ctx.fill(outline, with: .color(NoopVisualStyle.inset))
+        ctx.stroke(
+            outline,
+            with: .color(NoopVisualStyle.border.opacity(0.72)),
+            lineWidth: NoopMetrics.hairlineWidth
+        )
+
+        var clip = ctx
+        clip.clip(to: outline)
+        let shift = -sim.a * h * 1.3
+        let edge = max(r * 0.8, min(w - 2, frac * (w - 4) + shift))
+        let bulge = r * 0.6 + sin(sim.p1 * 2) * sim.energy * h * 0.3 - 0.01 * h * 6
+        var p = Path()
+        p.move(to: CGPoint(x: 0, y: 0))
+        p.addLine(to: CGPoint(x: edge - r * 0.3, y: 0))
+        p.addQuadCurve(to: CGPoint(x: edge - r * 0.3, y: h), control: CGPoint(x: edge + bulge, y: h / 2))
+        p.addLine(to: CGPoint(x: 0, y: h))
+        p.closeSubpath()
+        let fillGradient = usesCleanFill
+            ? progressGradient(tint)
+            : Gradient(colors: [tint.opacity(0.84), tint.liquidDarker(0.28).opacity(0.86)])
+        clip.fill(p, with: .linearGradient(
+            fillGradient,
+            startPoint: CGPoint(x: 0, y: usesCleanFill ? h / 2 : 0),
+            endPoint: CGPoint(x: usesCleanFill ? w : 0, y: usesCleanFill ? h / 2 : h)
+        ))
+        if showsHighlight {
+            clip.fill(Path(CGRect(x: 2, y: 1.2, width: max(0, edge - r * 0.6), height: 1)),
+                      with: .color(.white.opacity(0.12)))
+        }
+        if !usesCleanFill {
+            for i in 0..<min(8, sim.flecks.count) {
+                let f = sim.flecks[i]
+                let spark = pow(max(0, sin(f.ph + sim.a * 5 + now * f.sp)), 10)
+                if spark < 0.08 { continue }
+                let fx = 3 + (f.x + 1.05) / 2.1 * max(1, edge - 8)
+                clip.fill(Path(CGRect(x: fx, y: h * 0.15 + f.z * h * 0.7,
+                                      width: 1 + spark, height: 1 + spark)),
+                          with: .color(.white.opacity(spark * 0.6)))
+            }
+        }
+    }
+
+    /// The plot mapping [thread] draws with, exposed so anything pointing AT the drawn curve reads the
+    /// same geometry instead of restating it.
+    ///
+    /// The Today scrub crosshair is the caller that made this necessary. It had its own copy of the inset,
+    /// the span floor and both mappings, which agreed by inspection and nothing else: change `pad` here and
+    /// the crosshair drifts off the line it claims to mark, silently, with no test able to see it and only
+    /// an eye on a device to catch it. A crosshair whose whole job is to point at what was drawn cannot
+    /// derive where that is from a private copy.
+    struct ThreadPlot {
+        /// Inset on every side, in points.
+        static let pad: Double = 10
+        /// Floor on the value span, so a flat trace still fills the plot rather than dividing by zero.
+        static let minSpan: Double = 10
+
+        let size: CGSize
+        let count: Int
+        let minValue: Double
+        let span: Double
+
+        init(size: CGSize, values: [Double]) {
+            var mn = Double.greatestFiniteMagnitude, mx = -Double.greatestFiniteMagnitude
+            for v in values { mn = min(mn, v); mx = max(mx, v) }
+            self.size = size
+            self.count = values.count
+            self.minValue = mn
+            self.span = max(Self.minSpan, mx - mn)
+        }
+
+        /// Sample `i`'s x, equal-distance across the inset plot. Gap-aware by construction: positions come
+        /// from the index, not from time, so a broken subpath still lands its samples where they are drawn.
+        func x(_ i: Int) -> Double {
+            Self.pad + Double(i) * (size.width - 2 * Self.pad) / Double(max(1, count - 1))
+        }
+
+        /// Value `v`'s y, inverted for the view's downward axis.
+        func y(_ v: Double) -> Double {
+            size.height - Self.pad - (v - minValue) / span * (size.height - 2 * Self.pad)
+        }
+
+        /// The sample nearest a touch at `xPosition`, clamped to the series.
+        func nearestIndex(toX xPosition: Double) -> Int {
+            guard count >= 2 else { return 0 }
+            let plotWidth = max(1, size.width - 2 * Self.pad)
+            let raw = ((xPosition - Self.pad) / plotWidth * Double(count - 1)).rounded()
+            return min(count - 1, max(0, Int(raw)))
+        }
+    }
+
+    /// The live heart-rate curve as a glowing liquid thread with a travelling glint.
+    /// - Parameter segments: per-value line identity from `hrGapSegments`, or nil for a series known to be
+    ///   contiguous. Values whose ids differ are stroked as SEPARATE subpaths, so a stretch the strap never
+    ///   recorded reads as a break instead of a straight climb across it (#2082). Nil produces byte-for-byte
+    ///   the path this drew before, which is what keeps the live 1 Hz stream untouched.
+    static func thread(_ base: GraphicsContext, _ size: CGSize, values: [Double], now: Double, tint: Color,
+                       segments: [String]? = nil) {
+        guard values.count >= 2 else { return }
+        let plot = ThreadPlot(size: size, values: values)
+        let n = values.count
+        func px(_ i: Int) -> Double { plot.x(i) }
+        func py(_ v: Double) -> Double { plot.y(v) }
+        func appendRun(_ p: inout Path, _ lo: Int, _ hi: Int) {
+            // A lone bucket between two gaps is real data, and it has to draw as something. A bare `move`
+            // strokes nothing at all, and a ZERO-length line is at the mercy of whether the renderer keeps
+            // a degenerate subpath alive for its round cap. Give it a hair of width instead, so the cap has
+            // something to round and the reading is a dot rather than a coin flip. Losing it would be the
+            // same class of lie as the joined line this change removes: data on screen that is not there.
+            guard hi > lo else {
+                let x = px(lo), y = py(values[lo])
+                p.move(to: CGPoint(x: x - 0.6, y: y))
+                p.addLine(to: CGPoint(x: x + 0.6, y: y))
+                return
+            }
+            p.move(to: CGPoint(x: px(lo), y: py(values[lo])))
+            for i in (lo + 1)..<hi {
+                let xc = (px(i) + px(i + 1)) / 2, yc = (py(values[i]) + py(values[i + 1])) / 2
+                p.addQuadCurve(to: CGPoint(x: xc, y: yc), control: CGPoint(x: px(i), y: py(values[i])))
+            }
+            p.addLine(to: CGPoint(x: px(hi), y: py(values[hi])))
+        }
+        // Resolved ONCE, outside `curve()`. That closure is called twice per frame and this runs inside a
+        // 60fps TimelineView, so leaving the walk in there re-split the whole series 120 times a second for
+        // an answer that cannot change between strokes.
+        // One run when nothing says otherwise, and that run is the exact path this drew before.
+        var runs: [ClosedRange<Int>] = [0...(n - 1)]
+        if let segs = segments, segs.count == n { runs = hrGapRuns(segments: segs) }
+        func curve() -> Path {
+            var p = Path()
+            for r in runs { appendRun(&p, r.lowerBound, r.upperBound) }
+            return p
+        }
+        var ctx = base
+        // Built ONCE. The glint strokes the same geometry as the line under it, and this runs inside a
+        // 60fps TimelineView, so building it per stroke walked the whole series twice a frame for two
+        // identical paths.
+        let line = curve()
+        ctx.stroke(line, with: .color(tint.opacity(0.9)), style: StrokeStyle(lineWidth: 2.4, lineCap: .round, lineJoin: .round))
+        // Travelling glint. The dash pattern restarts at each subpath, so a day broken into several runs
+        // shows a tick per run rather than one glint travelling the whole line. Cosmetic, and the honest
+        // alternative (one glint walking across gaps) would re-assert the continuity this change removes.
+        let phase = -(now * 55).truncatingRemainder(dividingBy: 414)
+        ctx.stroke(line, with: .color(.white.opacity(0.55)),
+                   style: StrokeStyle(lineWidth: 1.1, lineCap: .round, dash: [14, 400], dashPhase: phase))
+        // endpoint pulse
+        let ex = px(n - 1), ey = py(values[n - 1])
+        let pr = 3 + sin(now * 6) * 1.1
+        ctx.fill(Path(ellipseIn: CGRect(x: ex - pr - 4, y: ey - pr - 4, width: (pr + 4) * 2, height: (pr + 4) * 2)), with: .color(tint.opacity(0.15)))
+        ctx.fill(Path(ellipseIn: CGRect(x: ex - pr, y: ey - pr, width: pr * 2, height: pr * 2)), with: .color(tint))
+    }
+}
+
+// MARK: - Views
+
+/// Applies the splash tap either as a normal tap (consuming it) or as a simultaneous gesture (sharing
+/// it with whatever wraps the view).
+///
+/// A plain `onTapGesture` inside a `NavigationLink` swallows the tap, so the link never pushes. That is
+/// why the hero rings could splash but not navigate. `simultaneousGesture` lets both run, which is the
+/// behaviour a tappable gauge wants; standalone vessels keep the consuming tap so nothing else changes.
+private struct LiquidSplashTap: ViewModifier {
+    let passesThrough: Bool
+    let action: () -> Void
+
+    func body(content: Content) -> some View {
+        if passesThrough {
+            content.simultaneousGesture(TapGesture().onEnded { action() })
+        } else {
+            content.onTapGesture { action() }
+        }
+    }
+}
+
+/// A circular liquid gauge. `value` is 0...1 (nil = empty/no-data). Tap → splash.
+///
+/// `animated: false` renders a single static frame (no TimelineView, no CoreMotion) — the small
+/// gauges in card rows / vitals slosh imperceptibly at 26–30pt but each cost a live 30fps Canvas,
+/// so they pose still and CoreAnimation caches them. The big hero gauges stay animated.
+struct LiquidVessel: View {
+    let value: Double?
+    let tint: Color
+    var animated: Bool = true
+    /// When the vessel sits inside a NavigationLink or Button, the splash tap must not CONSUME the
+    /// tap or the wrapping control never fires. Opt in and the splash runs as a simultaneous gesture
+    /// instead, so both happen: the liquid still splashes and the link still pushes. Default false
+    /// keeps every standalone vessel byte-identical (#1995).
+    var tapPassesThrough: Bool = false
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ObservedObject private var motion = NoopMotionState.shared
+    @State private var sim: LiquidSim
+    @State private var splashes = 0
+    /// Whether the fill is still easing toward `value`: the only time the ring changes (see `gauge`).
+    @State private var filling = true
+
+    // The custom init exists to seed `_sim` from `value`, which also means the memberwise init is NOT
+    // synthesised: any new stored property has to be threaded through here or callers cannot pass it.
+    init(value: Double?, tint: Color, animated: Bool = true, tapPassesThrough: Bool = false) {
+        self.value = value
+        self.tint = tint
+        self.animated = animated
+        self.tapPassesThrough = tapPassesThrough
+        _sim = State(initialValue: LiquidSim(target: value ?? 0))
+    }
+
+    var body: some View {
+        if animated && !motion.poseStill(reduceMotion) { gauge } else { staticGauge }
+    }
+
+    /// The live gauge: the fill eases in from empty and to each new value, then the ring holds still.
+    ///
+    /// Since #1068 `LiquidRender.vessel` draws a ring from `sim.level` alone. The waves, tilt, flecks and
+    /// drops the sim still computes are no longer drawn, so once the level has arrived every frame is the
+    /// same picture. The frame loop now runs only while the fill moves; before, the three Today heroes and
+    /// Sleep's hero redrew an unchanged ring 60 times a second for as long as they were on screen. For the
+    /// same reason the vessel no longer holds the tilt sensor: tilt moved only what is not drawn.
+    private var gauge: some View {
+        Group {
+            if filling {
+                // 60fps: on the 120Hz ProMotion panel a 30fps cap updated the fluid only every 4th refresh,
+                // which read as juddery slosh. Only the 3 hero gauges + HR thread run live now (the small ones
+                // are static), so the higher rate is affordable and the liquid actually flows.
+                TimelineView(.animation(minimumInterval: 1.0 / 60.0)) { tl in
+                    let now = liquidSeconds(tl.date)
+                    Canvas { context, size in
+                        sim.step(now: now, tilt: 0, target: value ?? 0)
+                        LiquidRender.vessel(context, size, sim, now: now, tint: tint)
+                    }
+                }
+            } else {
+                // No timeline behind it: a paused one made the render server busier, not quieter (measured
+                // on the sky, `LiquidSky`).
+                Canvas { context, size in
+                    LiquidRender.vessel(context, size, sim, now: 0, tint: tint)
+                }
+            }
+        }
+        .aspectRatio(1, contentMode: .fit)
+        .contentShape(Circle())
+        .modifier(LiquidSplashTap(passesThrough: tapPassesThrough) { sim.splash(12); splashes &+= 1 })
+        .liquidTapHaptic(trigger: splashes)   // light tap feedback (guarded so the primitives compile on macOS 13)
+        .task(id: value) { await followFill() }
+    }
+
+    /// Keeps the frame loop running until the fill has arrived at `value`, checking four times a second.
+    ///
+    /// A vessel that draws no frames meanwhile (off screen) would never arrive; after `fillChecks` the ring is
+    /// set to its value and drawn still, so it can never be left showing a fill it was on the way from.
+    private func followFill() async {
+        sim.target = max(0, min(1, value ?? 0))
+        if !filling { sim.restartClock() }
+        filling = true
+        var checks = 0
+        while !sim.fillArrived && checks < Self.fillChecks {
+            do { try await Task.sleep(nanoseconds: 250_000_000) } catch { return }
+            checks += 1
+        }
+        if !sim.fillArrived { sim.level = sim.target }
+        filling = false
+    }
+
+    /// Ten seconds of checks. The fill arrives in about three at 60 fps (`LiquidSim.step`).
+    static let fillChecks = 40
+
+    /// One-shot, cached render — posed at the fill line, no clock, no motion acquire.
+    private var staticGauge: some View {
+        Canvas { context, size in
+            LiquidRender.vessel(context, size, LiquidSim.posed(value ?? 0), now: 0, tint: tint)
+        }
+        .aspectRatio(1, contentMode: .fit)
+        .contentShape(Circle())
+    }
+}
+
+/// A horizontal liquid tube filled to `frac` (0...1).
+///
+/// `animated: false` poses it still and lets CoreAnimation cache the layer — the 8pt grid tubes
+/// and 12pt workout bar don't need a live 30fps Canvas each. Hero-adjacent tubes can stay live.
+struct LiquidTube: View {
+    let frac: Double
+    let tint: Color
+    var height: CGFloat = 14
+    var animated: Bool = true
+    var showsHighlight: Bool = true
+    var usesCleanFill: Bool = false
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ObservedObject private var motion = NoopMotionState.shared
+    @State private var sim = LiquidSim(target: 0)
+
+    var body: some View {
+        if animated && !motion.poseStill(reduceMotion) { liveTube } else { staticTube }
+    }
+
+    private var liveTube: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { tl in
+            let now = liquidSeconds(tl.date)
+            Canvas { context, size in
+                sim.step(now: now, tilt: LiquidMotion.shared.tilt, target: frac)
+                LiquidRender.tube(context, size, sim, now: now, frac: max(0, min(1, frac)),
+                                  tint: tint, showsHighlight: showsHighlight,
+                                  usesCleanFill: usesCleanFill)
+            }
+        }
+        .frame(height: height)
+        .onAppear { LiquidMotion.shared.acquire() }
+        .onDisappear { LiquidMotion.shared.release() }
+    }
+
+    private var staticTube: some View {
+        Canvas { context, size in
+            LiquidRender.tube(context, size, LiquidSim.posed(frac), now: 0,
+                              frac: max(0, min(1, frac)), tint: tint,
+                              showsHighlight: showsHighlight, usesCleanFill: usesCleanFill)
+        }
+        .frame(height: height)
+    }
+}
+
+/// The live heart-rate thread. `bpm` is the recent series (any length ≥ 2).
+struct LiquidThread: View {
+    let bpm: [Double]
+    /// Per-value line identity from `hrGapSegments`, or nil for a series known to be contiguous (#2082).
+    /// The live 1 Hz stream passes nil and is drawn exactly as before; the banked 5-minute fallback passes
+    /// ids so the hours a strap recorded nothing read as breaks rather than a climb across them.
+    var segments: [String]? = nil
+    var tint: Color = Color(.sRGB, red: 1, green: 107/255, blue: 129/255, opacity: 1)
+    var height: CGFloat = 96
+    var animated: Bool = true
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ObservedObject private var motion = NoopMotionState.shared
+
+    var body: some View {
+        if animated && !motion.poseStill(reduceMotion) { liveThread } else { staticThread }
+    }
+
+    private var liveThread: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 60.0)) { tl in   // 60fps to flow smoothly on ProMotion
+            let now = liquidSeconds(tl.date)
+            Canvas { context, size in
+                LiquidRender.thread(context, size, values: bpm, now: now, tint: tint, segments: segments)
+            }
+        }
+        .frame(height: height)
+    }
+
+    /// One-shot render (no travelling glint / pulse) — used until first data load settles.
+    private var staticThread: some View {
+        Canvas { context, size in
+            LiquidRender.thread(context, size, values: bpm, now: 0, tint: tint, segments: segments)
+        }
+        .frame(height: height)
+    }
+}
+
+// MARK: - Shared liquid components (cross-platform: used by Today AND the other liquid screens on iOS + mac)
+
+extension View {
+    /// A light selection/impact haptic, available only where `sensoryFeedback` is (iOS 17 / macOS 14);
+    /// a no-op below that so the liquid primitives still compile on the macOS 13 deployment target.
+    @ViewBuilder func liquidTapHaptic(trigger: some Equatable) -> some View {
+        if #available(iOS 17.0, macOS 14.0, *) {
+            self.sensoryFeedback(.impact(weight: .light), trigger: trigger)
+        } else {
+            self
+        }
+    }
+
+    /// A selection tick (e.g. the WHOOP-style day change), guarded so it compiles on macOS 13.
+    @ViewBuilder func liquidSelectionHaptic(trigger: some Equatable) -> some View {
+        if #available(iOS 17.0, macOS 14.0, *) {
+            self.sensoryFeedback(.selection, trigger: trigger)
+        } else {
+            self
+        }
+    }
+
+    /// A firmer medium impact (e.g. the pull-to-refresh release), guarded for the macOS 13 target.
+    @ViewBuilder func liquidMediumHaptic(trigger: some Equatable) -> some View {
+        if #available(iOS 17.0, macOS 14.0, *) {
+            self.sensoryFeedback(.impact(weight: .medium), trigger: trigger)
+        } else {
+            self
+        }
+    }
+}
+
+/// The "this card was pressed" response for any tappable liquid card — a small settle inward plus a
+/// touch of dimming. Cheap (a transform), so it's free on static cards and makes every tap feel physical.
+struct LiquidPressStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.975 : 1)
+            .opacity(configuration.isPressed ? 0.86 : 1)
+            .animation(.easeOut(duration: 0.16), value: configuration.isPressed)
+    }
+}
+
+/// A number that animates to its value: SwiftUI interpolates `animatableData`, so the shown integer rolls
+/// smoothly frame-by-frame whenever `value` changes inside a `withAnimation` block.
+struct CountUpNumber: View, Animatable {
+    var value: Double
+    var font: Font
+    /// Decimal places to render. 0 (default) keeps the whole-number scores (Charge/Rest/100-scale Effort)
+    /// byte-identical; the WHOOP 0–21 Effort scale passes 1 so the hero matches the app-wide one-decimal
+    /// `effortDisplay` convention instead of rounding 12.6 → "13" (#45).
+    var decimals: Int = 0
+    /// Rendered ahead of the number and never animated, for a value that is bounded rather than
+    /// measured: Fitness Age arrives clamped, so a reading at the edge of the scale shows "≤20" while
+    /// the count-up still runs (#2173). Empty by default, which leaves every existing caller identical.
+    var prefix: String = ""
+    var animatableData: Double {
+        get { value }
+        set { value = newValue }
+    }
+    var body: some View {
+        Text(prefix + (decimals > 0 ? String(format: "%.\(decimals)f", value) : "\(Int(value.rounded()))"))
+            .font(font).monospacedDigit()
+    }
+}
+
+// MARK: - LiquidScoreGauge — Home hero score instrument (shared)
+
+/// The liquid score gauge used on Today (`HeroScoreCell`): a `LiquidVessel` fill with a count-up centre
+/// read-out. Callers supply diameter/tint/scale; optional caption sits under the number (Sleep: "of 100").
+struct LiquidScoreGauge: View {
+    /// Matches `HeroScoreCell.vesselDiameter` — the Home hero trio size.
+    private static let homeHeroDiameter: CGFloat = 96
+
+    let score: Double?
+    let tint: Color
+    let diameter: CGFloat
+    let animated: Bool
+    /// The scale `score` is expressed on (100 for Charge/Rest, 21 for WHOOP Effort, etc.).
+    var maxValue: Double = 100
+    var decimals: Int = 0
+    /// Optional caption under the number (nil = Home hero: number only).
+    var captionText: String? = nil
+    var numberColor: Color = StrandPalette.textPrimary
+    var captionColor: Color = StrandPalette.textTertiary
+    /// Forwarded to `LiquidVessel` so a gauge inside a link still splashes AND still navigates (#1995).
+    var tapPassesThrough: Bool = false
+
+    @State private var shown: Double = 0
+
+    private var frac: Double? { score.map { max(0, min(1, $0 / maxValue)) } }
+    private var centerFont: Font { StrandFont.rounded(diameter * 26 / Self.homeHeroDiameter) }
+    private var captionFont: Font { StrandFont.rounded(diameter * 0.085, weight: .medium) }
+
+    var body: some View {
+        ZStack {
+            LiquidVessel(value: frac, tint: tint, animated: animated,
+                         tapPassesThrough: tapPassesThrough)
+                .frame(width: diameter, height: diameter)
+            VStack(spacing: captionText == nil ? 0 : 1) {
+                Group {
+                    if score != nil {
+                        CountUpNumber(value: shown, font: centerFont, decimals: decimals)
+                    } else {
+                        Text("–").font(centerFont)
+                    }
+                }
+                if let captionText {
+                    Text(captionText)
+                        .font(captionFont)
+                        .foregroundStyle(captionColor)
+                }
+            }
+            .foregroundStyle(numberColor)
+            .shadow(color: .black.opacity(0.5), radius: 6, y: 1)
+            .lineLimit(1)
+            .minimumScaleFactor(0.6)
+            .allowsHitTesting(false)
+        }
+        .frame(width: diameter, height: diameter)
+        .onAppear { rollTo(score) }
+        .onChangeCompat(of: score) { rollTo($0) }
+    }
+
+    private func rollTo(_ v: Double?) {
+        guard let v else { shown = 0; return }
+        withAnimation(.easeOut(duration: 0.9)) { shown = v }
+    }
+}

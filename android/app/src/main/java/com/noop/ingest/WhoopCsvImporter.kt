@@ -5,6 +5,7 @@ import android.net.Uri
 import com.noop.data.DailyMetric
 import com.noop.data.ImportSummary
 import com.noop.data.JournalEntry
+import com.noop.data.MetricSeriesRow
 import com.noop.data.SleepSession
 import com.noop.data.WhoopRepository
 import com.noop.data.WorkoutRow
@@ -52,6 +53,29 @@ object WhoopCsvImporter {
     /** Per-CSV uncompressed ceiling (zip-bomb guard). Mirrors Swift maxEntryBytes = 256 MB. */
     private const val MAX_ENTRY_BYTES = 256L shl 20
 
+    /** Aggregate RAM ceiling across ALL retained CSVs from one import. The per-entry cap bounds a single
+     *  file but NOT the sum of the retained set — this backstops a crafted export from accumulating
+     *  unbounded ByteArray in the map before parsing. A real WHOOP bundle is a few MB, so 1 GB never trips
+     *  in practice. Mirrors the Swift WhoopExportImporter.maxTotalBytes (#70). */
+    internal const val MAX_TOTAL_BYTES = 1L shl 30
+
+    /**
+     * Charge/Effort/Rest redesign (2026-06-12): WHOOP "Day Strain" is on WHOOP's 0–21 scale, but
+     * NOOP's "Effort" score lives on 0–100 (StrainScorer.maxStrain = 100). Rescale an imported Day
+     * Strain by 100/21 when writing the `strain` metric so imported history sits on the same axis as
+     * live-computed Effort. Keep byte-identical to Swift
+     * (WhoopExportImporter.dayStrainToEffortScale).
+     */
+    private const val DAY_STRAIN_TO_EFFORT_SCALE = 100.0 / 21.0
+
+    /**
+     * WHOOP CSVs carry "Sleep efficiency %" on a 0–100 scale, but NOOP's `efficiency` columns store
+     * the 0–1 fraction the native pipeline writes (AnalyticsEngine: actual-sleep ÷ in-bed). Divide at
+     * the WRITE boundary — the verbatim parsed value stays untouched, same shape as the Day Strain
+     * rescale above. Keep byte-identical to Swift (WhoopExportImporter.fractionFromImportedEfficiencyPct).
+     */
+    private fun efficiencyFractionFromPct(pct: Double?): Double? = pct?.let { it / 100.0 }
+
     private val DAY_FMT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd")
 
     /**
@@ -68,7 +92,7 @@ object WhoopCsvImporter {
         repo: WhoopRepository,
         deviceId: String = WHOOP_DEVICE,
     ): ImportSummary {
-        val csvData: Map<String, ByteArray> = try {
+        val (csvData, truncated) = try {
             loadCsvData(context, uri)
         } catch (e: Exception) {
             return ImportSummary.failure(SOURCE_LABEL, "Could not read export: ${e.message ?: "unknown error"}")
@@ -82,11 +106,15 @@ object WhoopCsvImporter {
         }
 
         val cycles = csvData[CYCLES_NAME]?.let { parseCycles(CsvTable.fromData(it), deviceId) } ?: emptyList()
+        val cycleSeries = csvData[CYCLES_NAME]?.let { parseCycleSeries(CsvTable.fromData(it), deviceId) } ?: emptyList()
         val sleepParse = csvData[SLEEPS_NAME]?.let { parseSleeps(CsvTable.fromData(it), deviceId) }
         val sleepSessions = sleepParse?.sessions ?: emptyList()
         val sleepDaily = sleepParse?.daily ?: emptyList()
         val workouts = csvData[WORKOUTS_NAME]?.let { parseWorkouts(CsvTable.fromData(it), deviceId) } ?: emptyList()
-        val journal = csvData[JOURNAL_NAME]?.let { parseJournal(CsvTable.fromData(it), deviceId) } ?: emptyList()
+        // #136: journal rows key only by cycle_start; map that to the cycle's wake day so entries land on
+        // the same day as their recovery/sleep outcome (else they read one day early and never correlate).
+        val journalWake = csvData[CYCLES_NAME]?.let { journalWakeDayMap(CsvTable.fromData(it)) } ?: emptyMap()
+        val journal = csvData[JOURNAL_NAME]?.let { parseJournal(CsvTable.fromData(it), deviceId, journalWake) } ?: emptyList()
 
         // Merge cycle-derived and sleep-derived daily rows on (deviceId, day): cycle fields
         // (recovery / strain / RHR / HRV / SpO2 / skin-temp / resp) win where present, sleep
@@ -101,13 +129,23 @@ object WhoopCsvImporter {
         if (daily.isNotEmpty()) repo.upsertDailyMetrics(daily)
         if (sleepSessions.isNotEmpty()) repo.upsertSleepSessions(sleepSessions)
         if (workouts.isNotEmpty()) repo.upsertWorkouts(workouts)
-        if (journal.isNotEmpty()) repo.upsertJournal(journal)
+        if (journal.isNotEmpty()) {
+            // #136: the wake-day fix moves an entry's day, so a naive re-import would leave the pre-fix
+            // onset-keyed rows behind as duplicates. Atomically clear + re-write EXACTLY the day span we
+            // import ([min, max] of its days), so journal outside the imported range (e.g. from an earlier,
+            // wider export) is never touched, and a crash mid-import can't drop the range. Same
+            // "re-import replaces this period" semantics daily/sleep already have.
+            val jDays = journal.map { it.day }
+            repo.replaceJournalRange(deviceId, jDays.min(), jDays.max(), journal)
+        }
+        if (cycleSeries.isNotEmpty()) repo.upsertMetricSeries(cycleSeries)
 
         val counts = LinkedHashMap<String, Int>()
         if (daily.isNotEmpty()) counts["dailyMetric"] = daily.size
         if (sleepSessions.isNotEmpty()) counts["sleepSession"] = sleepSessions.size
         if (workouts.isNotEmpty()) counts["workout"] = workouts.size
         if (journal.isNotEmpty()) counts["journal"] = journal.size
+        if (cycleSeries.isNotEmpty()) counts["metricSeries"] = cycleSeries.size
 
         // Date span across everything we wrote.
         val days = ArrayList<String>()
@@ -125,6 +163,9 @@ object WhoopCsvImporter {
             append(" WHOOP rows")
             if (firstDay != null && lastDay != null) append(" ($firstDay → $lastDay)")
             append(".")
+            // #70: never silently truncate. If the aggregate RAM budget tripped, the retained CSV set was
+            // partial — say so plainly instead of reporting a clean import over incomplete data.
+            if (truncated) append(" (partial — export exceeded the ${MAX_TOTAL_BYTES shr 30} GB import memory budget)")
         }
 
         return ImportSummary(
@@ -133,6 +174,8 @@ object WhoopCsvImporter {
             firstDay = firstDay,
             lastDay = lastDay,
             message = message,
+            columnCoverage = importColumnCoverage(cycles),
+            columnCoverageRows = cycles.size,
         )
     }
 
@@ -143,9 +186,15 @@ object WhoopCsvImporter {
      * Accepts a `.zip` (iterated with [ZipInputStream], routed by base filename) or a single
      * `.csv`. Mirrors Swift `loadCSVData` filename routing.
      */
-    private fun loadCsvData(context: Context, uri: Uri): Map<String, ByteArray> {
+    private fun loadCsvData(
+        context: Context,
+        uri: Uri,
+        maxTotalBytes: Long = MAX_TOTAL_BYTES,
+    ): Pair<Map<String, ByteArray>, Boolean> {
         val wanted = setOf(CYCLES_NAME, SLEEPS_NAME, WORKOUTS_NAME, JOURNAL_NAME)
         val result = LinkedHashMap<String, ByteArray>()
+        var total = 0L
+        var truncated = false
 
         // First attempt: treat as a zip. WHOOP exports are zips; this also covers a .zip Uri
         // whose displayName we cannot read. If the stream is not a valid zip, ZipInputStream
@@ -174,7 +223,9 @@ object WhoopCsvImporter {
                                             else -> localizedAlias(base) ?: sniffCsvKind(bytes)
                                         }
                                         if (canonical != null && !result.containsKey(canonical)) {
+                                            if (total + bytes.size > maxTotalBytes) { truncated = true; break }
                                             result[canonical] = bytes
+                                            total += bytes.size
                                         }
                                     }
                                 }
@@ -185,7 +236,7 @@ object WhoopCsvImporter {
                     }
                 }
             }
-            if (result.isNotEmpty()) return result
+            if (result.isNotEmpty()) return result to truncated
         }
 
         // Not a (useful) zip — treat the input as a single CSV. Route by display name; if the
@@ -199,7 +250,7 @@ object WhoopCsvImporter {
         if (routed != null) {
             result[routed] = firstBytes
         }
-        return result
+        return result to false   // single-CSV path holds one file — the budget can't trip here
     }
 
     /** Whether the leading bytes are a local-file-header zip signature ("PK"). */
@@ -234,6 +285,20 @@ object WhoopCsvImporter {
         "schlaf.csv" -> SLEEPS_NAME
         "trainings.csv" -> WORKOUTS_NAME
         "logbuch_eintraege.csv" -> JOURNAL_NAME
+        // Spanish (issue #76): physiological_cycles.csv keeps its English name; sleep/workouts renamed.
+        // Folded + unfolded variants — the filename is lowercased but not diacritic-folded.
+        "sueño.csv", "sueno.csv" -> SLEEPS_NAME
+        "entrenamientos.csv" -> WORKOUTS_NAME
+        // French (issue #79): physiological_cycles.csv keeps its English name; sleep/workouts renamed.
+        "sommeil.csv" -> SLEEPS_NAME
+        "entrainements.csv", "entraînements.csv" -> WORKOUTS_NAME
+        // Brazilian Portuguese (issue #692): unlike es/fr, WHOOP localizes ALL FOUR filenames here,
+        // cycles included. Names from a real pt-BR export. Folded + unfolded variants because the
+        // filename is lowercased but not diacritic-folded; header sniffing is the backstop if it mojibakes.
+        "ciclos_fisiológicos.csv", "ciclos_fisiologicos.csv" -> CYCLES_NAME
+        "sonos.csv" -> SLEEPS_NAME
+        "treinos.csv" -> WORKOUTS_NAME
+        "entradas_diário.csv", "entradas_diario.csv" -> JOURNAL_NAME
         else -> null
     }
 
@@ -261,22 +326,33 @@ object WhoopCsvImporter {
 
     // MARK: - physiological_cycles.csv -> DailyMetric
 
-    private fun parseCycles(table: CsvTable, deviceId: String): List<DailyMetric> {
+    internal fun parseCycles(table: CsvTable, deviceId: String): List<DailyMetric> {
         val out = ArrayList<DailyMetric>(table.rows.size)
         for (row in table.rows) {
             val tz = WhoopTime.tzOffsetMinutes(row["cycle_timezone"])
             val cycleStart = WhoopTime.parseEpochSeconds(row.cell("cycle_start_time"), tz)
             val cycleEnd = WhoopTime.parseEpochSeconds(row.cell("cycle_end_time"), tz)
+            val wakeOnset = WhoopTime.parseEpochSeconds(row.cell("wake_onset"), tz)
 
-            // Skip rows with no usable timestamp at all (Swift: cycleStart == nil && cycleEnd == nil).
-            if (cycleStart == null && cycleEnd == null) continue
-            val day = epochSecondsToDay(cycleStart ?: cycleEnd!!, tz)
+            // Skip rows with no usable timestamp at all.
+            if (cycleStart == null && cycleEnd == null && wakeOnset == null) continue
+            // WHOOP cycles are onset-to-onset: cycle_start_time == the sleep onset (the EVENING). Key
+            // the day off the WAKE (wake_onset), then cycle_end (the next onset, same wake-day), then
+            // the start. Matches parseSleeps + mergeSleep + macOS; keying off the start put scores a day
+            // early and blanked Today for import-only users (import day-shift, v8.2.1).
+            val day = epochSecondsToDay(wakeOnset ?: cycleEnd ?: cycleStart!!, tz)
 
             // Same aliases / unit handling as Swift parseCycles.
             val recovery = row.double("recovery_score_pct")
             val restingHr = row.double("resting_heart_rate_bpm", "resting_heart_rate")
             val avgHrv = row.double("heart_rate_variability_ms", "heart_rate_variability_rmssd_ms")
-            val skinTemp = row.double("skin_temp_celsius", "skin_temp_f")
+            // #1849: a Fahrenheit WHOOP export ships `skin_temp_f`, NOT `skin_temp_celsius`. Treating
+            // the two as aliases stored the °F value unconverted (92.3 °F → 92.3 in a °C column),
+            // which read as a lethal fever and poisoned the baseline. Read each as its OWN key and
+            // convert the Fahrenheit value on the way in. `skin_temp_celsius` wins when both are
+            // present (a Celsius export is the canonical form). Byte-identical with the Swift twin.
+            val skinTemp = row.double("skin_temp_celsius")
+                ?: row.double("skin_temp_f")?.let { (it - 32.0) * 5.0 / 9.0 }
             val spo2 = row.double("blood_oxygen_pct", "blood_oxygen_pct_pct")
             val strain = row.double("day_strain")
             val resp = row.double("respiratory_rate_rpm", "respiratory_rate")
@@ -293,7 +369,7 @@ object WhoopCsvImporter {
                     deviceId = deviceId,
                     day = day,
                     totalSleepMin = asleepMin,
-                    efficiency = efficiency,
+                    efficiency = efficiencyFractionFromPct(efficiency),
                     deepMin = deepMin,
                     remMin = remMin,
                     lightMin = lightMin,
@@ -303,7 +379,9 @@ object WhoopCsvImporter {
                     restingHr = restingHr?.roundToInt(),
                     avgHrv = avgHrv,
                     recovery = recovery,
-                    strain = strain,
+                    // Rescale WHOOP's 0–21 Day Strain onto NOOP's 0–100 Effort axis (see
+                    // DAY_STRAIN_TO_EFFORT_SCALE). nil passes through.
+                    strain = strain?.let { it * DAY_STRAIN_TO_EFFORT_SCALE },
                     exerciseCount = null, // not present in physiological_cycles.csv
                     spo2Pct = spo2,
                     skinTempDevC = skinTemp,
@@ -314,14 +392,40 @@ object WhoopCsvImporter {
         return out
     }
 
+    /**
+     * physiological_cycles.csv -> long-format metricSeries rows for the export-verbatim sleep
+     * figures the wide DailyMetric has no columns for. Keys mirror the macOS WhoopImporter
+     * (Strand/Data/WhoopImporter.swift): sleep_performance / sleep_consistency are 0–100 %,
+     * sleep_need_min / sleep_debt_min are minutes. Internal + pure so it is JVM unit-testable
+     * (WhoopCycleSeriesTest).
+     */
+    internal fun parseCycleSeries(table: CsvTable, deviceId: String): List<MetricSeriesRow> {
+        val out = ArrayList<MetricSeriesRow>()
+        for (row in table.rows) {
+            val tz = WhoopTime.tzOffsetMinutes(row["cycle_timezone"])
+            val cycleStart = WhoopTime.parseEpochSeconds(row.cell("cycle_start_time"), tz)
+            val cycleEnd = WhoopTime.parseEpochSeconds(row.cell("cycle_end_time"), tz)
+            val wakeOnset = WhoopTime.parseEpochSeconds(row.cell("wake_onset"), tz)
+            if (cycleStart == null && cycleEnd == null && wakeOnset == null) continue   // same skip rule as parseCycles
+            // Wake-day keying — see parseCycles (WHOOP cycle_start is the evening onset, v8.2.1).
+            val day = epochSecondsToDay(wakeOnset ?: cycleEnd ?: cycleStart!!, tz)
+            fun add(key: String, v: Double?) { if (v != null) out.add(MetricSeriesRow(deviceId, day, key, v)) }
+            add("sleep_performance", row.double("sleep_performance_pct"))
+            add("sleep_consistency", row.double("sleep_consistency_pct"))
+            add("sleep_need_min", row.double("sleep_need_min"))
+            add("sleep_debt_min", row.double("sleep_debt_min"))
+        }
+        return out
+    }
+
     // MARK: - sleeps.csv -> SleepSession (+ DailyMetric sleep fields)
 
-    private class SleepParse(
+    internal class SleepParse(
         val sessions: List<SleepSession>,
         val daily: List<DailyMetric>,
     )
 
-    private fun parseSleeps(table: CsvTable, deviceId: String): SleepParse {
+    internal fun parseSleeps(table: CsvTable, deviceId: String): SleepParse {
         val sessions = ArrayList<SleepSession>(table.rows.size)
         val daily = ArrayList<DailyMetric>()
         for (row in table.rows) {
@@ -355,7 +459,7 @@ object WhoopCsvImporter {
                         deviceId = deviceId,
                         startTs = startTs,
                         endTs = if (endTs >= startTs) endTs else startTs,
-                        efficiency = efficiency,
+                        efficiency = efficiencyFractionFromPct(efficiency),
                         restingHr = null, // resting HR is a cycles/recovery field, not in sleeps.csv
                         avgHrv = null,    // HRV likewise is a recovery field, not in sleeps.csv
                         stagesJSON = stagesJson(lightMin, deepMin, remMin, awakeMin),
@@ -363,17 +467,23 @@ object WhoopCsvImporter {
                 )
             }
 
-            // Fold the MAIN sleep (not naps) into a DailyMetric keyed on the sleep's day, so the
+            // Fold the MAIN sleep (not naps) into a DailyMetric keyed on the sleep's WAKE day, so the
             // sleep-architecture columns are populated even when physiological_cycles.csv is absent.
+            // Key off wake_onset: sleep_onset (== cycle_start_time in a WHOOP export) is the PREVIOUS
+            // evening, and mergeDaily groups by day-string. parseCycles now keys its cycle rows off the
+            // wake too (v8.2.1), so the two align on the same wake-day and merge into one row; keying
+            // either off the onset landed the night a day early and split it across two rows. Every
+            // convention (sleep-session mergeSleep, the AppleHealth importer, macOS) uses the local
+            // wake-day; align with it. Naps stay excluded above.
             if (!isNap) {
-                val dayTs = sleepOnset ?: cycleStart ?: wakeOnset
+                val dayTs = wakeOnset ?: cycleStart ?: sleepOnset
                 if (dayTs != null) {
                     daily.add(
                         DailyMetric(
                             deviceId = deviceId,
                             day = epochSecondsToDay(dayTs, tz),
                             totalSleepMin = asleepMin,
-                            efficiency = efficiency,
+                            efficiency = efficiencyFractionFromPct(efficiency),
                             deepMin = deepMin,
                             remMin = remMin,
                             lightMin = lightMin,
@@ -410,7 +520,9 @@ object WhoopCsvImporter {
             val startTs = workoutStart ?: cycleStart ?: workoutEnd!!
             val sport = row.cell("activity_name") ?: "Workout" // PK component; never blank.
 
-            val strain = row.double("activity_strain")
+            // Workout strain is also WHOOP's 0–21 scale → rescale onto NOOP's 0–100 Effort axis so
+            // imported workouts match detected/manual ones (StrainScorer now scores 0–100).
+            val strain = row.double("activity_strain")?.let { it * DAY_STRAIN_TO_EFFORT_SCALE }
             val energyKcal = row.double("energy_burned_cal") // CSV "(cal)" == kcal
             val avgHr = row.double("average_hr_bpm", "average_heart_rate_bpm")
             val maxHr = row.double("max_hr_bpm", "max_heart_rate_bpm")
@@ -454,13 +566,37 @@ object WhoopCsvImporter {
 
     // MARK: - journal_entries.csv -> JournalEntry
 
-    private fun parseJournal(table: CsvTable, deviceId: String): List<JournalEntry> {
+    /** #136: map each cycle's onset (cycle_start_time epoch) to its WAKE day, so journal entries — which
+     *  the export keys only by cycle_start — store on the same wake day as the cycle's recovery/sleep
+     *  outcome (and the native journal), not the onset evening. Same day rule as parseCycles. */
+    internal fun journalWakeDayMap(cycles: CsvTable): Map<Long, String> {
+        val out = HashMap<Long, String>()
+        for (row in cycles.rows) {
+            val tz = WhoopTime.tzOffsetMinutes(row["cycle_timezone"])
+            val start = WhoopTime.parseEpochSeconds(row.cell("cycle_start_time"), tz) ?: continue
+            val wake = WhoopTime.parseEpochSeconds(row.cell("wake_onset"), tz)
+                ?: WhoopTime.parseEpochSeconds(row.cell("cycle_end_time"), tz)
+                ?: continue
+            out[start] = epochSecondsToDay(wake, tz)
+        }
+        return out
+    }
+
+    internal fun parseJournal(
+        table: CsvTable,
+        deviceId: String,
+        wakeDayByStart: Map<Long, String> = emptyMap(),
+    ): List<JournalEntry> {
         val out = ArrayList<JournalEntry>(table.rows.size)
         for (row in table.rows) {
             val tz = WhoopTime.tzOffsetMinutes(row["cycle_timezone"])
             val cycleStart = WhoopTime.parseEpochSeconds(row.cell("cycle_start_time"), tz)
             val question = row.cell("question_text", "question")
-            val answer = row.cell("answered_yes_no", "answer", "answer_text")
+            // #631: the REAL WHOOP export header is "Answered yes" (-> answered_yes), not the
+            // "Answered yes/no" NOOP's own exporter writes (-> answered_yes_no). Every real WHOOP
+            // journal import silently zeroed out to "without" because neither of the old keys ever
+            // matched, regardless of the account's actual answers.
+            val answer = row.cell("answered_yes", "answered_yes_no", "answer", "answer_text")
             val notes = row.cell("notes")
 
             // Swift: a journal row is only meaningful if it has a question/answer/notes.
@@ -468,7 +604,13 @@ object WhoopCsvImporter {
             // Our JournalEntry PK is (deviceId, day, question); a question is required to store.
             if (question == null) continue
 
-            val day = cycleStart?.let { epochSecondsToDay(it, tz) }
+            // #136: journal_entries.csv carries only cycle_start (the onset evening), no wake time. Key the
+            // entry to the cycle's WAKE day — the same day parseCycles/parseSleeps and the native journal
+            // use — via wakeDayByStart, so it lines up with the recovery/sleep outcome Insights correlates
+            // it against. Without this every imported entry sat one day early and never matched its outcome,
+            // so all historic days collapsed into "Without". Fall back to the onset day only when the cycle
+            // row isn't in the export.
+            val day = cycleStart?.let { wakeDayByStart[it] ?: epochSecondsToDay(it, tz) }
                 ?: epochSecondsToDay(System.currentTimeMillis() / 1000)
 
             val answeredYes = parseYesNo(answer)
@@ -493,7 +635,7 @@ object WhoopCsvImporter {
      * precedence (they carry recovery/strain/RHR/HRV/SpO2/skin-temp); sleep rows fill any sleep
      * architecture columns the cycle row left null. One row per (deviceId, day) to honour the PK.
      */
-    private fun mergeDaily(cycles: List<DailyMetric>, sleepDaily: List<DailyMetric>): List<DailyMetric> {
+    internal fun mergeDaily(cycles: List<DailyMetric>, sleepDaily: List<DailyMetric>): List<DailyMetric> {
         if (sleepDaily.isEmpty()) return dedupeByDay(cycles, preferFirst = true)
         if (cycles.isEmpty()) return dedupeByDay(sleepDaily, preferFirst = true)
 
@@ -533,6 +675,8 @@ object WhoopCsvImporter {
         disturbances = base.disturbances ?: fill.disturbances,
         restingHr = base.restingHr ?: fill.restingHr,
         avgHrv = base.avgHrv ?: fill.avgHrv,
+        avgSdnn = base.avgSdnn ?: fill.avgSdnn,
+        skinTempC = base.skinTempC ?: fill.skinTempC,
         recovery = base.recovery ?: fill.recovery,
         strain = base.strain ?: fill.strain,
         exerciseCount = base.exerciseCount ?: fill.exerciseCount,

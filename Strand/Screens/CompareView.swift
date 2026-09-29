@@ -12,7 +12,8 @@ import WhoopStore
 // chart (each metric min–max scaled to 0–1 within the window so different units
 // share an axis). Below, every pair of selected metrics gets a live Pearson-r
 // correlation readout with a plain-English conclusion. Pure read-side: each
-// metric loads from repo.series; everything else is derived in-view.
+// metric loads from repo.resolvedSeries (freshest-wins across imported / NOOP-computed /
+// compatible Apple Health, PR#196); everything else is derived in-view.
 
 // yyyy-MM-dd → Date, fixed UTC / en_US_POSIX (per task spec).
 private let compareDayParser: DateFormatter = {
@@ -34,12 +35,12 @@ enum CompareRange: String, CaseIterable, Identifiable {
 
     var label: String {
         switch self {
-        case .week:    return "W"
-        case .month:   return "M"
-        case .quarter: return "3M"
-        case .half:    return "6M"
-        case .year:    return "1Y"
-        case .all:     return "ALL"
+        case .week:    return String(localized: "W")
+        case .month:   return String(localized: "M")
+        case .quarter: return String(localized: "3M")
+        case .half:    return String(localized: "6M")
+        case .year:    return String(localized: "1Y")
+        case .all:     return String(localized: "ALL")
         }
     }
 
@@ -58,12 +59,12 @@ enum CompareRange: String, CaseIterable, Identifiable {
     /// A human phrase for sentences ("over 1Y").
     var phrase: String {
         switch self {
-        case .week:    return "the last 7 days"
-        case .month:   return "30 days"
-        case .quarter: return "3 months"
-        case .half:    return "6 months"
-        case .year:    return "1 year"
-        case .all:     return "all history"
+        case .week:    return String(localized: "the last 7 days")
+        case .month:   return String(localized: "30 days")
+        case .quarter: return String(localized: "3 months")
+        case .half:    return String(localized: "6 months")
+        case .year:    return String(localized: "1 year")
+        case .all:     return String(localized: "all history")
         }
     }
 
@@ -85,10 +86,23 @@ private struct CompareSeries: Identifiable {
     let color: Color
     let rows: [(day: String, value: Double)]
 
+    /// Real min/max over the window, computed ONCE at construction. As computed vars
+    /// these re-scanned every row per access, which put an O(rows) cost inside every
+    /// `normalized()` call (so building the overlay's plot points was O(rows squared))
+    /// and inside the per-frame hover read-outs.
+    let realMin: Double
+    let realMax: Double
+
     var id: String { metric.id }
-    var values: [Double] { rows.map(\.value) }
-    var realMin: Double { values.min() ?? 0 }
-    var realMax: Double { values.max() ?? 0 }
+
+    init(metric: MetricDescriptor, color: Color, rows: [(day: String, value: Double)]) {
+        self.metric = metric
+        self.color = color
+        self.rows = rows
+        let values = rows.map(\.value)
+        self.realMin = values.min() ?? 0
+        self.realMax = values.max() ?? 0
+    }
 
     /// Min–max normalize a value into 0…1 within this series' window. Flat series
     /// (max == min) collapse to the mid-line so they still render.
@@ -97,17 +111,18 @@ private struct CompareSeries: Identifiable {
         guard hi > lo else { return 0.5 }
         return min(max((v - lo) / (hi - lo), 0), 1)
     }
-
-    /// The value on a given day, if recorded.
-    func value(on day: String) -> Double? {
-        rows.first(where: { $0.day == day })?.value
-    }
 }
 
 // MARK: - Root
 
 struct CompareView: View {
     @EnvironmentObject var repo: Repository
+
+    // Effort display scale (#268) — routes the Effort metric's min/max + hover read-outs onto WHOOP's
+    // 0–21 axis; display-only, the normalized overlay shape is untouched. Every other metric is
+    // scale-agnostic (see MetricDescriptor.format).
+    @AppStorage(UnitPrefs.effortScaleKey) private var effortScaleRaw = EffortScale.hundred.rawValue
+    private var effortScale: EffortScale { UnitPrefs.resolveEffortScale(effortScaleRaw) }
 
     // Distinct, high-legibility series colors (avoid the recovery/strain ramps so
     // overlay lines read as categorical, not as a value gradient).
@@ -121,9 +136,25 @@ struct CompareView: View {
     /// Default starter selection (falls back gracefully if a key is missing).
     private static let defaultKeys = ["recovery", "sleep_performance", "weight"]
 
-    @State private var range: CompareRange = .year
-    /// Ordered selection (max 4). Drives both the legend order and color mapping.
-    @State private var selected: [MetricDescriptor] = []
+    // #358 parity (Android ComparePrefs): the time window + the ordered metric selection persist across
+    // visits — a UI preference, not `.noopbak` data. Selection is stored as comma-joined descriptor ids
+    // ("source:key"). Both are restored PRE-render (window straight off @AppStorage, selection via a
+    // static initial value), so Compare opens directly on the saved state — matching Android, with no
+    // default-then-restore flash.
+    @AppStorage("compare.rangeRaw") private var savedRangeRaw = CompareRange.year.rawValue
+    @AppStorage("compare.selectedIds") private var savedSelectedIds = ""
+
+    /// The active window, backed directly by @AppStorage so it is the persisted value from the first
+    /// frame. Read-only; writes go through `rangeBinding`.
+    private var range: CompareRange { CompareRange(rawValue: savedRangeRaw) ?? .year }
+    private var rangeBinding: Binding<CompareRange> {
+        Binding(get: { CompareRange(rawValue: savedRangeRaw) ?? .year },
+                set: { savedRangeRaw = $0.rawValue })
+    }
+
+    /// Ordered selection (max 4). Pre-populated from the persisted ids (else the defaults) at creation,
+    /// so it renders the saved selection immediately. Drives both the legend order and color mapping.
+    @State private var selected: [MetricDescriptor] = CompareView.initialSelection()
     /// Full-history series per selected metric id (ascending by day).
     @State private var fullSeries: [String: [(day: String, value: Double)]] = [:]
     @State private var loadedOnce = false
@@ -137,9 +168,18 @@ struct CompareView: View {
 
     private let maxSelection = 4
     private let minSelection = 2
+    private var loadTaskID: String { "\(selectionKey)|\(repo.refreshSeq)" }
 
     var body: some View {
-        ScreenScaffold(title: "Compare", subtitle: "Overlay signals, draw conclusions.") {
+        ScreenScaffold(title: "Compare", subtitle: "Overlay signals, draw conclusions.",
+                       // PERF (scroll): lazy column — byte-identical layout (LazyVStack == eager VStack
+                       // alignment/spacing/header). The content is one inner eager VStack; no staggered
+                       // reveals, and the only GeometryReaders are chart-local (.chartOverlay plot rects),
+                       // so nothing depends on eager layout of the scroll column.
+                       lazy: true,
+                       // Liquid finish: the day-of-sky backdrop carries the liquid atmosphere across the
+                       // analysis tabs, exactly like Today and the batch-1 screens.
+                       topBackground: liquidScaffoldSky()) {
             VStack(alignment: .leading, spacing: NoopMetrics.sectionGap) {
                 metricSection
 
@@ -158,14 +198,13 @@ struct CompareView: View {
                 }
             }
         }
-        .task { await loadIfNeeded() }
-        .task(id: selectionKey) {
+        .task(id: loadTaskID) {
             await loadSelected()
             refreshPairCache(activeSeries)
         }
         // Recompute the pairwise scan only when the windowed series content changes,
         // never on hover/animation/HR-tick re-renders that don't touch these inputs.
-        .onChange(of: correlationKey(activeSeries)) { _ in
+        .onChangeCompat(of: correlationKey(activeSeries)) { _ in
             refreshPairCache(activeSeries)
         }
     }
@@ -218,32 +257,85 @@ struct CompareView: View {
         }
     }
 
+    /// How the overlay subtitle tells the user to read real (un-normalized) values.
+    /// The chart axis is normalized, so the only readout of real numbers is the
+    /// crosshair tooltip — driven by pointer hover on macOS, by tap/drag on iOS.
+    private var inspectHint: String {
+        #if os(iOS)
+        return String(localized: "tap or drag for real values")
+        #else
+        return String(localized: "hover for real values")
+        #endif
+    }
+
     /// "N readings · <range>" caption near the control, flagging any auto-widen.
+    /// Whole-phrase variants per count so translators see complete sentences.
     private var rangeCaption: String {
         let series = activeSeries
         let total = series.reduce(0) { $0 + $1.rows.count }
-        let unit = total == 1 ? "reading" : "readings"
-        let base = "\(total) \(unit) across \(series.count) · \(range.phrase)"
-        return anyWidened ? base + " · sparse widened" : base
+        if anyWidened {
+            return total == 1
+                ? String(localized: "1 reading across \(series.count) · \(range.phrase) · sparse widened")
+                : String(localized: "\(total) readings across \(series.count) · \(range.phrase) · sparse widened")
+        }
+        return total == 1
+            ? String(localized: "1 reading across \(series.count) · \(range.phrase)")
+            : String(localized: "\(total) readings across \(series.count) · \(range.phrase)")
     }
 
     // MARK: - Loading
 
-    private func loadIfNeeded() async {
-        guard selected.isEmpty else { return }
-        // Seed the default selection from whichever default keys exist.
+    /// The persisted selection (comma-joined descriptor ids) resolved against the catalog, else the
+    /// defaults. Evaluated at view creation (the `selected` initial value) so Compare renders the saved
+    /// selection on the first frame. Twin of the Android `ComparePrefs.readSelection`. The literals
+    /// mirror `minSelection` / `maxSelection` below (a static initial value can't read instance members).
+    static func initialSelection() -> [MetricDescriptor] {
+        let raw = UserDefaults.standard.string(forKey: "compare.selectedIds") ?? ""
+        return restoreSelection(raw, minSelection: 2, maxSelection: 4) ?? defaultSelection()
+    }
+
+    /// The default starter selection from `defaultKeys` (graceful when a key is missing).
+    static func defaultSelection() -> [MetricDescriptor] {
         var picks: [MetricDescriptor] = []
-        for key in Self.defaultKeys {
+        for key in defaultKeys {
             if let m = MetricCatalog.all.first(where: { $0.key == key }) { picks.append(m) }
         }
         if picks.isEmpty { picks = Array(MetricCatalog.all.prefix(2)) }
-        selected = Array(picks.prefix(maxSelection))
+        return Array(picks.prefix(4))   // maxSelection
     }
 
-    /// Load (and cache) the full history for any selected metric not yet fetched.
+    /// Restore a persisted Compare selection (comma-joined descriptor ids), or nil to fall back to the
+    /// defaults. Twin of the Android `parseCompareSelection` (#358): resolve each id against the catalog,
+    /// dedupe, cap at `maxSelection`; restore when EVERY saved id still resolves (so a deliberate
+    /// sub-minimum selection is honored) OR at least `minSelection` survive — nil only when a catalog
+    /// change dropped the saved ids below the minimum (the stale-selection case). Pure for testability.
+    static func restoreSelection(_ raw: String, minSelection: Int, maxSelection: Int) -> [MetricDescriptor]? {
+        let tokens = raw.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        guard !tokens.isEmpty else { return nil }
+        var seen = Set<String>()
+        var parsed: [MetricDescriptor] = []
+        for id in tokens {
+            guard seen.insert(id).inserted else { continue }   // first occurrence only (dedupe)
+            if let m = MetricCatalog.all.first(where: { $0.id == id }) {
+                parsed.append(m)
+                if parsed.count == maxSelection { break }
+            }
+        }
+        let uniqueSaved = Set(tokens).count
+        return (parsed.count == uniqueSaved || parsed.count >= minSelection) ? parsed : nil
+    }
+
+    /// Persist the current selection as comma-joined descriptor ids (#358).
+    private func persistSelection() {
+        savedSelectedIds = selected.map(\.id).joined(separator: ",")
+    }
+
+    /// Load the full history for the selected metrics. Selection is capped at four,
+    /// so a repository refresh can safely replace cached rows instead of leaving
+    /// Compare on a stale pre-sync snapshot.
     private func loadSelected() async {
-        for metric in selected where fullSeries[metric.id] == nil {
-            let s = await repo.series(key: metric.key, source: metric.source)
+        for metric in selected {
+            let s = await repo.resolvedSeries(key: metric.key, source: metric.source).values
             fullSeries[metric.id] = s
         }
         loadedOnce = true
@@ -253,14 +345,23 @@ struct CompareView: View {
 
     private var metricSection: some View {
         VStack(alignment: .leading, spacing: NoopMetrics.gap) {
-            SectionHeader("Metrics", overline: "Overlay 2–4 signals")
+            SectionHeader("Metrics", overline: "Overlay 2-4 signals")
             NoopCard {
                 VStack(alignment: .leading, spacing: NoopMetrics.gap) {
-                    HStack(alignment: .center) {
-                        SegmentedPillControl(CompareRange.allCases, selection: $range) { $0.label }
-                            .accessibilityLabel("Time range")
-                        Spacer()
-                        addMenu
+                    // Responsive: range pills + the Add menu side-by-side when there's room, else
+                    // stacked so the pills don't overflow/clip on a narrow window (ported from the iOS port).
+                    ViewThatFits(in: .horizontal) {
+                        HStack(alignment: .center) {
+                            SegmentedPillControl(CompareRange.allCases, selection: rangeBinding) { $0.label }
+                                .accessibilityLabel("Time range")
+                            Spacer()
+                            addMenu
+                        }
+                        VStack(alignment: .leading, spacing: NoopMetrics.gap) {
+                            SegmentedPillControl(CompareRange.allCases, selection: rangeBinding) { $0.label }
+                                .accessibilityLabel("Time range")
+                            addMenu
+                        }
                     }
 
                     if selected.count >= minSelection {
@@ -291,7 +392,9 @@ struct CompareView: View {
             ForEach(MetricCatalog.categories, id: \.self) { category in
                 let metrics = MetricCatalog.inCategory(category)
                 if !metrics.isEmpty {
-                    Section(category) {
+                    // Section title localized at the render site only; `category` stays the
+                    // raw English identifier that `inCategory` filters on.
+                    Section(MetricCatalog.categoryDisplayName(category)) {
                         ForEach(metrics) { metric in
                             let isOn = selected.contains(metric)
                             Button {
@@ -328,11 +431,13 @@ struct CompareView: View {
             remove(metric)
         } else if selected.count < maxSelection {
             withAnimation(StrandMotion.gentle) { selected.append(metric) }
+            persistSelection()   // #358
         }
     }
 
     private func remove(_ metric: MetricDescriptor) {
         withAnimation(StrandMotion.gentle) { selected.removeAll { $0 == metric } }
+        persistSelection()   // #358
     }
 
     // MARK: - Overlay chart section (locked ChartCard)
@@ -341,15 +446,20 @@ struct CompareView: View {
     private func overlaySection(_ series: [CompareSeries]) -> some View {
         let nonEmpty = series.filter { !$0.rows.isEmpty }
         VStack(alignment: .leading, spacing: NoopMetrics.gap) {
-            SectionHeader("Overlay", overline: range.phrase)
+            SectionHeader("Overlay", overline: "\(range.phrase)")
             ChartCard(
                 title: "Normalized overlay",
                 subtitle: anyWidened
-                    ? "Min–max normalized · sparse series widened past \(range.phrase) · hover for real values"
-                    : "Each line min–max normalized within \(range.phrase) · hover for real values",
-                trailing: "\(nonEmpty.count) series"
+                    ? String(localized: "Min-max normalized · sparse series widened past \(range.phrase) · \(inspectHint)")
+                    : String(localized: "Each line min-max normalized within \(range.phrase) · \(inspectHint)"),
+                trailing: String(localized: "\(nonEmpty.count) series"),
+                // Anchor the overlay card to the brand-green chrome world; each line keeps its own
+                // categorical series colour so the lines stay distinguishable against the wash.
+                tint: StrandPalette.accent
             ) {
-                OverlayChart(series: nonEmpty, height: NoopMetrics.chartHeight)
+                // The overlay is min–max NORMALIZED 0–1, so the Effort scale never touches the line shape;
+                // only the per-series hover read-outs convert (passed through to the tooltip). (#268)
+                OverlayChart(series: nonEmpty, effortScale: effortScale, height: NoopMetrics.chartHeight)
             } footer: {
                 legend(nonEmpty)
             }
@@ -360,6 +470,14 @@ struct CompareView: View {
         VStack(spacing: 0) {
             ForEach(Array(series.enumerated()), id: \.element.id) { idx, s in
                 HStack(spacing: 10) {
+                    // A small liquid vessel posed at this series' LATEST value within its own min–max
+                    // window (the same 0–1 position the overlay's "now" end-cap sits at) — the liquid
+                    // accent tying the legend to the real series. Static, decorative (the min/max text
+                    // + colour swatch carry the meaning for VoiceOver).
+                    LiquidVessel(value: s.rows.last.map { s.normalized($0.value) },
+                                 tint: s.color, animated: false)
+                        .frame(width: 22, height: 22)
+                        .accessibilityHidden(true)
                     RoundedRectangle(cornerRadius: 2, style: .continuous)
                         .fill(s.color)
                         .frame(width: 14, height: 3)
@@ -367,13 +485,14 @@ struct CompareView: View {
                         .font(StrandFont.subhead)
                         .foregroundStyle(StrandPalette.textPrimary)
                     Spacer()
-                    Text("\(s.metric.format(s.realMin)) – \(s.metric.format(s.realMax))")
+                    // Real min/max labels honour the Effort scale (#268); other metrics are unchanged.
+                    Text("\(s.metric.format(s.realMin, effortScale: effortScale))-\(s.metric.format(s.realMax, effortScale: effortScale))")
                         .font(StrandFont.captionNumber)
                         .foregroundStyle(StrandPalette.textSecondary)
                 }
                 .padding(.vertical, 7)
                 .accessibilityElement(children: .combine)
-                .accessibilityLabel("\(s.metric.title), range \(s.metric.format(s.realMin)) to \(s.metric.format(s.realMax))")
+                .accessibilityLabel("\(s.metric.title), range \(s.metric.format(s.realMin, effortScale: effortScale)) to \(s.metric.format(s.realMax, effortScale: effortScale))")
                 if idx < series.count - 1 {
                     Divider().overlay(StrandPalette.hairline)
                 }
@@ -445,7 +564,9 @@ struct CompareView: View {
         VStack(alignment: .leading, spacing: NoopMetrics.gap) {
             SectionHeader("How They Move Together",
                           overline: "Pearson r · \(range.phrase)",
-                          trailing: pairs.isEmpty ? nil : "\(pairs.count) pairs")
+                          trailing: pairs.isEmpty ? nil
+                                    : (pairs.count == 1 ? String(localized: "1 pair")
+                                                        : String(localized: "\(pairs.count) pairs")))
 
             if pairs.isEmpty {
                 NoopCard {
@@ -466,9 +587,18 @@ struct CompareView: View {
     /// One pairwise correlation as its own NoopCard.
     private func pairCard(_ p: PairResult) -> some View {
         let tint = correlationColor(p.r)
-        return NoopCard {
+        // Frosted card washed by the relationship's own colour (green positive / rose negative), with a
+        // TrendChip surfacing the signed direction at a glance — the Today delta idiom, applied to r.
+        return NoopCard(tint: tint) {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 10) {
+                    // A small liquid vessel filled to the correlation STRENGTH (|r|, a neutral 0–1
+                    // magnitude — not a health value), tinted by the relationship's own colour. Static
+                    // (posed) so a page of pair cards costs one cached frame each, matching Today's small
+                    // vessels. Decorative — the r read-out + sentence carry the meaning for VoiceOver.
+                    LiquidVessel(value: min(abs(p.r), 1), tint: tint, animated: false)
+                        .frame(width: 30, height: 30)
+                        .accessibilityHidden(true)
                     // Two color swatches for the pair.
                     HStack(spacing: 3) {
                         Circle().fill(p.a.color).frame(width: 8, height: 8)
@@ -478,6 +608,7 @@ struct CompareView: View {
                         .font(StrandFont.headline)
                         .foregroundStyle(StrandPalette.textPrimary)
                     Spacer()
+                    TrendChip(text: signedR(p.r), color: tint)
                     Text("r = \(signedR(p.r))")
                         .font(StrandFont.number(18))
                         .foregroundStyle(tint)
@@ -487,6 +618,11 @@ struct CompareView: View {
                     .font(StrandFont.subhead)
                     .foregroundStyle(StrandPalette.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
+
+                // The strength magnitude drawn as a liquid tube — the horizontal progress idiom Today
+                // uses for its key-metric fills, here reading |r| from none (0) to a perfect link (1).
+                LiquidTube(frac: min(abs(p.r), 1), tint: tint, height: 8, animated: false)
+                    .accessibilityHidden(true)
 
                 Text("\(p.n) overlapping days · \(strengthWord(p.r)) \(directionWord(p.r)) correlation")
                     .font(StrandFont.footnote)
@@ -502,15 +638,16 @@ struct CompareView: View {
     /// "Weight ↔ Recovery: r = −0.34 (moderate negative) over 1Y" + a plain-English
     /// conclusion when |r| is notable.
     private func insightSentence(_ p: PairResult) -> String {
-        let head = "\(p.a.metric.title) ↔ \(p.b.metric.title): r = \(signedR(p.r)) (\(strengthWord(p.r)) \(directionWord(p.r))) over \(p.n) shared days."
+        let head = String(localized: "\(p.a.metric.title) ↔ \(p.b.metric.title): r = \(signedR(p.r)) (\(strengthWord(p.r)) \(directionWord(p.r))) over \(p.n) shared days.")
         guard abs(p.r) >= 0.3 else {
-            return head + " No clear relationship — they move largely independently."
+            return String(localized: "\(head) No clear relationship. They move largely independently.")
         }
-        let lower = p.r < 0
         let aT = p.a.metric.title.lowercased()
         let bT = p.b.metric.title.lowercased()
-        let verb = lower ? "tends to fall" : "tends to rise"
-        return head + " When \(aT) rises, \(bT) \(verb) — a \(strengthWord(p.r)) \(directionWord(p.r)) link."
+        // Whole-phrase variants per direction so translators never see a stitched verb fragment.
+        return p.r < 0
+            ? String(localized: "\(head) When \(aT) rises, \(bT) tends to fall, a \(strengthWord(p.r)) \(directionWord(p.r)) link.")
+            : String(localized: "\(head) When \(aT) rises, \(bT) tends to rise, a \(strengthWord(p.r)) \(directionWord(p.r)) link.")
     }
 
     private func signedR(_ r: Double) -> String {
@@ -519,17 +656,17 @@ struct CompareView: View {
 
     private func strengthWord(_ r: Double) -> String {
         switch abs(r) {
-        case ..<0.1:  return "negligible"
-        case ..<0.3:  return "weak"
-        case ..<0.5:  return "moderate"
-        case ..<0.7:  return "strong"
-        default:      return "very strong"
+        case ..<0.1:  return String(localized: "negligible")
+        case ..<0.3:  return String(localized: "weak")
+        case ..<0.5:  return String(localized: "moderate")
+        case ..<0.7:  return String(localized: "strong")
+        default:      return String(localized: "very strong")
         }
     }
 
     private func directionWord(_ r: Double) -> String {
         if abs(r) < 0.1 { return "" }
-        return r >= 0 ? "positive" : "negative"
+        return r >= 0 ? String(localized: "positive") : String(localized: "negative")
     }
 
     private func correlationColor(_ r: Double) -> Color {
@@ -589,9 +726,20 @@ private struct FlowChips: View {
 /// the nearest day.
 private struct OverlayChart: View {
     let series: [CompareSeries]
+    /// Effort display scale (#268) — passed through to the hover tooltip's real-value read-outs. The
+    /// plotted points stay min–max normalized 0–1, so the line shape is unaffected.
+    var effortScale: EffortScale = .hundred
     var height: CGFloat = 260
 
     @State private var hoverX: CGFloat? = nil
+
+    /// Cache of the derived chart model + the series fingerprint it was built for.
+    /// `hoverX` is `@State` here, so every pointer move re-evaluates `body`; before
+    /// this cache each hover frame re-ran the full flatten + normalize + date-parse
+    /// + sort work over every row of every series. Mirrors the `pairCache` idiom
+    /// CompareView already uses for its correlation scan.
+    @State private var modelCache: Model = .empty
+    @State private var modelCacheKey: String = ""
 
     // A flat, plottable point: the series title (drives the categorical color
     // scale), the date, and the min–max normalized y.
@@ -604,25 +752,167 @@ private struct OverlayChart: View {
         let norm: Double
     }
 
-    /// All series flattened into normalized plot points (dropping unparseable days).
-    private var plots: [Plot] {
-        series.flatMap { s in
-            s.rows.compactMap { row -> Plot? in
-                guard let d = parseCompareDay(row.day) else { return nil }
-                return Plot(title: s.metric.title, date: d, norm: s.normalized(row.value))
+    /// Everything `body` derives from `series`, computed ONCE per data change instead
+    /// of on every hover frame. Drawing (`plots`) is downsampled; every read-out path
+    /// (hover index, tooltip values, end-caps) is built from the FULL-resolution rows.
+    private struct Model {
+        /// The plot points actually handed to the marks, per series: full resolution
+        /// up to `markThreshold`, else min/max-bucketed toward `targetVertices`.
+        /// DRAWING ONLY. The correlation cards never read this (they run on
+        /// `CompareSeries.rows`), and neither do the hover read-outs below.
+        let plots: [Plot]
+        /// The latest normalized plot point of each series (the glowing "now" end-caps).
+        let endCaps: [Plot]
+        /// The union of all parseable days present, ascending, each pre-parsed to a
+        /// `Date` once. The sorted index hover snapping binary-searches, replacing a
+        /// linear min-scan that re-parsed every day string on every mouse move.
+        let dayIndex: [(day: String, date: Date)]
+        /// day -> (series id -> real value): O(1) crosshair-dot and tooltip lookups,
+        /// replacing a per-frame linear `rows` scan per series.
+        let valuesByDay: [String: [String: Double]]
+        /// True when every series is sparse enough for its per-point marks to read as
+        /// discrete readings. Dense series draw line-only.
+        let showsPointMarks: Bool
+
+        static let empty = Model(series: [])
+
+        /// Same gate as TrendChart's dotted series: above 60 windowed points the dots
+        /// are sub-pixel-dense and invisible but still cost the GPU a mark each.
+        /// Because 60 < `markThreshold`, whenever marks ARE shown no series was
+        /// downsampled, so every dot sits on a real full-resolution vertex.
+        static let pointMarkGate = 60
+        /// Above this many points per series the DRAWN line is downsampled; at or
+        /// below it the series passes through untouched. Same constants as
+        /// StrandDesign's `ChartDownsample` (TrendChart / OverviewHRChart), applied
+        /// per overlaid series so bucketing never crosses a series boundary.
+        static let markThreshold = 120
+        static let targetVertices = 400
+
+        init(series: [CompareSeries]) {
+            var drawn: [Plot] = []
+            var caps: [Plot] = []
+            var byDay: [String: [String: Double]] = [:]
+            var dateCache: [String: Date] = [:]
+            var densest = 0
+
+            for s in series {
+                densest = max(densest, s.rows.count)
+                var pts: [Plot] = []
+                pts.reserveCapacity(s.rows.count)
+                for row in s.rows {
+                    byDay[row.day, default: [:]][s.id] = row.value
+                    let d: Date
+                    if let cached = dateCache[row.day] {
+                        d = cached
+                    } else if let parsed = parseCompareDay(row.day) {
+                        dateCache[row.day] = parsed
+                        d = parsed
+                    } else {
+                        continue // unparseable day: not plottable (as before)
+                    }
+                    pts.append(Plot(title: s.metric.title, date: d, norm: s.normalized(row.value)))
+                }
+                if let row = s.rows.last, let d = dateCache[row.day] ?? parseCompareDay(row.day) {
+                    caps.append(Plot(title: s.metric.title, date: d, norm: s.normalized(row.value)))
+                }
+                drawn.append(contentsOf: Model.minMaxBucketed(pts))
             }
+
+            plots = drawn
+            endCaps = caps
+            valuesByDay = byDay
+            dayIndex = dateCache.map { (day: $0.key, date: $0.value) }.sorted { $0.date < $1.date }
+            showsPointMarks = densest <= Model.pointMarkGate
+        }
+
+        /// Min/max-per-bucket downsample of ONE series' plot points, mirroring
+        /// `ChartDownsample.minMaxBucketed` in StrandDesign: each interior bucket
+        /// contributes its lowest and highest sample in time order, so every visible
+        /// peak and trough survives and the line silhouette is unchanged at normal
+        /// chart widths; first and last points are always kept. Pure + deterministic.
+        static func minMaxBucketed(_ points: [Plot]) -> [Plot] {
+            let n = points.count
+            guard n > markThreshold, n > 2 else { return points }
+
+            // Reserve the first and last; bucket the interior. Each bucket yields up
+            // to 2 vertices (min+max), so aim for ~targetVertices/2 buckets.
+            let first = points[0]
+            let last = points[n - 1]
+            let interior = n - 2
+            let bucketCount = max(1, (targetVertices - 2) / 2)
+            guard bucketCount < interior else { return points }
+
+            var out: [Plot] = []
+            out.reserveCapacity(targetVertices)
+            out.append(first)
+
+            var lastEmittedDate = first.date
+            for b in 0..<bucketCount {
+                // Interior indices [1 ... n-2] split into `bucketCount` contiguous ranges.
+                let lo = 1 + (b * interior) / bucketCount
+                let hi = 1 + ((b + 1) * interior) / bucketCount // exclusive
+                guard lo < hi else { continue }
+
+                var minIdx = lo, maxIdx = lo
+                var i = lo + 1
+                while i < hi {
+                    if points[i].norm < points[minIdx].norm { minIdx = i }
+                    if points[i].norm > points[maxIdx].norm { maxIdx = i }
+                    i += 1
+                }
+
+                // Emit the two extremes in chronological order, skipping duplicates
+                // (monotone bucket yields one point) and any whose date would not
+                // advance (keeps the day-keyed `Plot.id` unique for Chart's diffing).
+                let lowFirst = minIdx <= maxIdx
+                let aIdx = lowFirst ? minIdx : maxIdx
+                let bIdx = lowFirst ? maxIdx : minIdx
+                for idx in [aIdx, bIdx] where points[idx].date > lastEmittedDate {
+                    out.append(points[idx])
+                    lastEmittedDate = points[idx].date
+                }
+            }
+
+            if last.date > lastEmittedDate { out.append(last) }
+            return out
         }
     }
 
-    /// The union of all days present, ascending — the x-domain for hover snapping.
-    private var allDays: [String] {
-        var set = Set<String>()
-        for s in series { for r in s.rows { set.insert(r.day) } }
-        return set.sorted()
+    /// Fingerprint of the model's inputs, same idiom as `CompareView.correlationKey`:
+    /// series id + windowed row count + endpoint days. Row content only changes when
+    /// the selection, range, or fetched history changes, so this covers every input.
+    private var modelKey: String {
+        series
+            .map { s in "\(s.id):\(s.rows.count):\(s.rows.first?.day ?? "")>\(s.rows.last?.day ?? "")" }
+            .joined(separator: "|")
+    }
+
+    /// Cached accessor used by `body`. Mirrors `CompareView.pairResults`: returns the
+    /// memoized model when the inputs match, else computes for THIS render (without
+    /// mutating state mid-body); the matching onAppear/onChange then persist it so
+    /// subsequent hover frames hit the cache.
+    private var currentModel: Model {
+        modelKey == modelCacheKey ? modelCache : Model(series: series)
+    }
+
+    /// Rebuild the model cache if (and only if) the series content changed.
+    private func refreshModel() {
+        let key = modelKey
+        guard key != modelCacheKey else { return }
+        modelCacheKey = key
+        modelCache = Model(series: series)
+    }
+
+    /// The series colour for a metric title — drives the matching "now" end-cap glow.
+    private func colorFor(_ title: String) -> Color? {
+        series.first(where: { $0.metric.title == title })?.color
     }
 
     var body: some View {
-        Chart(plots) { p in
+        let model = currentModel
+        // Computed once so the marks and their label format agree about which days are shown.
+        let axisDays = ChartAxisDays.spanning(model.plots.map(\.date))
+        Chart(model.plots) { p in
             LineMark(
                 x: .value("Date", p.date),
                 y: .value("Normalized", p.norm)
@@ -631,12 +921,37 @@ private struct OverlayChart: View {
             .lineStyle(StrokeStyle(lineWidth: 2.2, lineCap: .round, lineJoin: .round))
             .foregroundStyle(by: .value("Metric", p.title))
 
-            PointMark(
-                x: .value("Date", p.date),
-                y: .value("Normalized", p.norm)
-            )
-            .symbolSize(10)
-            .foregroundStyle(by: .value("Metric", p.title))
+            // Per-point dots are only legible on sparse series; on a dense window they
+            // overlap into the line while still costing a mark each (same gate as
+            // TrendChart). The line carries the data past the gate.
+            if model.showsPointMarks {
+                PointMark(
+                    x: .value("Date", p.date),
+                    y: .value("Normalized", p.norm)
+                )
+                .symbolSize(10)
+                .foregroundStyle(by: .value("Metric", p.title))
+            }
+        }
+        // Bevel "now" end-caps — a soft halo + bright core on each series' latest point, drawn on top.
+        .chartOverlay { proxy in
+            GeometryReader { geo in
+                let plot = proxy.plotRectCompat(in: geo)
+                ForEach(model.endCaps) { cap in
+                    if let px = proxy.position(forX: cap.date),
+                       let py = proxy.position(forY: cap.norm),
+                       let color = colorFor(cap.title) {
+                        ZStack {
+                            Circle().fill(color.opacity(0.30)).frame(width: 16, height: 16)
+                            Circle().fill(color.opacity(0.65)).frame(width: 10, height: 10)
+                            Circle().fill(Color.white).frame(width: 4, height: 4)
+                        }
+                        .position(x: px + plot.minX, y: py + plot.minY)
+                        .allowsHitTesting(false)
+                    }
+                }
+            }
+            .accessibilityHidden(true)
         }
         .chartForegroundStyleScale(range: series.map(\.color))
         .chartYScale(domain: 0...1)
@@ -653,23 +968,27 @@ private struct OverlayChart: View {
                 }
             }
         }
+        // Day-aligned marks, not a requested count. `.automatic(desiredCount:)` picks the stride that
+        // best fits the count, and over a short window (this chart offers W) that stride goes sub-day, so
+        // two marks land in one calendar day and print the same date on top of itself.
         .chartXAxis {
-            AxisMarks(values: .automatic(desiredCount: 5)) { _ in
+            AxisMarks(values: axisDays) { _ in
                 AxisGridLine().foregroundStyle(StrandPalette.hairline.opacity(0.4))
-                AxisValueLabel().foregroundStyle(StrandPalette.textTertiary)
+                AxisValueLabel(format: ChartAxisDays.labelFormat(for: axisDays))
+                    .foregroundStyle(StrandPalette.textTertiary)
                     .font(StrandFont.footnote)
             }
         }
         .chartLegend(.hidden) // legend rendered separately with real min/max
         .chartOverlay { proxy in
             GeometryReader { geo in
-                let plot = geo[proxy.plotAreaFrame]
+                let plot = proxy.plotRectCompat(in: geo)
                 ZStack(alignment: .topLeading) {
                     if let hx = hoverX,
-                       let day = nearestDay(toX: hx, proxy: proxy, plot: plot),
-                       let d = parseCompareDay(day),
-                       let px = proxy.position(forX: d) {
+                       let snap = nearestEntry(toX: hx, proxy: proxy, plot: plot, index: model.dayIndex),
+                       let px = proxy.position(forX: snap.date) {
                         let cx = px + plot.minX
+                        let dayValues = model.valuesByDay[snap.day] ?? [:]
                         // Vertical crosshair at the hovered day.
                         Rectangle()
                             .fill(StrandPalette.hairlineStrong)
@@ -678,7 +997,7 @@ private struct OverlayChart: View {
 
                         // Dot on each series at this day (where it has a value).
                         ForEach(series) { s in
-                            if let v = s.value(on: day),
+                            if let v = dayValues[s.id],
                                let py = proxy.position(forY: s.normalized(v)) {
                                 Circle()
                                     .fill(s.color)
@@ -689,8 +1008,10 @@ private struct OverlayChart: View {
                         }
 
                         MultiTooltip(
-                            day: day,
+                            date: snap.date,
                             series: series,
+                            values: dayValues,
+                            effortScale: effortScale,
                             anchorX: cx,
                             container: geo.size
                         )
@@ -704,21 +1025,50 @@ private struct OverlayChart: View {
                     case .ended: hoverX = nil
                     }
                 }
+                #if os(iOS)
+                // Touch input never fires onContinuousHover (pointer-only), so on iPhone /
+                // iPad-without-pointer the crosshair + value tooltip would be unreachable.
+                // Drive the same hoverX via tap (single touch-down) and drag-to-scrub across
+                // days. minimumDistance:0 keeps the first touch responsive; a clearly vertical
+                // pan is still claimed by the parent ScrollView.
+                .gesture(
+                    SpatialTapGesture(coordinateSpace: .local)
+                        .onEnded { hoverX = $0.location.x }
+                        .exclusively(before:
+                            DragGesture(minimumDistance: 0, coordinateSpace: .local)
+                                .onChanged { hoverX = $0.location.x }
+                                .onEnded { _ in hoverX = nil }
+                        )
+                )
+                #endif
             }
         }
+        // Persist the model into @State so hover-frame body evals hit the cache
+        // (currentModel already served THIS render the fresh value when the key missed).
+        .onAppear { refreshModel() }
+        .onChangeCompat(of: modelKey) { _ in refreshModel() }
         .frame(height: height)
     }
 
-    /// Map a cursor x back to the nearest day-string present in the data.
-    private func nearestDay(toX x: CGFloat, proxy: ChartProxy, plot: CGRect) -> String? {
-        guard !allDays.isEmpty else { return nil }
+    /// Map a cursor x back to the nearest day present in the data: binary search over
+    /// the model's pre-parsed, date-sorted index, then pick the closer neighbour.
+    /// O(log days) per mouse move; ties snap to the earlier day, as the old scan did.
+    private func nearestEntry(toX x: CGFloat, proxy: ChartProxy, plot: CGRect,
+                              index: [(day: String, date: Date)]) -> (day: String, date: Date)? {
+        guard !index.isEmpty else { return nil }
         let relX = x - plot.minX
         guard let date: Date = proxy.value(atX: relX) else { return nil }
-        return allDays.min(by: { a, b in
-            let da = parseCompareDay(a) ?? .distantPast
-            let db = parseCompareDay(b) ?? .distantPast
-            return abs(da.timeIntervalSince(date)) < abs(db.timeIntervalSince(date))
-        })
+
+        // Lower bound: first entry whose date is >= the cursor date.
+        var lo = 0, hi = index.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if index[mid].date < date { lo = mid + 1 } else { hi = mid }
+        }
+        if lo == 0 { return index[0] }
+        if lo == index.count { return index[index.count - 1] }
+        let before = index[lo - 1], after = index[lo]
+        return date.timeIntervalSince(before.date) <= after.date.timeIntervalSince(date) ? before : after
     }
 }
 
@@ -727,18 +1077,29 @@ private struct OverlayChart: View {
 /// A floating tooltip listing each series' REAL value on the hovered day, kept
 /// inside the chart bounds.
 private struct MultiTooltip: View {
-    let day: String
+    /// The hovered day, pre-parsed once by the chart's model (no per-frame parse).
+    let date: Date
     let series: [CompareSeries]
+    /// Real values on the hovered day keyed by series id, precomputed in the chart's
+    /// model. Replaces a per-frame linear `rows` scan per series.
+    let values: [String: Double]
+    /// Effort display scale (#268) — the per-series real value converts onto WHOOP's 0–21 axis when set.
+    var effortScale: EffortScale = .hundred
     let anchorX: CGFloat
     let container: CGSize
 
-    private var dateLabel: String {
-        guard let d = parseCompareDay(day) else { return day }
+    /// Shared formatter; was rebuilt from scratch on every hover frame.
+    private static let dateLabelFormatter: DateFormatter = {
         let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
+        // Device locale (not en_US_POSIX) so the DISPLAYED weekday/month names translate — the crosshair
+        // parser above still uses en_US_POSIX for stable yyyy-MM-dd parsing. Same pattern + device locale
+        // as the Android twin so both localize consistently.
+        f.locale = Locale.autoupdatingCurrent
         f.dateFormat = "EEE d MMM yyyy"
-        return f.string(from: d)
-    }
+        return f
+    }()
+
+    private var dateLabel: String { Self.dateLabelFormatter.string(from: date) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -752,22 +1113,14 @@ private struct MultiTooltip: View {
                         .font(StrandFont.caption)
                         .foregroundStyle(StrandPalette.textSecondary)
                     Spacer(minLength: 12)
-                    Text(s.value(on: day).map { s.metric.format($0) } ?? "—")
+                    Text(values[s.id].map { s.metric.format($0, effortScale: effortScale) } ?? "—")
                         .font(StrandFont.captionNumber)
                         .foregroundStyle(StrandPalette.textPrimary)
                 }
             }
         }
         .padding(10)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(StrandPalette.surfaceOverlay)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(StrandPalette.hairline, lineWidth: 1)
-        )
-        .shadow(color: .black.opacity(0.4), radius: 10, y: 6)
+        .background(NoopPanelSurface(cornerRadius: 10, elevated: true))
         .frame(width: tooltipWidth, alignment: .leading)
         .position(x: clampedX, y: tooltipHeight / 2 + 8)
         .allowsHitTesting(false)

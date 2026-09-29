@@ -12,9 +12,15 @@ public struct JournalEntry: Equatable, Codable {
     public let question: String
     public let answeredYes: Bool
     public let notes: String?
-    public init(day: String, question: String, answeredYes: Bool, notes: String?) {
+    /// Optional numeric reading for a numeric journal item (e.g. caffeine mg, alcohol units).
+    /// nil for a plain yes/no answer and for every imported WHOOP row (#322). A numeric log writes
+    /// answeredYes=true AND numericValue=v, so the BehaviorInsights with/without split is unchanged.
+    public let numericValue: Double?
+    public init(day: String, question: String, answeredYes: Bool, notes: String?,
+                numericValue: Double? = nil) {
         self.day = day; self.question = question
         self.answeredYes = answeredYes; self.notes = notes
+        self.numericValue = numericValue
     }
 }
 
@@ -34,13 +40,23 @@ public struct WorkoutRow: Equatable, Codable {
     public let distanceM: Double?
     public let zonesJSON: String?
     public let notes: String?
+    public let steps: Int?               // #1058: per-session steps (activity-file foot sports); nil otherwise
+    /// NO DEFAULTS HERE, deliberately (#1444). Swift rebuilds a row field by field, so a defaulted
+    /// parameter lets an existing call site keep compiling while it silently starts writing nothing.
+    /// That is exactly how `steps` was dropped at six sites — two of which persisted the loss — with
+    /// nothing in the read path able to tell "never had steps" from "had steps, then lost them".
+    /// Requiring every field makes each call site state its intent and turns the next added column into
+    /// a compile error instead of silent data loss. Keep it that way: add a field WITHOUT a default and
+    /// fix the call sites the compiler points at. (Kotlin needs no equivalent rule because `copy()`
+    /// carries unmentioned fields — but note that only protects a rebuild whose receiver IS the stored
+    /// row, which is why the Android edit sheet lost `steps` anyway.)
     public init(startTs: Int, endTs: Int, sport: String, source: String, durationS: Double?,
                 energyKcal: Double?, avgHr: Int?, maxHr: Int?, strain: Double?, distanceM: Double?,
-                zonesJSON: String?, notes: String?) {
+                zonesJSON: String?, notes: String?, steps: Int?) {
         self.startTs = startTs; self.endTs = endTs; self.sport = sport; self.source = source
         self.durationS = durationS; self.energyKcal = energyKcal; self.avgHr = avgHr
         self.maxHr = maxHr; self.strain = strain; self.distanceM = distanceM
-        self.zonesJSON = zonesJSON; self.notes = notes
+        self.zonesJSON = zonesJSON; self.notes = notes; self.steps = steps
     }
 }
 
@@ -75,12 +91,56 @@ extension WhoopStore {
             for r in rows {
                 try db.execute(sql: """
                     INSERT INTO journal
-                        (deviceId, day, question, answeredYes, notes)
-                    VALUES (?, ?, ?, ?, ?)
+                        (deviceId, day, question, answeredYes, notes, numericValue)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     ON CONFLICT(deviceId, day, question) DO UPDATE SET
                         answeredYes = excluded.answeredYes,
-                        notes = excluded.notes
-                    """, arguments: [deviceId, r.day, r.question, r.answeredYes ? 1 : 0, r.notes])
+                        notes = excluded.notes,
+                        numericValue = excluded.numericValue
+                    """, arguments: [deviceId, r.day, r.question, r.answeredYes ? 1 : 0, r.notes,
+                                     r.numericValue])
+                n += db.changesCount
+            }
+            return n
+        }
+    }
+
+    /// Delete one journal answer by natural key (the native logging card's "clear"). Source-scoped
+    /// by deviceId, so clearing a native ("noop-journal") answer never removes an identical imported
+    /// row. Returns rows deleted.
+    @discardableResult
+    public func deleteJournal(deviceId: String, day: String, question: String) async throws -> Int {
+        try syncWrite { db in
+            try db.execute(sql: """
+                DELETE FROM journal WHERE deviceId = ? AND day = ? AND question = ?
+                """, arguments: [deviceId, day, question])
+            return db.changesCount
+        }
+    }
+
+    /// Atomically replace a device's journal within a day range (#136): clear [from, to] then upsert
+    /// `rows`, all in ONE transaction, so the wake-day keying fix leaves no pre-fix onset-keyed duplicates
+    /// AND a crash mid-import can't leave the range deleted-but-not-repopulated. Bounded to [from, to] —
+    /// journal outside the imported range is never touched. deviceId-scoped (native log untouched).
+    @discardableResult
+    public func replaceJournalRange(_ rows: [JournalEntry], deviceId: String,
+                                    from: String, to: String) async throws -> Int {
+        try syncWrite { db in
+            try db.execute(sql: """
+                DELETE FROM journal WHERE deviceId = ? AND day >= ? AND day <= ?
+                """, arguments: [deviceId, from, to])
+            var n = 0
+            for r in rows {
+                try db.execute(sql: """
+                    INSERT INTO journal
+                        (deviceId, day, question, answeredYes, notes, numericValue)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(deviceId, day, question) DO UPDATE SET
+                        answeredYes = excluded.answeredYes,
+                        notes = excluded.notes,
+                        numericValue = excluded.numericValue
+                    """, arguments: [deviceId, r.day, r.question, r.answeredYes ? 1 : 0, r.notes,
+                                     r.numericValue])
                 n += db.changesCount
             }
             return n
@@ -96,8 +156,8 @@ extension WhoopStore {
                 try db.execute(sql: """
                     INSERT INTO workout
                         (deviceId, startTs, endTs, sport, source, durationS, energyKcal,
-                         avgHr, maxHr, strain, distanceM, zonesJSON, notes)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         avgHr, maxHr, strain, distanceM, zonesJSON, notes, steps)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(deviceId, startTs, sport) DO UPDATE SET
                         endTs = excluded.endTs,
                         source = excluded.source,
@@ -108,13 +168,28 @@ extension WhoopStore {
                         strain = excluded.strain,
                         distanceM = excluded.distanceM,
                         zonesJSON = excluded.zonesJSON,
-                        notes = excluded.notes
+                        notes = excluded.notes,
+                        steps = excluded.steps
                     """, arguments: [deviceId, r.startTs, r.endTs, r.sport, r.source, r.durationS,
                                      r.energyKcal, r.avgHr, r.maxHr, r.strain, r.distanceM,
-                                     r.zonesJSON, r.notes])
+                                     r.zonesJSON, r.notes, r.steps])
                 n += db.changesCount
             }
             return n
+        }
+    }
+
+    /// Delete one source's workouts of a given sport whose startTs is in [from, to]. Automatic
+    /// detected-workout reconciliation no longer calls this; explicit edit/dismiss paths still do.
+    /// Returns rows deleted. Port of Android WhoopDao.deleteWorkoutsBySport (#78/#2187).
+    @discardableResult
+    public func deleteWorkouts(deviceId: String, sport: String, from: Int, to: Int) async throws -> Int {
+        try syncWrite { db in
+            try db.execute(sql: """
+                DELETE FROM workout
+                WHERE deviceId = ? AND sport = ? AND startTs >= ? AND startTs <= ?
+                """, arguments: [deviceId, sport, from, to])
+            return db.changesCount
         }
     }
 
@@ -153,14 +228,15 @@ extension WhoopStore {
     public func journalEntries(deviceId: String, from: String, to: String) async throws -> [JournalEntry] {
         try syncRead { db in
             try Row.fetchAll(db, sql: """
-                SELECT day, question, answeredYes, notes FROM journal
+                SELECT day, question, answeredYes, notes, numericValue FROM journal
                 WHERE deviceId = ? AND day >= ? AND day <= ?
                 ORDER BY day ASC, question ASC
                 """, arguments: [deviceId, from, to])
                 .map {
                     JournalEntry(day: $0["day"], question: $0["question"],
                                  answeredYes: ($0["answeredYes"] as Int) != 0,
-                                 notes: $0["notes"])
+                                 notes: $0["notes"],
+                                 numericValue: $0["numericValue"])
                 }
         }
     }
@@ -170,7 +246,7 @@ extension WhoopStore {
         try syncRead { db in
             try Row.fetchAll(db, sql: """
                 SELECT startTs, endTs, sport, source, durationS, energyKcal, avgHr, maxHr,
-                       strain, distanceM, zonesJSON, notes FROM workout
+                       strain, distanceM, zonesJSON, notes, steps FROM workout
                 WHERE deviceId = ? AND startTs >= ? AND startTs <= ?
                 ORDER BY startTs ASC LIMIT ?
                 """, arguments: [deviceId, from, to, limit])
@@ -179,8 +255,21 @@ extension WhoopStore {
                                source: $0["source"], durationS: $0["durationS"],
                                energyKcal: $0["energyKcal"], avgHr: $0["avgHr"], maxHr: $0["maxHr"],
                                strain: $0["strain"], distanceM: $0["distanceM"],
-                               zonesJSON: $0["zonesJSON"], notes: $0["notes"])
+                               zonesJSON: $0["zonesJSON"], notes: $0["notes"], steps: $0["steps"])
                 }
+        }
+    }
+
+    /// #1058: sum per-session `steps` over one source's workouts whose startTs is in [from, to). Used to
+    /// recompute an activity-file day's step total from ALL its sessions, so a second file on the same day
+    /// adds rather than clobbers — and re-importing a file is idempotent (its row's steps are replaced,
+    /// not re-added, by `upsertWorkouts`). Returns 0 when no session in the range carried steps.
+    public func sumWorkoutSteps(deviceId: String, from: Int, to: Int) async throws -> Int {
+        try syncRead { db in
+            try Int.fetchOne(db, sql: """
+                SELECT COALESCE(SUM(steps), 0) FROM workout
+                WHERE deviceId = ? AND steps IS NOT NULL AND startTs >= ? AND startTs < ?
+                """, arguments: [deviceId, from, to]) ?? 0
         }
     }
 

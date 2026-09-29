@@ -11,6 +11,9 @@ public struct DecodedField: Codable, Equatable {
 }
 
 public struct ParsedFrame: Codable, Equatable {
+    /// The FULL integrity verdict of `verifyFrame` — header checksum, payload CRC32 and structural
+    /// length together. It means "this frame is intact", NOT "this frame could be parsed": a frame
+    /// with a broken header still carries its decoded `typeName` and `parsed` fields for inspection.
     public let ok: Bool
     public let typeName: String
     public let seq: Int?
@@ -20,45 +23,96 @@ public struct ParsedFrame: Codable, Equatable {
     public let rawHex: String
     public let fields: [DecodedField]
     public let parsed: [String: ParsedValue]
+    /// Why `ok` is false, carried here so a consumer can report the cause from the value it was
+    /// handed — the frame is parsed exactly once and the result threaded on, so a consumer that had
+    /// to verify again to learn the reason would break that invariant.
+    public let rejectReason: FrameRejectReason
+
+    public init(ok: Bool, typeName: String, seq: Int?, cmdName: String?, crcOK: Bool?,
+                lenBytes: Int, rawHex: String, fields: [DecodedField],
+                parsed: [String: ParsedValue], rejectReason: FrameRejectReason = .none) {
+        self.ok = ok
+        self.typeName = typeName
+        self.seq = seq
+        self.cmdName = cmdName
+        self.crcOK = crcOK
+        self.lenBytes = lenBytes
+        self.rawHex = rawHex
+        self.fields = fields
+        self.parsed = parsed
+        self.rejectReason = rejectReason
+    }
+
+    /// Decoding tolerates a MISSING `rejectReason` and defaults it to `.none`. A parse result is
+    /// serialised into capture files and read back from hand-written fixtures; a strictly required
+    /// new key would make every one of those older documents fail to decode.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        ok = try c.decode(Bool.self, forKey: .ok)
+        typeName = try c.decode(String.self, forKey: .typeName)
+        seq = try c.decodeIfPresent(Int.self, forKey: .seq)
+        cmdName = try c.decodeIfPresent(String.self, forKey: .cmdName)
+        crcOK = try c.decodeIfPresent(Bool.self, forKey: .crcOK)
+        lenBytes = try c.decode(Int.self, forKey: .lenBytes)
+        rawHex = try c.decode(String.self, forKey: .rawHex)
+        fields = try c.decode([DecodedField].self, forKey: .fields)
+        parsed = try c.decode([String: ParsedValue].self, forKey: .parsed)
+        rejectReason = try c.decodeIfPresent(FrameRejectReason.self, forKey: .rejectReason) ?? .none
+    }
 }
 
 // MARK: - low-level readers (LE), nil when out of range (mirrors interpreter._read)
+//
+// `limit` is the EXCLUSIVE upper bound for a named inner field (D7): the minimum of where the CRC32
+// trailer starts and how many bytes the frame actually has. It is a required argument, not a
+// defaulted one, so adding a field read without deciding its bound does not compile. Callers derive
+// it with `payloadLimit(_:trailerStart:)`, which never returns more than `f.count`, so passing it
+// here is at least as safe as the old bound and never reads a byte that is not there.
 
-@inline(__always) private func readU8(_ f: [UInt8], _ off: Int) -> Int? {
-    off + 1 <= f.count ? Int(f[off]) : nil
+@inline(__always) private func readU8(_ f: [UInt8], _ off: Int, _ limit: Int) -> Int? {
+    off >= 0 && off + 1 <= limit ? Int(f[off]) : nil
 }
-@inline(__always) private func readU16(_ f: [UInt8], _ off: Int) -> Int? {
-    off + 2 <= f.count ? Int(f[off]) | (Int(f[off + 1]) << 8) : nil
+@inline(__always) private func readU16(_ f: [UInt8], _ off: Int, _ limit: Int) -> Int? {
+    off >= 0 && off + 2 <= limit ? Int(f[off]) | (Int(f[off + 1]) << 8) : nil
 }
-@inline(__always) private func readU32(_ f: [UInt8], _ off: Int) -> Int? {
-    guard off + 4 <= f.count else { return nil }
+@inline(__always) private func readU32(_ f: [UInt8], _ off: Int, _ limit: Int) -> Int? {
+    guard off >= 0, off + 4 <= limit else { return nil }
     return Int(f[off]) | (Int(f[off + 1]) << 8) | (Int(f[off + 2]) << 16) | (Int(f[off + 3]) << 24)
 }
-@inline(__always) private func readI16(_ f: [UInt8], _ off: Int) -> Int? {
-    guard off + 2 <= f.count else { return nil }
+@inline(__always) private func readI16(_ f: [UInt8], _ off: Int, _ limit: Int) -> Int? {
+    guard off >= 0, off + 2 <= limit else { return nil }
     let raw = UInt16(f[off]) | (UInt16(f[off + 1]) << 8)
     return Int(Int16(bitPattern: raw))
 }
 
-@inline(__always) private func readI32(_ f: [UInt8], _ off: Int) -> Int? {
-    guard off + 4 <= f.count else { return nil }
-    let raw = UInt32(f[off]) | (UInt32(f[off + 1]) << 8) | (UInt32(f[off + 2]) << 16) | (UInt32(f[off + 3]) << 24)
-    return Int(Int32(bitPattern: raw))
-}
-
-@inline(__always) private func readF32(_ f: [UInt8], _ off: Int) -> Double? {
-    guard off + 4 <= f.count else { return nil }
+@inline(__always) private func readF32(_ f: [UInt8], _ off: Int, _ limit: Int) -> Double? {
+    guard off >= 0, off + 4 <= limit else { return nil }
     let bits = UInt32(f[off]) | (UInt32(f[off + 1]) << 8) | (UInt32(f[off + 2]) << 16) | (UInt32(f[off + 3]) << 24)
     return Double(Float(bitPattern: bits))   // float32 -> Double is exact, no rounding
 }
 
-/// Read a schema dtype at off; returns the integer value or nil if out of range.
-private func readDType(_ f: [UInt8], _ off: Int, _ dtype: String) -> Int? {
+/// The exclusive upper bound for reading named inner fields out of `frame` (D7).
+///
+/// It is the MINIMUM of the CRC32 trailer's start and the frame's real size — not one or the other.
+/// The trailer start follows from the DECLARED length, which on a truncated frame points past the
+/// last byte we hold, so using it alone would read off the end of the buffer; using only the frame
+/// size is what let a frame at the family minimum have its own checksum trailer decoded as a
+/// sequence number, a command byte or a metadata type. A field counts as present when its start plus
+/// its length does not EXCEED this bound: the smallest real WHOOP 4.0 history frame is 11 bytes with
+/// its trailer at 7, and its metadata type occupies precisely the last payload byte.
+@inline(__always)
+private func payloadLimit(_ frame: [UInt8], trailerStart: Int?) -> Int {
+    guard let trailerStart = trailerStart else { return frame.count }
+    return min(max(0, trailerStart), frame.count)
+}
+
+/// Read a schema dtype at off, bounded by `limit`; nil when the field does not fit.
+private func readDType(_ f: [UInt8], _ off: Int, _ dtype: String, _ limit: Int) -> Int? {
     switch dtype {
-    case "u8": return readU8(f, off)
-    case "u16": return readU16(f, off)
-    case "u32": return readU32(f, off)
-    case "i16": return readI16(f, off)
+    case "u8": return readU8(f, off, limit)
+    case "u16": return readU16(f, off, limit)
+    case "u32": return readU32(f, off, limit)
+    case "i16": return readI16(f, off, limit)
     default: return nil
     }
 }
@@ -128,20 +182,25 @@ public func parseFrame(_ frame: [UInt8], collectFields: Bool = false) -> ParsedF
     // PuffinCapture, field-asserting tests) do — so on a 1Hz stream or an offload burst this skips a
     // per-byte `String(format:)` allocation pass whose result was discarded.
     let rawHex = collectFields ? frame.map { String(format: "%02x", $0) }.joined() : ""
-    if frame.count < 8 || frame[0] != 0xAA {
+    let check = verifyFrame(frame)
+    // Below the family minimum there is no inner record at all — every offset a field would use
+    // lands in the checksum trailer — so nothing is decoded, not even a packet type.
+    if frame.count < FrameLimits.whoop4MinimumFrameBytes || frame[0] != 0xAA {
         return ParsedFrame(ok: false, typeName: "INVALID/FRAGMENT", seq: nil, cmdName: nil,
                            crcOK: nil, lenBytes: frame.count, rawHex: rawHex,
-                           fields: [], parsed: [:])
+                           fields: [], parsed: [:], rejectReason: check.reason)
     }
 
     let schema = loadSchema()
-    let check = verifyFrame(frame)
     let length = check.length
     let crcOK = check.crc32OK
+    // D7: named inner fields come only from payload bytes. On WHOOP 4.0 the CRC32 trailer starts at
+    // the declared length.
+    let limit = payloadLimit(frame, trailerStart: length)
 
     let t = Int(frame[4])
     let typeName = schema.typeName(t)
-    let seq = Int(frame[5])
+    let seq = readU8(frame, 5, limit)
 
     let fb = FieldBuilder(frame, collectFields: collectFields)
     // envelope
@@ -149,17 +208,17 @@ public func parseFrame(_ frame: [UInt8], collectFields: Bool = false) -> ParsedF
     fb.add(1, 2, "length", "frame", value: length.map { .int($0) })
     fb.add(3, 1, "crc8", "frame", value: .string(String(format: "0x%02X", frame[3])))
     fb.add(4, 1, "packet_type", "frame", value: .string(typeName))
-    fb.add(5, 1, "seq", "frame", value: .int(Int(frame[5])))
+    if let seq = seq { fb.add(5, 1, "seq", "frame", value: .int(seq)) }
 
     let spec = schema.packet(forType: t)
     if spec == nil {
-        fb.add(6, 1, "cmd", "cmd", value: frame.count > 6 ? .int(Int(frame[6])) : nil)
+        fb.add(6, 1, "cmd", "cmd", value: readU8(frame, 6, limit).map { .int($0) })
         if let length = length { fb.region(7, length, "payload", "unknown") }
     } else {
         // static fields from schema
         for fld in spec!.fields {
             guard let dtype = fld.dtype else { continue }
-            guard let val = readDType(frame, fld.off, dtype) else { continue }
+            guard let val = readDType(frame, fld.off, dtype, limit) else { continue }
             let value: ParsedValue
             if let enumKey = fld.`enum` {
                 value = .string(schema.enumName(enumKey, val))
@@ -182,12 +241,14 @@ public func parseFrame(_ frame: [UInt8], collectFields: Bool = false) -> ParsedF
                note: check.crc32OK == true ? "OK" : "MISMATCH")
     }
 
-    let cmdByte = frame.count > 6 ? Int(frame[6]) : 0
+    let cmdByte = readU8(frame, 6, limit) ?? 0
     let cmdName = (t == 35 || t == 36) ? schema.enumName("CommandNumber", cmdByte) : nil
 
-    return ParsedFrame(ok: true, typeName: typeName, seq: seq, cmdName: cmdName,
+    // `ok` is the verifier's full verdict, not a constant: the fields above stay decoded so an
+    // inspector can still read a broken frame, but no consumer may mistake that for integrity.
+    return ParsedFrame(ok: check.ok, typeName: typeName, seq: seq, cmdName: cmdName,
                        crcOK: crcOK, lenBytes: frame.count, rawHex: rawHex,
-                       fields: fb.fields, parsed: fb.parsed)
+                       fields: fb.fields, parsed: fb.parsed, rejectReason: check.reason)
 }
 
 /// #47: the packet type NAME only — NO CRC verify, NO FieldBuilder — for hot-path pre-filters that just
@@ -195,18 +256,25 @@ public func parseFrame(_ frame: [UInt8], collectFields: Bool = false) -> ParsedF
 /// multi-minute offload of thousands of type-47 records that only ever act on rare EVENT frames, this skips
 /// the redundant decode for the ~99% that aren't. Mirrors `parseFrame`'s family split EXACTLY — the inner
 /// type byte is at [4] on WHOOP4 and [8] on 5/MG, with the same lookup each uses (`schema.typeName` /
-/// `canonicalTypeName`). Returns nil for a frame too short / wrong SOF — which `parseFrame` would also mark
-/// INVALID (never "EVENT") — so a pre-filter guarded on `== "EVENT"` is byte-identical to the full-parse
-/// guard.
+/// `canonicalTypeName`), and it uses the same family minimum, so a frame this returns nil for is exactly a
+/// frame `parseFrame` marks INVALID.
+///
+/// What this does NOT tell you is whether the frame is INTACT. It never was a CRC check, but it used to be
+/// interchangeable with the full parse for a caller that only asked "is the type EVENT?", because
+/// `parseFrame` reported success for anything it could read. `parseFrame` now reports the verifier's
+/// verdict, so the two agree on the type NAME and diverge on `ok`: this is a type peek, and a caller that
+/// must not act on a corrupt frame has to parse and check the verdict.
 public func frameTypeName(_ frame: [UInt8], family: DeviceFamily) -> String? {
     guard frame.first == 0xAA else { return nil }
     let schema = loadSchema()
     switch family {
     case .whoop4:
-        guard frame.count >= 8 else { return nil }        // parseFrame's `count < 8` INVALID guard
+        // parseFrame's INVALID guard.
+        guard frame.count >= FrameLimits.whoop4MinimumFrameBytes else { return nil }
         return schema.typeName(Int(frame[4]))
     case .whoop5:
-        guard frame.count >= 12 else { return nil }       // parseFrameWhoop5's `count < 12` INVALID guard
+        // parseFrameWhoop5's INVALID guard.
+        guard frame.count >= FrameLimits.whoop5MinimumFrameBytes else { return nil }
         return canonicalTypeName(Int(frame[8]), schema: schema)
     }
 }
@@ -233,23 +301,27 @@ public func parseFrame(_ frame: [UInt8], family: DeviceFamily, collectFields: Bo
 private func parseFrameWhoop5(_ frame: [UInt8], collectFields: Bool) -> ParsedFrame {
     // D#969: gated identically to parseFrame — build the hex only when a consumer reads it.
     let rawHex = collectFields ? frame.map { String(format: "%02x", $0) }.joined() : ""
-    // Minimum whoop5 frame: 8 header bytes + 1 inner (type) + 4 CRC32 trailer.
-    if frame.count < 12 || frame[0] != 0xAA {
+    let check = verifyFrame(frame, family: .whoop5)
+    // Minimum whoop5 frame: 8 header bytes + 1 payload byte + 4 CRC32 trailer. Below that, the type
+    // byte at [8] would be the first byte of the frame's own CRC32 trailer, so nothing is decoded.
+    if frame.count < FrameLimits.whoop5MinimumFrameBytes || frame[0] != 0xAA {
         return ParsedFrame(ok: false, typeName: "INVALID/FRAGMENT", seq: nil, cmdName: nil,
                            crcOK: nil, lenBytes: frame.count, rawHex: rawHex,
-                           fields: [], parsed: [:])
+                           fields: [], parsed: [:], rejectReason: check.reason)
     }
 
     let schema = loadSchema()
-    let check = verifyFrame(frame, family: .whoop5)
     let declaredLength = check.length            // payload + 4 (CRC32)
     let crcOK = check.crc32OK
 
     // Inner record starts at offset 8: [type][seq][cmd][data…].
     let innerStart = 8
+    let payloadEnd = declaredLength.map { ($0 + 8) - 4 }   // start of CRC32 trailer
+    // D7: named inner fields come only from payload bytes, bounded by the trailer AND the real size.
+    let limit = payloadLimit(frame, trailerStart: payloadEnd)
     let t = Int(frame[innerStart])
     let typeName = canonicalTypeName(t, schema: schema)
-    let seq = frame.count > innerStart + 1 ? Int(frame[innerStart + 1]) : nil
+    let seq = readU8(frame, innerStart + 1, limit)
 
     let fb = FieldBuilder(frame, collectFields: collectFields)
     // envelope
@@ -267,44 +339,53 @@ private func parseFrameWhoop5(_ frame: [UInt8], collectFields: Bool) -> ParsedFr
     // byte 8 here vs byte 4 on 4.0, so every field sits at its 4.0 offset + `delta`. Verified on real
     // hardware for REALTIME_DATA (type 40) — HR, R-R and the unix timestamp land exactly at +4 (HR
     // matched the standard 2A37 profile to ~0.4 bpm). We reuse the 4.0 schema with that shift.
-    let cmdByte = frame.count > innerStart + 2 ? Int(frame[innerStart + 2]) : 0
+    let cmdByte = readU8(frame, innerStart + 2, limit) ?? 0
     let delta = innerStart - 4                       // = 4
-    let payloadEnd = declaredLength.map { ($0 + 8) - 4 }   // start of CRC32 trailer
     let spec = schema.packet(forType: t)
     if spec == nil {
         fb.add(innerStart + 2, 1, "cmd", "cmd",
-               value: frame.count > innerStart + 2 ? .int(cmdByte) : nil)
+               value: readU8(frame, innerStart + 2, limit).map { .int($0) })
         if let payloadEnd = payloadEnd, innerStart + 3 < payloadEnd, payloadEnd <= frame.count {
             fb.region(innerStart + 3, payloadEnd, "payload", "unknown")
         }
     } else {
         // Static schema fields at the 4.0 offset + delta.
         for fld in spec!.fields {
-            guard let dtype = fld.dtype, let val = readDType(frame, fld.off + delta, dtype) else { continue }
+            guard let dtype = fld.dtype,
+                  let val = readDType(frame, fld.off + delta, dtype, limit) else { continue }
             let value: ParsedValue = fld.`enum`.map { .string(schema.enumName($0, val)) } ?? .int(val)
             fb.add(fld.off + delta, fld.len, fld.name, fld.cat, value: value, note: fld.note)
         }
         if spec!.post == "realtime_data" {
             // Verified variable-length extension: REALTIME_DATA R-R intervals (rr_count @13+delta,
             // intervals @14+delta…), the same shape as 4.0 shifted by +4.
-            let rrn = readDType(frame, 13 + delta, "u8") ?? 0
+            let rrn = readDType(frame, 13 + delta, "u8", limit) ?? 0
             var rrs: [Int] = []
+            var rawTicks: [Int] = []
             for i in 0..<rrn {
                 let off = 14 + delta + i * 2
-                if let v = readDType(frame, off, "u16"), v > 0 {
-                    fb.add(off, 2, "rr[\(i)]", "rr", value: .int(v), note: "ms")
-                    rrs.append(v)
+                guard off + 2 <= limit else { break }
+                if let v = readDType(frame, off, "u16", limit), v > 0 {
+                    let ms = Whoop5RR.milliseconds(ticks: UInt16(v))
+                    fb.add(off, 2, "rr[\(i)]", "rr", value: .int(ms), note: "ms from 1/1024 s ticks")
+                    rawTicks.append(v)
+                    rrs.append(ms)
                 }
             }
             fb.parsed["rr_intervals"] = .intArray(rrs)
+            fb.parsed["rr_raw_ticks"] = .intArray(rawTicks)
+            fb.parsed["rr_source_channel"] = .int(RRSourceChannel.whoop5Realtime.rawValue)
         } else if spec!.post == "historical_data" {
-            decodeWhoop5Historical(frame, fb: fb, payloadEnd: payloadEnd)
+            decodeWhoop5Historical(frame, fb: fb, payloadEnd: payloadEnd, limit: limit)
         } else if spec!.post == "metadata" {
-            decodeWhoop5Metadata(frame, fb: fb)
+            decodeWhoop5Metadata(frame, fb: fb, limit: limit)
         } else if spec!.post == "command_response" {
-            decodeWhoop5CommandResponse(frame, fb: fb, schema: schema, payloadEnd: payloadEnd)
+            decodeWhoop5CommandResponse(frame, fb: fb, schema: schema, payloadEnd: payloadEnd,
+                                        limit: limit)
         } else if spec!.post == "event" {
-            decodeWhoop5Event(frame, fb: fb, schema: schema)
+            decodeWhoop5Event(frame, fb: fb, schema: schema, limit: limit)
+        } else if spec!.post == "console_logs" {
+            decodeWhoop5ConsoleLogs(frame, fb: fb, payloadEnd: payloadEnd, limit: limit)
         } else if let payloadEnd = payloadEnd, innerStart + 3 < payloadEnd, payloadEnd <= frame.count {
             // Other types: static fields decoded above; the remaining variable body is kept raw —
             // its 4.0 post-hook awaits per-type 5.0 hardware verification before we apply it at +4.
@@ -324,9 +405,30 @@ private func parseFrameWhoop5(_ frame: [UInt8], collectFields: Bool) -> ParsedFr
     let cmdName = (t == 35 || t == 36 || t == PuffinPacketType.puffinCommandResponse)
         ? schema.enumName("CommandNumber", cmdByte) : nil
 
-    return ParsedFrame(ok: true, typeName: typeName, seq: seq, cmdName: cmdName,
+    // The verifier's verdict, not a constant — see the WHOOP 4.0 parser for the reasoning.
+    return ParsedFrame(ok: check.ok, typeName: typeName, seq: seq, cmdName: cmdName,
                        crcOK: crcOK, lenBytes: frame.count, rawHex: rawHex,
-                       fields: fb.fields, parsed: fb.parsed)
+                       fields: fb.fields, parsed: fb.parsed, rejectReason: check.reason)
+}
+
+/// The WHOOP 5/MG type-47 `hist_version` values `decodeWhoop5Historical` has a REAL field map for.
+/// Every other version falls through to the "unmapped layout" branch, which decodes nothing and only
+/// describes the payload as an opaque region.
+///
+/// This is the single source of truth for "does NOOP understand this layout": the dispatch `switch` in
+/// `decodeWhoop5Historical` reads nothing else, and `rejectedHistoricalRecords` uses it to decide which
+/// records must be archived raw. Keeping one set means the two can never disagree — the failure mode
+/// this replaced was a record from an unmapped layout that happened to decode a plausible `unix` and
+/// `gravity_x`/`heart_rate` slipping past the archive filter, so its bytes were kept nowhere at all.
+/// `Whoop5HistoricalLayoutMapTests` pins the set against the decoder's actual behaviour.
+public let mappedWhoop5HistoricalVersions: Set<Int> = [18, 20, 21, 26]
+
+/// True when `frame` is a WHOOP 5/MG type-47 record whose layout version has NO field map — the
+/// records that reach the unmapped branch of `decodeWhoop5Historical` and are therefore never
+/// re-derivable from anything NOOP stores. Non-type-47 and too-short frames are false.
+public func isUnmappedWhoop5HistoricalRecord(_ frame: [UInt8]) -> Bool {
+    guard frame.count > 9, Int(frame[8]) == 47 else { return false }
+    return !mappedWhoop5HistoricalVersions.contains(Int(frame[9]))
 }
 
 /// Decode a WHOOP 5.0 HISTORICAL_DATA (type 47) DSP biometric record.
@@ -345,104 +447,134 @@ private func parseFrameWhoop5(_ frame: [UInt8], collectFields: Bool) -> ParsedFr
 /// PPG / SpO₂ / skin-temp live further in the 124-byte record but lack on-device ground truth, so
 /// they are left as a raw region rather than guessed (project rule: real captures, never invented
 /// offsets).
-private func decodeWhoop5Historical(_ frame: [UInt8], fb: FieldBuilder, payloadEnd: Int?) {
-    let version = frame.count > 9 ? Int(frame[9]) : -1
+private func decodeWhoop5Historical(_ frame: [UInt8], fb: FieldBuilder, payloadEnd: Int?,
+                                    limit: Int) {
+    // The layout version is the inner record's seq slot: a named inner field, so it is bounded like
+    // any other. Out of bounds it stays -1, which routes the record to the unmapped branch below.
+    let version = readU8(frame, 9, limit) ?? -1
     fb.parsed["hist_version"] = .int(version)
-    fb.add(9, 1, "hist_version", "meta", value: .int(version))
-    if version == 26 {
-        decodeWhoop5HistoricalV26(frame, fb: fb)
+    if version >= 0 { fb.add(9, 1, "hist_version", "meta", value: .int(version)) }
+    // One dispatch, one list: every `case` here must appear in `mappedWhoop5HistoricalVersions` and
+    // vice versa, because that set is what decides whether a record gets archived raw. A `switch`
+    // rather than the old if-chain so the mapped versions are readable in one place.
+    switch version {
+    case 26:
+        decodeWhoop5HistoricalV26(frame, fb: fb, limit: limit)
         return
-    }
-    if version == 20 || version == 21 {
-        decodeWhoop5HistoricalV2021(frame, fb: fb, version: version, payloadEnd: payloadEnd)
+    case 20, 21:
+        decodeWhoop5HistoricalV2021(frame, fb: fb, version: version, payloadEnd: payloadEnd,
+                                    limit: limit)
         return
-    }
-    guard version == 18 else {
-        // Unknown historical layout — describe it faithfully without inventing offsets.
+    case 18:
+        break   // falls through to the v18 field decode below
+    default:
+        // Unknown historical layout — describe it faithfully without inventing offsets. The bytes are
+        // NOT lost: `rejectedHistoricalRecords` archives every record that lands here (#77 / #91).
         if let payloadEnd = payloadEnd, 11 < payloadEnd, payloadEnd <= frame.count {
             fb.region(11, payloadEnd, "HISTORICAL_DATA v\(version) (unmapped layout)", "unknown")
         }
         return
     }
-    if let idx = readDType(frame, 11, "u32") {
+    if let idx = readDType(frame, 11, "u32", limit) {
         // A per-record counter: +1 every record and independent of unix (it advances across gaps);
         // observed identical on two straps. @11 is only the low byte — read the full u32 LE.
         fb.add(11, 4, "record_index", "meta", value: .int(idx), note: "per-record counter")
     }
-    if let unix = readDType(frame, 15, "u32") {
+    if let unix = readDType(frame, 15, "u32", limit) {
         fb.add(15, 4, "unix", "time", value: .int(unix), note: "real unix seconds")
     }
-    if let hr = readDType(frame, 22, "u8") {
+    if let hr = readDType(frame, 22, "u8", limit) {
         fb.add(22, 1, "heart_rate", "hr", value: .int(hr), note: "bpm")
     }
-    let rrn = readDType(frame, 23, "u8") ?? 0
+    let rrn = readDType(frame, 23, "u8", limit) ?? 0
     fb.add(23, 1, "rr_count", "rr", value: .int(rrn))
     var rrs: [Int] = []
+    var rawTicks: [Int] = []
     for i in 0..<min(rrn, 4) {
         let off = 24 + i * 2
-        if let v = readDType(frame, off, "u16"), v > 0 {
-            fb.add(off, 2, "rr[\(i)]", "rr", value: .int(v), note: "ms")
-            rrs.append(v)
+        guard off + 2 <= limit else { break }
+        if let v = readDType(frame, off, "u16", limit), v > 0 {
+            let ms = Whoop5RR.milliseconds(ticks: UInt16(v))
+            fb.add(off, 2, "rr[\(i)]", "rr", value: .int(ms), note: "ms from 1/1024 s ticks")
+            rawTicks.append(v)
+            rrs.append(ms)
         }
     }
     fb.parsed["rr_intervals"] = .intArray(rrs)
-    // Bytes adjacent to the HR/R-R fields, read off real frames. @36 / 256 tracks the integer hr@22 to
-    // sub-bpm (corr 0.989 over ~258k records) — a higher-precision heart rate; the others are raw.
-    if let v = readDType(frame, 33, "u8") {
+    fb.parsed["rr_raw_ticks"] = .intArray(rawTicks)
+    fb.parsed["rr_source_channel"] = .int(RRSourceChannel.whoop5Historical.rawValue)
+    // Bytes adjacent to the HR/R-R fields, read off real frames: @36 is a FLAG byte and @37 a duplicate
+    // heart rate — not the two halves of one fixed-point HR (see below); the others are raw.
+    if let v = readDType(frame, 33, "u8", limit) {
         fb.add(33, 1, "cardiac_flags", "cardiac", value: .int(v), note: "raw byte near the HR fields")
     }
-    if let v = readDType(frame, 36, "u16") {
-        fb.add(36, 2, "hr_fixed_8_8", "hr", value: .int(v), note: "higher-precision HR: bpm = value/256")
+    // @36 was read as the low half of a u16 `hr_fixed_8_8` with bpm = value/256. Over 18,650 real v18
+    // records that model is false. Bit 4 is NEVER set (0/18,650 — a genuine 8.8 fraction sets it ~50% of
+    // the time, and it is the ONLY bit never set); 95.02% of values land in 0x80–0x8F where uniform would
+    // be 6.25%, over just 40 distinct values, sd 26.5 vs 73.9 for a uniform byte. The "corr 0.989 with
+    // hr@22" that justified the old name was circular — the u16 is literally hr@22 (carried at @37) plus
+    // this flag byte over 256, so the residual is a flat +0.504 ± 0.189. Bit 7 reads as a VALIDITY bit:
+    // with it clear (n=748) rr_count == 0 in 70.32% of records vs 19.82% with it set, and the @108/@109
+    // sentinel fires in 69.65% vs 1.32%. The remaining bits are unpinned, so the byte ships raw.
+    if let v = readDType(frame, 36, "u8", limit) {
+        fb.add(36, 1, "hr_quality_flags", "hr", value: .int(v),
+               note: "flag byte (raw); bit7 = HR/R-R valid, bit4 never set; NOT a fixed-point HR")
     }
-    if let v = readDType(frame, 38, "u16") {
+    // @37 duplicates heart_rate@22 — equal in 99.575% of records (18,523/18,602), differing only by
+    // -6…+2, and it only tracks HR while @36 bit7 is set (99.74% exact vs 94.12% when clear).
+    if let v = readDType(frame, 37, "u8", limit) {
+        fb.add(37, 1, "heart_rate_alt", "hr", value: .int(v),
+               note: "bpm; duplicate of heart_rate@22 (99.6% exact); trust only when hr_quality_flags bit7 is set")
+    }
+    if let v = readDType(frame, 38, "u16", limit) {
         fb.add(38, 2, "rr_packed", "rr", value: .int(v), note: "raw u16 near the R-R fields; meaning not pinned")
     }
-    if let v = readDType(frame, 40, "u8") {
+    if let v = readDType(frame, 40, "u8", limit) {
         fb.add(40, 1, "cardiac_status", "cardiac", value: .int(v), note: "raw status-like byte near the HR fields")
     }
     for (name, off) in [("gravity_x", 45), ("gravity_y", 49), ("gravity_z", 53)] {
-        if let d = readF32(frame, off) {
+        if let d = readF32(frame, off, limit) {
             fb.add(off, 4, name, "accel", value: .double(d), note: "g")
         }
     }
     // Per-second fields beyond HR/gravity, each gated to a physically-real range and cross-validated
     // against real v18 frames (worn vs off-wrist), so a wrong offset on an unmapped layout stores
     // nothing rather than garbage (the data is the arbiter).
-    if let d = readF32(frame, 41), d.isFinite, (0...8).contains(d) {
+    if let d = readF32(frame, 41, limit), d.isFinite, (0...8).contains(d) {
         fb.add(41, 4, "dynamic_acceleration", "accel", value: .double(d), note: "g, gravity-removed magnitude")
     }
-    if let raw = readDType(frame, 57, "u16") {
+    if let raw = readDType(frame, 57, "u16", limit) {
         // Cumulative motion/step counter — monotonic across a stream (validated downstream), no midnight
         // reset. Single-frame value is unbounded so it carries no physical gate here.
         fb.add(57, 2, "step_motion_counter", "activity", value: .int(raw), note: "cumulative motion counter")
     }
-    if let cad = readDType(frame, 59, "u8") {
+    if let cad = readDType(frame, 59, "u8", limit) {
         // A per-step cadence-like byte between the step counter and @63: never 0, and lower when moving
         // faster (still > walk > run in the data). Raw — no unit asserted.
         fb.add(59, 1, "step_cadence", "activity", value: .int(cad), note: "cadence-like byte (raw)")
     }
-    if let wear = readDType(frame, 63, "u8"), (0...2).contains(wear) {
+    if let wear = readDType(frame, 63, "u8", limit), (0...2).contains(wear) {
         fb.add(63, 1, "motion_wear_quality", "quality", value: .int(wear), note: "0=still/good, 1, 2=poor contact")
     }
     // @63 also reads as a small validated ACTIVITY-CLASS enum (community finding, #316): 0=still, 1=walk,
     // 2=run, 0xFF=invalid. A lightweight, no-cloud per-record activity readout that rides alongside the
     // step counter. Only the four known codes are surfaced — anything else (incl. 0xFF) stores nothing so
     // an unmapped firmware can't inject garbage.
-    if let cls = readDType(frame, 63, "u8"), cls == 0 || cls == 1 || cls == 2 {
+    if let cls = readDType(frame, 63, "u8", limit), cls == 0 || cls == 1 || cls == 2 {
         fb.add(63, 1, "activity_class", "activity", value: .int(cls), note: "0=still, 1=walk, 2=run (0xFF=invalid)")
     }
     // Two auxiliary thermal channels just before skin_temp. Each is a signed i16 whose value/10 reads as
     // °C, tracks skin_temp@73 closely (corr ~0.92 and ~0.97 across the captured corpus) and follows the
     // same diurnal curve. Gated to a plausible thermal range so a wrong offset stores nothing.
-    if let v = readI16(frame, 69), (0...60).contains(Double(v) / 10.0) {
+    if let v = readI16(frame, 69, limit), (0...60).contains(Double(v) / 10.0) {
         fb.add(69, 2, "temp_aux_1_raw", "temp", value: .int(v),
                note: "secondary temperature channel; °C = value/10; tracks skin_temp (corr ~0.92) with the same diurnal curve")
     }
-    if let v = readI16(frame, 71), (0...60).contains(Double(v) / 10.0) {
+    if let v = readI16(frame, 71, limit), (0...60).contains(Double(v) / 10.0) {
         fb.add(71, 2, "temp_aux_2_raw", "temp", value: .int(v),
                note: "secondary temperature channel; °C = value/10; tracks skin_temp (corr ~0.97) with the same diurnal curve")
     }
-    if let raw = readDType(frame, 73, "u16") {
+    if let raw = readDType(frame, 73, "u16", limit) {
         // Skin temperature from a digital skin-temperature sensor. Emitted as the RAW u16 register
         // (`skin_temp_raw`, consumed by the decode-features store) to stay scale-agnostic; °C = raw/100
         // is the divisor that yields physiological worn skin temps (median ~34 °C across two straps;
@@ -456,20 +588,20 @@ private func decodeWhoop5Historical(_ frame: [UInt8], fb: FieldBuilder, payloadE
                    note: "raw register; °C = raw/100 (≈30.6 worn / ~22.5 ambient; on-wrist warming curve)")
         }
     }
-    if let raw = readDType(frame, 75, "u16") {
+    if let raw = readDType(frame, 75, "u16", limit) {
         // A 16-bit status word. NOT a deep-sleep marker: across ~258k records its low nibble is 0 and it
         // occurs as often awake as asleep (the community "80 = deep" reading is a misread).
         fb.add(75, 2, "status_word", "status", value: .int(raw), note: "packed status word; not deep-sleep")
     }
-    if let v = readDType(frame, 77, "u16") {
+    if let v = readDType(frame, 77, "u16", limit) {
         fb.add(77, 2, "status_word_1", "status", value: .int(v),
                note: "raw; near-static sibling of status_word@75 (low nibble = 1)")
     }
-    if let v = readDType(frame, 79, "u16") {
+    if let v = readDType(frame, 79, "u16", limit) {
         fb.add(79, 2, "status_word_2", "status", value: .int(v),
                note: "raw; sibling of @75 (low nibble = 2)")
     }
-    if let sb = readDType(frame, 81, "u8") {
+    if let sb = readDType(frame, 81, "u8", limit) {
         // High nibble (bits 4-5) tracks a scored night: 0 wake / 1 still / 2 asleep / 3 up; low nibble =
         // sub-flags. Deep/REM/light are computed off-band, not present here.
         let state = (sb >> 4) & 3
@@ -479,17 +611,85 @@ private func decodeWhoop5Historical(_ frame: [UInt8], fb: FieldBuilder, payloadE
                note: "on-wrist/validity flag (b0-1)")
         fb.add(81, 1, "wake_quality", "sleep", value: .int((sb >> 2) & 3),
                note: "quality code (b2-3); observed nonzero only in wake")
+        // The WHOLE byte, unmasked. The three fields above are the nibbles this project has interpreted;
+        // this key is the strap's own byte VERBATIM so all 8 bits survive to storage — including b6-7,
+        // which read 0 across every capture held here and therefore have no interpretation at all yet.
+        // A per-nibble store would make those bits permanently unrecoverable, because the strap trims its
+        // banked history the moment an offload is acked. Instrumentation only: nothing scores this.
+        fb.add(81, 1, "sleep_state_byte", "sleep", value: .int(sb),
+               note: "the RAW @81 flag byte, all 8 bits (b0-1 onwrist, b2-3 wake_quality, b4-5 sleep_state, b6-7 reserved)")
     }
-    if let v = readDType(frame, 82, "u8") {
+    if let v = readDType(frame, 82, "u8", limit) {
         fb.add(82, 1, "aux_byte_82", "status", value: .int(v),
-               note: "raw; observed nonzero only while sleep_state = asleep (meaning not pinned)")
+               note: "raw; nonzero only while sleep_state = asleep; tri-mode, see spo2_candidate_82")
+        // #103 SpO2 candidate: a decompile-sourced decode (gen5.rs `spo2_pct`, reimplemented here as a
+        // protocol fact with attribution, like the other RE work) reads @82 (= inner 74) as a
+        // strap-computed SpO2 % scalar, tri-mode: 70–100 = a real %, bit-7 values (0x80/0xA0…) =
+        // saturation sentinels, other sub-70 nonzero = diagnostic codes, populated only during sleep.
+        // Evidence is SPLIT: an 8-night independent validation with real spread (corr +0.99, ~0.4 %/night,
+        // tracks a 92 % desat AND a 98 % high; offset-specific — only @82 tracks in a 74–92 scan) meets
+        // the cross-night bar, but the two capture nights checked on the original #103 device moved
+        // OPPOSITE to the app value (95.50→92.83 app vs 93.62→93.80 gated mean) — device/firmware
+        // variance or an extraction error on one side, unresolved. So this ships as an INSTRUMENTATION
+        // CANDIDATE only: the in-band value is decoded and surfaced raw for multi-device correlation
+        // against the app's own nightly SpO2. It must never back a shipped SpO2 metric, never write
+        // `spo2Pct`/`spo2_red`/`spo2_ir` (the testHistoricalV18OpticalFieldsAreNotNamedPhysiologically
+        // guard), and never
+        // feed a downstream gate (recovery/illness) until the cross-device contradiction is resolved.
+        if (70...100).contains(v) {
+            fb.add(82, 1, "spo2_candidate_82", "spo2", value: .int(v),
+                   note: "in-band (70–100) @82 reading; candidate strap-computed SpO2 % (#103) — instrumentation only, cross-device evidence still split, not a shipped metric")
+        }
     }
-    if let d = readF32(frame, 113), d.isFinite {
+    // ── The @82–119 "optical/perfusion + tail" span, characterised over 18,602 real v18 records from a
+    // third strap (overnight R22 live stream) + cross-checked on the two fixture devices above. The span
+    // is ~85% ZERO PADDING: bytes 83–103, 110–112 and 117–119 are constant 0x00 on every record, and @104
+    // is a constant 0x01 marker (5/5 fixtures, both devices). Only two byte PAIRS carry data — @106/@107
+    // and @108/@109 — plus the @113 float, and none is physiologically ground-truth-named (no
+    // SpO2/respiratory reference exists), so each is carried RAW with its observed behaviour, never
+    // mapped to a named metric. This documents the region honestly instead of leaving 38 opaque bytes.
+    //
+    // @106/@107 were read as ONE u16 LE. They cannot be: across 18,599 consecutive-second pairs the HIGH
+    // byte changed while the LOW byte stayed frozen in 3,514 of them (18.89%), and the corpus holds ZERO
+    // low-byte wrap events — a real u16 cannot step its high byte without a carry. The apparent u16 deltas
+    // are exactly 256·Δ@107 + Δ@106 (they cluster at 0, ±1, ±255, ±256, ±257, ±513). These are two
+    // correlated but independent u8 channels (corr +0.73; they move in OPPOSITE directions in 5.8% of the
+    // pairs where both move), structurally parallel to the @108/@109 pair. 0 — not 128 — is the off-wrist
+    // marker: both bytes read 0 in exactly the 8 records that also carry HR == 0, while 128 occurs
+    // unremarkably while worn (@106 in 10 records, @107 in 103). Magnitudes are device-specific (102–255 /
+    // 119–247 on the R22 strap vs 20–66 / 34–81 on another), so no scale is asserted.
+    for (name, off) in [("optical_baseline_a", 106), ("optical_baseline_b", 107)] {
+        if let v = readDType(frame, off, "u8", limit) {
+            fb.add(off, 1, name, "optical", value: .int(v),
+                   note: "u8 optical/ADC baseline channel; wanders overnight, 0 = off-wrist; raw, not pinned")
+        }
+    }
+    // @108/@109 are a tightly-coupled PAIR (equal in 23.5% of records, within ±2 in ~80%). 128 is a
+    // RECORD-level sentinel, not a per-channel one: amp_a == 128 in 757 records and amp_b == 128 in 757 —
+    // the SAME 757, never one without the other. They do NOT rise with heart rate; that reading (mean ~34
+    // at HR 40–49 → ~58 at 80–89) was an averaging artifact of counting the 128 sentinel as a number, and
+    // with sentinels excluded the trend is flat-to-declining (32.45 → 29.52). The real monotone trend is
+    // with MOTION: ~32.7 while still (dyn_acc < 0.02 g) → 37.4 at 0.05–0.2 g. Amplitude- or
+    // signal-quality-like; carried raw, NOT named SpO2/perfusion without on-device ground truth.
+    //
+    // The sentinel itself is a usable per-second SIGNAL-QUALITY flag: it fires on 4.02% of worn seconds
+    // and predicts the band's own beat-detection failure (rr_count == 0) at 79.44% vs 19.40% — a 4.09×
+    // lift that SURVIVES holding motion constant (4.11× within dyn_acc < 0.009 g), where shuffled and
+    // circular-shift nulls all sit at ~1.0×. It is the same quality condition @36 bit7 reports.
+    if let a = readDType(frame, 108, "u8", limit) {
+        fb.add(108, 1, "optical_amp_a", "optical", value: .int(a),
+               note: "paired optical channel A (≈ optical_amp_b@109); tracks motion, not HR; 128 = record-level signal-quality sentinel; raw")
+    }
+    if let b = readDType(frame, 109, "u8", limit) {
+        fb.add(109, 1, "optical_amp_b", "optical", value: .int(b),
+               note: "paired optical channel B (see optical_amp_a@108); 128 = record-level sentinel, always together with @108; raw")
+    }
+    if let d = readF32(frame, 113, limit), d.isFinite {
         // A float32 at @113 (observed range ~ -5.3…0, 0 = unset); purpose unknown, carried raw.
         fb.add(113, 4, "unknown_f32_113", "aux", value: .double(d), note: "float32, purpose unknown")
     }
-    // The remaining bytes (optical/perfusion + the unmapped tail) are not ground-truth-mapped; keep them
-    // as one honest raw region.
+    // The bytes NOT annotated above are the constant zero padding (83–103, 105, 110–112, 117–119) and the
+    // @104 = 0x01 marker; keep one honest raw region over the whole span so nothing is silently dropped.
     // PROVENANCE / lossless-tail note (A10): the fields above split into VERIFIED (physiologically
     // cross-checked vs the live 2A37 HR / |gravity|~1g: unix, heart_rate, rr, gravity, skin_temp) and
     // EMPIRICAL / not-pinned (status words, aux bytes, unknown_f32_113). This decoder never truncates
@@ -497,7 +697,7 @@ private func decodeWhoop5Historical(_ frame: [UInt8], fb: FieldBuilder, payloadE
     // undecodable records, the raw-capture batch when that toggle is on), so a future re-decode is
     // lossless. Kept in lockstep with the Android decodeWhoop5Historical provenance note.
     if let payloadEnd = payloadEnd, 82 < payloadEnd, payloadEnd <= frame.count {
-        fb.region(82, payloadEnd, "unmapped (optical/perfusion + tail)", "unknown")
+        fb.region(82, payloadEnd, "optical/tail (mostly zero padding; see @106/@107/@108/@109/@113)", "unknown")
     }
 }
 
@@ -509,47 +709,74 @@ private func decodeWhoop5Historical(_ frame: [UInt8], fb: FieldBuilder, payloadE
 /// reference): the concatenated waveform's autocorrelation peaks at the HR (lag 14 = 102.9 bpm vs a
 /// measured 101.7 bpm), trough-detection gives a 563 ms inter-beat interval (≈106 bpm), the pulse stays
 /// HR-locked even when the wrist is still, and its amplitude is not motion-driven. (Reproduce with
-/// `tools/linux-capture/analyze_v26_waveform.py`; see docs §5.)
+/// `Tools/linux-capture/analyze_v26_waveform.py`; see docs §5.)
 ///
 /// The samples are raw AC-coupled ADC counts — PPG has no absolute unit — so they are exposed verbatim
 /// as `ppg_waveform` with NO invented scale. The bytes before [27] (header + a block index) and the
 /// footer after [75] are not mapped; SpO₂/skin-temp have no internal proxy and are left untouched.
-private func decodeWhoop5HistoricalV26(_ frame: [UInt8], fb: FieldBuilder) {
+private func decodeWhoop5HistoricalV26(_ frame: [UInt8], fb: FieldBuilder, limit: Int) {
     // @21 is a small per-burst counter (`burst_index`), NOT the optical channel (PR#553). An earlier read
     // labelled it `ppg_channel` and gated it 1…26 because our two original fixtures happened to read 1 and
     // 2 — but a later capture read 65, far outside any 26-channel sweep, so @21 is not a stable channel id.
     // Re-surfaced as the neutral `burst_index` (gated bi > 0, the observed always-set sentinel) with NO
     // channel/LED semantics claimed; the physical optical-channel mapping is unproven and left unasserted.
-    if let bi = readDType(frame, 21, "u8"), bi > 0 {
-        fb.add(21, 1, "burst_index", "ppg", value: .int(bi),
-               note: "per-burst counter (raw); NOT a channel id")
+    // Sixteen bits, not eight. The field is a per-burst COUNTER and a u8 wraps the moment it passes 255;
+    // @21 has already been observed at 65 (see above), so wrapping is reachable rather than hypothetical,
+    // and a wrapped counter is indistinguishable from a genuine low one.
+    //
+    // The evidence for the width is the LAYOUT, not our fixtures: 21..23 counter, 23..27 the absolute
+    // base (#2019), 27..75 the 24 deltas, which accounts for every byte between the record header and the
+    // samples with nothing left over. An independent decode of this record reads the same two bytes as one
+    // u16 LE. Every v26 frame held here carries byte 22 = 0, so our own captures CANNOT discriminate a u16
+    // from a u8 beside a constant zero, and that is recorded as the weaker half of the case rather than
+    // left implied. Reading it wide is the safe direction: under 256 the two readings agree exactly, and
+    // above it only the wide one is right.
+    if let bi = readDType(frame, 21, "u16", limit), bi > 0 {
+        fb.add(21, 2, "burst_index", "ppg", value: .int(bi),
+               note: "per-burst counter (raw, u16 LE); NOT a channel id")
     }
     // record_index@11 (PR#563): the same monotonic lifetime per-record counter the v18/v20/v21 records
     // carry at @11 — +1 per record, independent of unix (advances across gaps). The only @11+ v26 field
     // proven by behaviour; everything else below stays raw/neutral.
-    if let idx = readDType(frame, 11, "u32") {
+    if let idx = readDType(frame, 11, "u32", limit) {
         fb.add(11, 4, "record_index", "meta", value: .int(idx), note: "monotonic lifetime record index")
     }
-    if let unix = readDType(frame, 15, "u32") {
+    if let unix = readDType(frame, 15, "u32", limit) {
         fb.add(15, 4, "unix", "time", value: .int(unix), note: "real unix seconds")
+    }
+    // #2019: the ABSOLUTE optical code the 24 values below are deltas FROM. The window is 25 samples,
+    // not 24: sample 0 is this code and delta i produces sample i+1. Reading only the deltas and calling
+    // them the waveform stored a derivative as if it were a signal, and discarded the DC level, which is
+    // the half an SpO2 ratio-of-ratios needs. Verified on the captured frame in the waveform tests:
+    // 378,307 here, a valid 20-bit code, against 24 deltas that are every one NEGATIVE, which no
+    // absolute optical reading can be.
+    if let base = readDType(frame, 23, "u32", limit) {
+        fb.add(23, 4, "ppg_base_code", "ppg", value: .int(base),
+               note: "absolute optical ADC code; ppg_waveform holds the deltas from it")
     }
     var samples: [Int] = []
     for off in stride(from: 27, to: 75, by: 2) {
-        guard let v = readI16(frame, off) else { break }
+        guard let v = readI16(frame, off, limit) else { break }
         samples.append(v)
     }
     if !samples.isEmpty {
         fb.add(27, samples.count * 2, "ppg_waveform", "ppg", value: .intArray(samples),
-               note: "optical PPG @24 Hz, LE-i16 ADC counts")
+               note: "optical PPG DELTAS, LE-i16; absolute sample i+1 = base + running sum")
         fb.parsed["ppg_sample_count"] = .int(samples.count)
     }
     // PR#563: the remaining per-record v26 bytes, surfaced as RAW NEUTRAL fields — read off the real
     // fixtures but with NO invented semantics (deliberately not named segment_id / signal_quality / etc.).
-    // Each is gated only to "present in range"; meaning is unpinned. The header @19/@23/@25 frame the
-    // waveform block; @75/@79/@81/@82 trail it. (`@27…@75` is the proven waveform handled above.)
-    for (name, off) in [("raw_u8_19", 19), ("raw_u8_23", 23), ("raw_u8_25", 25),
+    // Each is gated only to "present in range"; meaning is unpinned. @19 sits ahead of the waveform
+    // block and @75/@79/@81/@82 trail it. (`@27…@75` is the proven waveform handled above.)
+    //
+    // @23 and @25 USED to be here, described as framing the block. They are not: #2019 identified
+    // @23…@27 as the window's absolute optical base, which `ppg_base_code` above now carries as one u32.
+    // Leaving them would describe the same two bytes twice, once as an identified field and once as a
+    // byte whose "meaning is not pinned", and the second reading is simply no longer true. A field
+    // viewer showing both would invite someone to re-derive what has already been worked out.
+    for (name, off) in [("raw_u8_19", 19),
                         ("raw_u8_75", 75), ("raw_u8_79", 79), ("raw_u8_81", 81), ("raw_u8_82", 82)] {
-        if let v = readDType(frame, off, "u8") {
+        if let v = readDType(frame, off, "u8", limit) {
             fb.add(off, 1, name, "raw", value: .int(v), note: "raw byte @\(off); meaning not pinned")
         }
     }
@@ -562,84 +789,93 @@ private func decodeWhoop5HistoricalV26(_ frame: [UInt8], fb: FieldBuilder) {
 /// Both versions reuse the v18 record header — layout version @9, a marker byte @10 (0x81 on v20, 0x80 on
 /// v21), the monotonic u32 record index @11 (the same lifetime counter as v18), and the u32 unix second
 /// @15. Their bodies are blocks of fixed-length sample channels, established from captured frames:
-///   • v21 (1244 B): a (100, 100, 3) descriptor near @22, then three 100-sample i16 channels at @28 /
-///     @228 / @428 (200 B apart), each a bounded pulsatile waveform at its own DC baseline.
-///   • v20 (2140 B): five channel blocks, each preceded by a presence byte (0x19 = active, 0x00 =
-///     empty / zero-filled); an active block holds two 50-sample i32 channels. The presence bytes sit at
-///     @0x1a / @0x1c0 / @0x366 / @0x50c / @0x6b2; the ten channel slots start at
-///     @0x2f / 0xf7 / 0x1d5 / 0x29d / 0x37b / 0x443 / 0x521 / 0x5e9 / 0x6c7 / 0x78f.
+///   • v21 (1244 B): a (100, 100, 3) descriptor near @22, then SIX 100-sample i16 channels in two blocks —
+///     accelerometer at @28 / @228 / @428 and gyroscope at @640 / @840 / @1040 (200 B apart; countB @630 =
+///     100). This is 6-axis IMU, not optical: the accel channels sphere-fit to a ~1 g gravity shell on a
+///     stationary strap (validated by Whoop5RawImu over 1423 real buffers, #423/#493).
+///   • v20 (2140 B): five repeated 422-byte optical-measurement blocks. Each has a 21-byte header,
+///     two 200-byte channel slots, and one reserved byte. Header byte 0 is the shared sample count; an
+///     active block holds two 25-sample i32 channels (~25 Hz). The two channels share one measurement
+///     header and must not be interpreted as two wavelengths. See `Whoop5RawOptical` for the lossless
+///     structural model and the 25-vs-50 sample-count evidence.
 ///
-/// Channels are exposed as raw sample arrays with NO invented scale or unit (an optical waveform has no
-/// absolute unit). Which channel maps to which optical LED — and which carries motion — needs a labelled
-/// capture (e.g. a deliberate moving window), so no per-channel identity is asserted here.
-private func decodeWhoop5HistoricalV2021(_ frame: [UInt8], fb: FieldBuilder, version: Int, payloadEnd: Int?) {
-    if frame.count > 10 {
-        fb.add(10, 1, "layout_marker", "meta", value: .int(Int(frame[10])))
+/// v21 channels are named accel_/gyro_ per the gravity-shell evidence above. The v20 record is optical,
+/// but its measurement wavelengths and channel geometry remain OPEN, so those channels stay neutrally
+/// named. This layer exposes raw i16 (v21) or sign-extended i32 (v20) arrays; `Whoop5RawImu.decode`
+/// applies the v21 physical scales.
+private func decodeWhoop5HistoricalV2021(_ frame: [UInt8], fb: FieldBuilder, version: Int,
+                                         payloadEnd: Int?, limit: Int) {
+    if let marker = readU8(frame, 10, limit) {
+        fb.add(10, 1, "layout_marker", "meta", value: .int(marker))
     }
-    if let idx = readU32(frame, 11) {
+    if let idx = readU32(frame, 11, limit) {
         fb.add(11, 4, "record_index", "meta", value: .int(idx), note: "monotonic lifetime record index")
     }
-    if let unix = readU32(frame, 15) {
+    if let unix = readU32(frame, 15, limit) {
         fb.add(15, 4, "unix", "time", value: .int(unix), note: "real unix seconds")
     }
     if version == 21 {
-        // v21 is the raw 6-axis IMU buffer, NOT an optical one. Earlier builds here read only the
-        // first three channels and named them `optical_ch0..2` while asserting no identity. Hardware
-        // validation on 1423 real buffers (fw 50.40.1.0) identifies them: the first three are the
-        // accelerometer (ax, ay, az) at 1/4096 g per LSB, and there are three MORE channels this
-        // decoder never read at all — the gyroscope (gx, gy, gz) at 2000/32768 (°/s) per LSB, ±2000
-        // dps. Evidence: accel magnitude forms a 1.01 g gravity shell (100% of samples within ±15% of
-        // the median, 4117 ± 11 LSB over 200 s) and gyro rests near zero, spikes on motion, and
-        // correlates 0.79 with accel motion. Columnar layout: all of one axis, then the next.
-        let axes: [(name: String, start: Int)] = [
-            ("imu_ax", 28), ("imu_ay", 228), ("imu_az", 428),
-            ("imu_gx", 640), ("imu_gy", 840), ("imu_gz", 1040),
+        // TWO blocks of three 100-sample i16 channels: accelerometer (@28/@228/@428) then gyroscope
+        // (@640/@840/@1040), matching the (100,100,3) header @22 and countB @630. NOT optical: on a
+        // stationary strap the three accel channels sphere-fit to a ~1 g gravity shell (median |a| =
+        // 1.006 g, 100/100 samples in-shell on the real fixture) — a gravity vector, which PPG cannot
+        // produce. Validated as 6-axis IMU by Whoop5RawImu over 1423 real buffers (#423/#493). Emitted as
+        // raw i16 arrays (this field layer applies no scale); the physical scales — 1/4096 g/LSB (accel),
+        // 2000/32768 (°/s)/LSB (gyro) — are applied by Whoop5RawImu.decode.
+        let channels: [(name: String, start: Int)] = [
+            ("accel_x", 28), ("accel_y", 228), ("accel_z", 428),
+            ("gyro_x", 640), ("gyro_y", 840), ("gyro_z", 1040),
         ]
-        var decoded = 0
-        for axis in axes {
+        for (name, start) in channels {
             var samples: [Int] = []
             for i in 0..<100 {
-                guard let v = readI16(frame, axis.start + i * 2) else { break }
+                guard let v = readI16(frame, start + i * 2, limit) else { break }
                 samples.append(v)
             }
             if samples.count == 100 {
-                fb.add(axis.start, 200, axis.name, "imu", value: .intArray(samples),
-                       note: "raw i16 columnar samples @100 Hz")
-                decoded += 1
+                fb.add(start, 200, name, "imu", value: .intArray(samples),
+                       note: "raw i16 samples (scale via Whoop5RawImu: 1/4096 g accel, 2000/32768 dps gyro)")
             }
         }
-        if let countA = readDType(frame, 24, "u16") {
-            fb.add(24, 2, "imu_accel_count", "imu", value: .int(countA))
-        }
-        if let countB = readDType(frame, 630, "u16") {
-            fb.add(630, 2, "imu_gyro_count", "imu", value: .int(countB))
-        }
-        fb.parsed["imu_axes_present"] = .int(decoded)
         fb.parsed["sensor_channel_samples"] = .int(100)
         return
     }
-    // version == 20: five blocks of two 50-sample i32 channels, each block gated by a presence byte.
-    let blocks: [(present: Int, ch0: Int, ch1: Int)] = [
-        (0x1a, 0x2f, 0xf7), (0x1c0, 0x1d5, 0x29d), (0x366, 0x37b, 0x443),
-        (0x50c, 0x521, 0x5e9), (0x6b2, 0x6c7, 0x78f),
-    ]
+    // version == 20: five repeated optical-measurement blocks. Each block carries one shared header and
+    // two channel slots. This matters semantically: the two channels within a block are a detector/readout
+    // pair for one measurement configuration, not evidence for two different LED wavelengths.
+    //
+    // EVIDENCE (why 25, not 50): across all 29,203 captured 2140-B buffers, exactly blocks 0/3/4 are active
+    // (channel slots @47/247/1313/1513/1735/1935) and, in every active channel, sample slots 25..49 are
+    // exactly 0.0 — only samples 0..24 carry data. Earlier builds read 50 and emitted arrays that were half
+    // zeros. The block-header byte itself reads 0x19 = 25 on every active block, consistent with a live
+    // per-block sample count. Each sample is a 4-byte LE container holding a 20-bit signed value (its upper
+    // 12 bits are only ever 0x000/0xFFF — pure sign extension — across all captures), so reading it as i32
+    // recovers the correct signed magnitude with no masking.
+    //
+    // Wavelength identity remains open. The six active channels in the current corpus are three pairs
+    // (blocks 0/3/4), not six independent colors. In particular, block 4's two channels cannot be named
+    // IR and red without independent evidence because they share the same block-level configuration.
+    guard let optical = Whoop5RawOptical.decode(frame) else { return }
+    fb.parsed["sensor_block_count"] = .int(optical.blocks.count)
     var present = 0
-    for (b, blk) in blocks.enumerated() {
-        guard frame.count > blk.present, frame[blk.present] != 0 else { continue }
-        for (half, start) in [(0, blk.ch0), (1, blk.ch1)] {
-            var samples: [Int] = []
-            for i in 0..<50 {
-                guard let v = readI32(frame, start + i * 4) else { break }
-                samples.append(v)
-            }
-            if samples.count == 50 {
-                fb.add(start, 200, "channel_b\(b)_\(half)", "sensor", value: .intArray(samples),
-                       note: "raw i32 channel samples (no absolute unit)")
-                present += 1
-            }
+    for block in optical.blocks {
+        let start = Whoop5RawOptical.blockStart + block.index * Whoop5RawOptical.blockLength
+        fb.add(start, Whoop5RawOptical.headerLength, "block_b\(block.index)_header", "optical_config",
+               value: .intArray(block.rawHeader.map(Int.init)),
+               note: "raw: sample count + shared metadata + two 7-byte channel descriptors")
+        fb.parsed["block_b\(block.index)_sample_count"] = .int(block.sampleCount)
+        guard block.sampleCount > 0 else { continue }
+        for (channelIndex, channel) in block.channels.enumerated() {
+            let sampleStart = start + Whoop5RawOptical.headerLength
+                + channelIndex * Whoop5RawOptical.channelSlotLength
+            fb.add(sampleStart, block.sampleCount * 4,
+                   "channel_b\(block.index)_\(channelIndex)", "sensor",
+                   value: .intArray(channel.samples.map(Int.init)),
+                   note: "raw signed i32 samples; paired under one block config; no wavelength or absolute unit asserted")
+            present += 1
         }
     }
-    fb.parsed["sensor_channel_samples"] = .int(50)
+    fb.parsed["sensor_channel_samples"] = .int(optical.blocks.map(\.sampleCount).max() ?? 0)
     fb.parsed["sensor_channels_present"] = .int(present)
 }
 
@@ -649,10 +885,10 @@ private func decodeWhoop5HistoricalV2021(_ frame: [UInt8], fb: FieldBuilder, ver
 /// drive the `HISTORICAL_DATA_RESULT` ack. Offsets are the 4.0 metadata post-hook positions + 4,
 /// verified on real WHOOP 5 HISTORY_END frames (trim decodes consistently across a whole capture).
 /// `end_data` to echo back in the ack is `frame[21..29]` (trim u32 + next u32).
-private func decodeWhoop5Metadata(_ frame: [UInt8], fb: FieldBuilder) {
-    if let unix = readDType(frame, 11, "u32") { fb.add(11, 4, "unix", "time", value: .int(unix)) }
-    if let ss = readDType(frame, 15, "u16") { fb.add(15, 2, "subsec", "time", value: .int(ss)) }
-    if let trim = readDType(frame, 21, "u32") {
+private func decodeWhoop5Metadata(_ frame: [UInt8], fb: FieldBuilder, limit: Int) {
+    if let unix = readDType(frame, 11, "u32", limit) { fb.add(11, 4, "unix", "time", value: .int(unix)) }
+    if let ss = readDType(frame, 15, "u16", limit) { fb.add(15, 2, "subsec", "time", value: .int(ss)) }
+    if let trim = readDType(frame, 21, "u32", limit) {
         fb.add(21, 4, "trim_cursor", "meta", value: .int(trim), note: "ack with this to advance")
     }
 }
@@ -672,12 +908,20 @@ public func whoop5HistoricalAckFrame(endData: [UInt8], seq: UInt8) -> [UInt8] {
 /// mapped from a real WHOOP 5 capture (firmware 50.38.1.0), not ported on faith. Commands that return
 /// a short stub on this firmware (REPORT_VERSION_INFO / GET_EXTENDED_BATTERY_INFO) or aren't served
 /// (GET_CLOCK — unneeded, since realtime + historical carry real unix) are intentionally left undecoded.
-private func decodeWhoop5CommandResponse(_ frame: [UInt8], fb: FieldBuilder, schema: Schema, payloadEnd: Int?) {
+private func decodeWhoop5CommandResponse(_ frame: [UInt8], fb: FieldBuilder, schema: Schema,
+                                         payloadEnd: Int?, limit: Int) {
     guard let payloadEnd = payloadEnd, 11 < payloadEnd, payloadEnd <= frame.count else { return }
-    let respCmd = Int(frame[10])
+    guard let respCmd = readU8(frame, 10, limit) else { return }
     let name = schema.enumName("CommandNumber", respCmd)   // e.g. "GET_BATTERY_LEVEL(26)"
     let pay = Array(frame[11..<payloadEnd])
     fb.region(11, payloadEnd, "response payload", "cmd")
+    // Origin-seq echo + result code, the 4.0 offsets shifted by the usual +4 (#894). The Kotlin twin has
+    // always published both here; this decoder published neither. Bounded by `pay` so a short reply
+    // decodes nothing rather than reading the CRC32 trailer as a result.
+    if pay.count >= 1 { fb.add(11, 1, "resp_seq", "cmd", value: .int(Int(pay[0]))) }
+    if pay.count >= 2 {
+        fb.add(12, 1, "result", "cmd", value: .string(schema.enumName("CommandResult", Int(pay[1]))))
+    }
     if name.hasPrefix("GET_BATTERY_LEVEL"), pay.count >= 3 {
         // Direct percent at pay[2] (47% confirmed against the app) — the 4.0 deci-percent ÷10 is gone.
         fb.add(11 + 2, 1, "battery_pct", "battery", value: .double(Double(pay[2])), note: "%")
@@ -713,6 +957,11 @@ private func decodeWhoop5CommandResponse(_ frame: [UInt8], fb: FieldBuilder, sch
         }
         if pay.count >= 97, pay[93] == 50 {
             fb.parsed["fw_version"] = .string("\(pay[93]).\(pay[94]).\(pay[95]).\(pay[96])")
+        } else {
+            // The guards fail closed by design, which left a strap reporting no firmware with no way to
+            // say WHY - a different generation byte and a MOVED offset look identical from a log. Carry
+            // the evidence instead; see `firmwareGateDiagnostic`.
+            fb.parsed["fw_gate"] = .string(firmwareGateDiagnostic(payload: pay, nameEndIndex: i))
         }
     }
 }
@@ -731,18 +980,60 @@ private func decodeWhoop5CommandResponse(_ frame: [UInt8], fb: FieldBuilder, sch
 /// borrowed from another enum (`CommandNumber` 123 is `SELECT_WRIST`) or invented. Other events'
 /// payloads (EXTENDED_BATTERY_INFORMATION, STRAP_CONDITION_REPORT) lack on-device 5.0 ground truth and
 /// are intentionally left raw rather than ported from 4.0 on faith.
-private func decodeWhoop5Event(_ frame: [UInt8], fb: FieldBuilder, schema: Schema) {
-    guard let evVal = readDType(frame, 10, "u8") else { return }
+private func decodeWhoop5Event(_ frame: [UInt8], fb: FieldBuilder, schema: Schema, limit: Int) {
+    guard let evVal = readDType(frame, 10, "u8", limit) else { return }
     guard schema.enums["EventNumber"]?[String(evVal)] == "BATTERY_LEVEL" else { return }
-    if let raw = readDType(frame, 21, "u16"), raw <= 1100 {
+    if let raw = readDType(frame, 21, "u16", limit), raw <= 1100 {
         fb.add(21, 2, "battery_pct", "battery", value: .double(Double(raw) / 10), note: "%")
     }
-    if let mv = readDType(frame, 25, "u16"), (3000...4300).contains(mv) {
+    if let mv = readDType(frame, 25, "u16", limit), (3000...4300).contains(mv) {
         fb.add(25, 2, "battery_mV", "battery", value: .int(mv), note: "mV")
     }
-    if let ch = readDType(frame, 30, "u8"), ch <= 1 {
+    if let ch = readDType(frame, 30, "u8", limit), ch <= 1 {
         fb.add(30, 1, "battery_charging", "battery", value: .int(ch & 1))
     }
+}
+
+/// Decode a WHOOP 5.0 CONSOLE_LOGS (type 50) frame — the strap firmware's own plaintext diagnostics
+/// channel. The console is one continuous text stream chunked into fixed-size pieces, so a log line
+/// routinely splits mid-sentence across frames. Consumers retain arrival order within one link and
+/// characteristic and check the wrapping `console_sequence` before joining text. Lines look like
+/// `19, 146552119: BLE: History burst success. Trim: …` (boot-count,
+/// firmware tick ms, tag, message) and narrate the history sync and the sensor pipeline
+/// ("SENSORS: AFE configuration changed", "SIGPROC: generated a valid SPO2 during sleep") — primary
+/// raw material for the deep-data work (#103).
+///
+/// Header: sequence u8@9, raw header byte @10, `unix` u32@12 + `subsec` u16@16 (batch write time),
+/// chunk_len u16@18, channel u8@20, text bytes @21 up to the CRC32 trailer with NUL padding.
+/// On firmware 50.41.1.0, 2,978 CRC-valid night records keep @10 = 2, including nine captured
+/// 255 -> 0 sequence wraps. Reading @9 as a monotonic u16 was wrong: it jumps 767 -> 512 at each
+/// wrap. Captured EVENT records can occupy sequence positions between console fragments; other
+/// record kinds have their own sequence semantics. Never sort these chunks by a global index or
+/// join across an unexplained gap. See docs/WHOOP5_DEEP_DATA.md for the evidence boundary.
+/// The text key is "log" — matching the Python
+/// reference decoder that `golden.json` is generated from, which `ParityTests` pins. Kotlin used
+/// "console" for the same field, and the mismatch is why a reader ported from that side got nil.
+private func decodeWhoop5ConsoleLogs(_ frame: [UInt8], fb: FieldBuilder, payloadEnd: Int?,
+                                     limit: Int) {
+    if let sequence = readDType(frame, 9, "u8", limit) {
+        fb.add(9, 1, "console_sequence", "meta", value: .int(sequence),
+               note: "wrapping u8 console/event sequence; not a historical record index")
+    }
+    if let headerByte = readDType(frame, 10, "u8", limit) {
+        fb.add(10, 1, "console_header_byte_10", "raw", value: .int(headerByte),
+               note: "raw header byte; remains 2 across observed sequence wraps")
+    }
+    if let unix = readDType(frame, 12, "u32", limit) { fb.add(12, 4, "unix", "time", value: .int(unix)) }
+    if let ss = readDType(frame, 16, "u16", limit) { fb.add(16, 2, "subsec", "time", value: .int(ss)) }
+    guard let payloadEnd = payloadEnd, 21 < payloadEnd, payloadEnd <= frame.count else { return }
+    var textBytes = Array(frame[21..<payloadEnd])
+    while textBytes.last == 0 { textBytes.removeLast() }
+    guard !textBytes.isEmpty else { return }
+    let txt = String(decoding: textBytes, as: UTF8.self)
+    fb.region(21, payloadEnd, "console log text", "text", note: String(txt.prefix(80)))
+    // Same 2 KB cap as the 4.0 console post-hook: a garbled/malicious peer must not pin arbitrary
+    // bytes as a String on the parse path. A real chunk is 51 bytes.
+    fb.parsed["log"] = .string(String(txt.prefix(2048)))
 }
 
 @inline(__always)

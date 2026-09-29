@@ -1,7 +1,6 @@
 import Foundation
 
-/// Single source of truth for project identity, attribution, and donation addresses — reused by the
-/// Support screen and kept in sync with the cross-platform docs (see docs/DONATIONS.md). Deliberately
+/// Single source of truth for project identity and attribution. Deliberately
 /// contains no author/AI identifiers so the public repo can stay anonymous.
 enum ProjectInfo {
     static let appName = "NOOP"
@@ -17,6 +16,8 @@ enum ProjectInfo {
     ]
 
     /// Optional, never-required donation addresses. Framed as support, not a paywall.
+    /// Upstream retired its donations lane; this fork keeps the Support screen, so the data
+    /// lives here rather than in the view.
     static let donations: [CryptoAddress] = [
         .init(symbol: "BTC", name: "Bitcoin",
               address: "bc1qn2gkl7wslwpws06mvazjn2uu689zlkv7kg3kf5"),
@@ -34,4 +35,5 @@ enum ProjectInfo {
         let address: String
         var id: String { symbol }
     }
+
 }

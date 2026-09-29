@@ -22,12 +22,83 @@ object StreamPersistence {
     /** Convert a decoded protocol [Streams] batch into the Room [StreamBatch] insert shape. */
     fun toBatch(streams: Streams): StreamBatch = StreamBatch(
         hr = streams.hr.map { HrRow(it.ts.toLong(), it.bpm) },
-        rr = streams.rr.map { RrRow(it.ts.toLong(), it.rrMs) },
+        // `srcChannel` (#1071) rides through unchanged: which optical channel measured the beat is
+        // decided by the decoder and must survive to the row, or the two Oura channels become
+        // indistinguishable and every night is stored twice over.
+        rr = streams.rr.map { RrRow(it.ts.toLong(), it.rrMs, it.srcChannel) },
         events = streams.events.map { EventEntry(it.ts.toLong(), it.kind, encodePayload(it.payload)) },
         battery = streams.battery.map { BatteryRow(it.ts.toLong(), it.soc, it.mv, it.charging) },
-        // The live REALTIME_DATA stream carries no SpO2/skinTemp/resp/gravity — those are
-        // type-47-only and arrive via the historical-offload path (extractHistoricalStreams).
+        // The WHOOP REALTIME_DATA stream carries no SpO2/skinTemp (those are type-47-only and arrive
+        // via the historical-offload path), so for a WHOOP batch these stay empty. A live source that
+        // DOES decode them (the Oura ring) populates the protocol Streams' spo2/skinTemp, which widen
+        // 1:1 onto the existing Room insert shape here.
+        // `unit` is carried on the protocol Spo2Sample/SkinTempSample for fidelity but is not yet
+        // persisted: Spo2Row/SkinTempRow (and the Room entities) have no unit column. The raw integers
+        // follow fixed conventions (skinTemp = centi-°C, °C = raw/100; spo2 = raw_adc), documented on the
+        // protocol carriers, so a missing column never causes a misread until a migration adds one.
+        spo2 = streams.spo2.map { Spo2Row(it.ts.toLong(), it.red, it.ir) },
+        skinTemp = streams.skinTemp.map { SkinTempRow(it.ts.toLong(), it.raw) },
+        // resp is populated by a live source that decodes a respiration value itself — the Oura ring's
+        // 0x6A `breath`, stored in milli-bpm under the ring's own deviceId (`OuraRespScale`). It stays
+        // empty for a WHOOP live batch, whose respiration rows arrive on the historical-offload path.
+        // The rows already carry the Room shape, so this is a pass-through, not a re-map.
+        resp = streams.resp.map { RespRow(it.ts.toLong(), it.raw) },
+        // gravity/steps/ppgHr remain type-47-only (historical offload), unchanged.
     )
+
+    /**
+     * Pack a decoded v26 PPG waveform's samples as little-endian i16 (2 bytes/sample) — a single compact
+     * BLOB per (deviceId, ts) row instead of 24 scalar rows (issue #156 follow-up, MIGRATION_19_20). Port
+     * of Swift `WhoopStore.packPpgSamples`, BYTE-IDENTICAL so a `.noopbak` round-trips across platforms.
+     * Any sample count is handled (a truncated frame can decode fewer than 24); each value is truncated to
+     * Int16's range (`toShort()`), matching the i16 wire format the decoder read it from.
+     */
+    fun packPpgSamples(samples: List<Int>): ByteArray {
+        val buf = ByteArray(samples.size * 2)
+        for ((i, s) in samples.withIndex()) {
+            val v = s.toShort().toInt()              // truncate to 16 bits, then read low/high bytes
+            buf[i * 2] = (v and 0xFF).toByte()       // little-endian: low byte first
+            buf[i * 2 + 1] = ((v shr 8) and 0xFF).toByte()
+        }
+        return buf
+    }
+
+    /**
+     * Inverse of [packPpgSamples]. A trailing odd byte (a corrupt/truncated blob) is dropped rather than
+     * thrown — a read path never crashes on a malformed row. Port of Swift `WhoopStore.unpackPpgSamples`.
+     */
+    fun unpackPpgSamples(data: ByteArray): List<Int> {
+        val out = ArrayList<Int>(data.size / 2)
+        var i = 0
+        while (i + 1 < data.size) {
+            val u = (data[i].toInt() and 0xFF) or ((data[i + 1].toInt() and 0xFF) shl 8)
+            out.add(u.toShort().toInt())             // sign-extend the 16-bit value back to Int
+            i += 2
+        }
+        return out
+    }
+
+    /** #423: pack the raw-IMU i16 columns to a little-endian BLOB (same wire encoding as [packPpgSamples],
+     *  just a [ShortArray] source — the 6×100 columns [ax…az,gx…gz]). Byte-identical to Swift's pack. */
+    fun packImuColumns(cols: ShortArray): ByteArray {
+        val buf = ByteArray(cols.size * 2)
+        for (i in cols.indices) {
+            val v = cols[i].toInt()
+            buf[i * 2] = (v and 0xFF).toByte()
+            buf[i * 2 + 1] = ((v shr 8) and 0xFF).toByte()
+        }
+        return buf
+    }
+
+    /** Inverse of [packImuColumns]; a trailing odd byte is dropped so a malformed row never crashes a read. */
+    fun unpackImuColumns(data: ByteArray): ShortArray {
+        val n = data.size / 2
+        val out = ShortArray(n)
+        for (i in 0 until n) {
+            out[i] = ((data[i * 2].toInt() and 0xFF) or ((data[i * 2 + 1].toInt() and 0xFF) shl 8)).toShort()
+        }
+        return out
+    }
 
     /**
      * Deterministic sorted-keys JSON for an event payload. Port of `WhoopStore.encodePayload`.

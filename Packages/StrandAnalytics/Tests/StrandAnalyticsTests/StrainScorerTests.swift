@@ -14,22 +14,73 @@ final class StrainScorerTests: XCTestCase {
         XCTAssertEqual(StrainScorer.defaultMaxHR(age: 30), 190)
     }
 
-    func testTrimpToStrainCeilingMapsTo21() {
-        // Edwards 24 h ceiling TRIMP = 7200 → strain exactly 21.0 with D = 7201.
-        XCTAssertEqual(StrainScorer.trimpToStrain(7200), 21.0, accuracy: 1e-9)
+    func testTrimpToStrainCeilingMapsTo100() {
+        // Edwards 24 h ceiling TRIMP = 7200 → Effort exactly 100.0 with D = 7201
+        // (rescaled from the old 21.0; the curve/saturation point is unchanged).
+        XCTAssertEqual(StrainScorer.trimpToStrain(7200), 100.0, accuracy: 1e-9)
+    }
+
+    func testWhoopAxisValuesMapAcrossTheWholeEffortRange() {
+        let cases: [(whoop: Double, effort: Double)] = [
+            (0, 0),
+            (1, 4.761904761904762),
+            (3.5, 16.666666666666668),
+            (7, 33.333333333333336),
+            (10.5, 50),
+            (12.5, 59.523809523809526),
+            (14, 66.66666666666667),
+            (17.5, 83.33333333333333),
+            (20, 95.23809523809524),
+            (21, 100),
+        ]
+
+        for sample in cases {
+            XCTAssertEqual(
+                StrainScorer.effortValue(fromWhoopStrain: sample.whoop), sample.effort,
+                accuracy: 0.0, "WHOOP \(sample.whoop) must map proportionally onto 0–100"
+            )
+        }
     }
 
     func testTrimpToStrainKnownValues() {
         XCTAssertEqual(StrainScorer.trimpToStrain(0), 0.0, accuracy: 1e-9)
         XCTAssertEqual(StrainScorer.trimpToStrain(-5), 0.0, accuracy: 1e-9)
-        XCTAssertEqual(StrainScorer.trimpToStrain(100), 10.91, accuracy: 1e-9)
+        // 10.91 × 100/21 on the rescaled axis.
+        XCTAssertEqual(StrainScorer.trimpToStrain(100), 51.96, accuracy: 1e-2)
     }
 
     func testStrainGoldenEdwardsZone5() {
         // 600 z5 samples at 1 Hz, resting 60, max 190. TRIMP = 600*5*(1/60)=50.
-        // strain = 21*ln(51)/ln(7201) = 9.3.
+        // Effort = 100*ln(51)/ln(7201) = 44.27 (was 9.3 on the 0–21 axis).
         let s = StrainScorer.strain(hr(185, 600), maxHR: 190, restingHR: 60)
-        XCTAssertEqual(s!, 9.3, accuracy: 1e-2)
+        XCTAssertEqual(s!, 44.27, accuracy: 1e-2)
+    }
+
+    /// #137 (partial-day sanity, PR #236 review): an imported ride is a short HR ISLAND — a 1–2 h
+    /// window, not a full day of HR. Prove the day Effort from that island is SENSIBLE: it equals the
+    /// Effort the same ride would score if worn on a strap for a full day. Edwards TRIMP integrates only
+    /// over the samples present, and resting HR (≤ restingHR → zone weight 0) adds zero TRIMP, so a
+    /// strap-less imported ride is neither diluted by the empty hours nor inflated by them — the number
+    /// the user sees is the ride's own honest cardiovascular load, identical to a worn strap.
+    func testImportedRidePartialDayEffortMatchesWornStrap() {
+        // A 90-minute ride @ 150 bpm (moderate), mid-morning, sampled at 1 Hz.
+        let ride = hr(150, 90 * 60, start: 8 * 3_600)
+
+        // Import case (strap-less day): the ride is the ONLY HR on the day.
+        let importEffort = StrainScorer.strain(ride, maxHR: 190, restingHR: 60)
+
+        // Worn-strap case: the SAME ride embedded in a full 24 h of resting HR (60 bpm) around it.
+        let restBefore = hr(60, 8 * 3_600, start: 0)
+        let restAfter  = hr(60, 24 * 3_600 - 8 * 3_600 - 90 * 60, start: 8 * 3_600 + 90 * 60)
+        let wornEffort = StrainScorer.strain(restBefore + ride + restAfter, maxHR: 190, restingHR: 60)
+
+        XCTAssertNotNil(importEffort, "a 90-min HR island clears the minReadings/minSpan gates")
+        // Identical: resting time contributes zero TRIMP, so the island scores the same either way.
+        XCTAssertEqual(importEffort!, wornEffort!, accuracy: 1e-9,
+                       "imported-ride Effort must equal the same ride worn on a strap")
+        // A sensible MODERATE Effort for a 90-min zone-3 ride — not 0 (dark), not saturated (~100).
+        XCTAssertGreaterThan(importEffort!, 20)
+        XCTAssertLessThan(importEffort!, 90)
     }
 
     func testStrainReturnsNilTooFewReadings() {
@@ -58,7 +109,48 @@ final class StrainScorerTests: XCTestCase {
     func testStrainBanisterAlsoBounded() {
         let s = StrainScorer.strain(hr(185, 600), maxHR: 190, restingHR: 60, method: .banister)!
         XCTAssertGreaterThan(s, 0)
-        XCTAssertLessThanOrEqual(s, 21.0)
+        XCTAssertLessThanOrEqual(s, 100.0)
+    }
+
+    // MARK: - #482/#480 sparse-strap acceptance + honest-zero (regression guards)
+
+    /// Build n samples at a fixed cadence (default 30 s — the WHOOP 5/MG live-HR rate).
+    private func hrEvery(_ bpm: Int, _ n: Int, stepS: Int = 30, start: Int = 0) -> [HRSample] {
+        (0..<n).map { HRSample(ts: start + $0 * stepS, bpm: bpm) }
+    }
+
+    func testSparseStreamScoresOnceItSpansEnoughTime() {
+        // The 5/MG case: only ~30 live samples at 30 s cadence — far under minReadings (600), but
+        // they SPAN ~15 min, so the score should compute rather than return nil (which made the live
+        // gauge fall back to a stale prior-day value). HR 185 is z5, so it produces a real number.
+        let sparse = hrEvery(185, 30)                                // 30 × 30 s = 870 s span
+        XCTAssertGreaterThanOrEqual(sparse.last!.ts - sparse.first!.ts, StrainScorer.minSpanSeconds)
+        XCTAssertNotNil(StrainScorer.strain(sparse, maxHR: 190, restingHR: 60))
+    }
+
+    func testSparseStreamStillNilUnderSampleFloor() {
+        // A handful of readings (under minSparseReadings) is too little to trust even if spread out.
+        let tooFew = hrEvery(185, 5, stepS: 200)                     // 5 samples, wide span, < floor
+        XCTAssertNil(StrainScorer.strain(tooFew, maxHR: 190, restingHR: 60))
+    }
+
+    func testLightDayHonestlyScoresZeroNotFabricated() {
+        // #482: HR that never crosses ~50% HRR earns ZERO Effort, by design. With max 184 / rest 60,
+        // zone 1 starts at 122 bpm; a day spent at 82–110 stays below it. The fix must NOT invent
+        // load to make the gauge "look alive" — both a dense (4.0) and a sparse (5/MG) light day = 0.
+        let denseLight = hr(105, 1200, start: 0)                     // 4.0-style, 20 min at 1 Hz
+        let sparseLight = hrEvery(105, 40)                           // 5/MG-style, 40 × 30 s
+        XCTAssertEqual(StrainScorer.strain(denseLight, maxHR: 184, restingHR: 60), 0.0)
+        XCTAssertEqual(StrainScorer.strain(sparseLight, maxHR: 184, restingHR: 60), 0.0)
+    }
+
+    func testSparseStreamScoresRealWorkout() {
+        // The same sparse cadence, but a genuine workout (z5) — Effort must be clearly > 0, proving the
+        // zero above is about intensity, not about the sparse path swallowing real load.
+        let sparseHard = hrEvery(175, 40)                            // 175 bpm ≈ 93% HRR → z5
+        let s = StrainScorer.strain(sparseHard, maxHR: 184, restingHR: 60)
+        XCTAssertNotNil(s)
+        XCTAssertGreaterThan(s!, 0)
     }
 
     func testEstimateHRmaxObservedVsTanaka() {
@@ -89,9 +181,10 @@ final class StrainScorerTests: XCTestCase {
     }
 
     func testFitStrainDenominator() throws {
-        // Pairs generated from a known D should recover that D.
+        // Pairs generated from a known D should recover that D. Pairs use the rescaled
+        // 0–100 axis (maxStrain = 100), matching fitStrainDenominator's maxStrain term.
         let knownD = 5000.0
-        func strainFor(_ t: Double) -> Double { 21 * log(t + 1) / log(knownD) }
+        func strainFor(_ t: Double) -> Double { 100 * log(t + 1) / log(knownD) }
         let pairs = [(100.0, strainFor(100)), (1000.0, strainFor(1000)), (50.0, strainFor(50))]
         let fitted = try StrainScorer.fitStrainDenominator(pairs)
         XCTAssertEqual(fitted, knownD, accuracy: 1.0)
@@ -99,5 +192,26 @@ final class StrainScorerTests: XCTestCase {
 
     func testFitStrainDenominatorThrowsTooFew() {
         XCTAssertThrowsError(try StrainScorer.fitStrainDenominator([(100, 10)]))
+    }
+
+    /// #983 — the resting HR a workout is scored with is not cosmetic; it moves every zone boundary.
+    ///
+    /// %HRR is `(bpm - resting) / (max - resting)`, so scoring someone whose real resting is 50 as if it
+    /// were the hardcoded default of 60 shrinks the reserve AND raises the floor. At 136 bpm that is the
+    /// difference between zone 1 and zone 2 — the same session, two Efforts. The saved-workout path
+    /// used to fall back to the default while Today's Effort and the manual rescore threaded the measured
+    /// value, so the SAVED workout disagreed with its own re-score.
+    ///
+    /// Twin: `StrainRestingHrTest.restingHrChangesTheZoneASampleLandsIn`.
+    func testRestingHrChangesTheZoneASampleLandsIn() {
+        XCTAssertEqual(StrainScorer.zoneWeight(136, restingHR: 60, hrReserve: 130), 1)
+        XCTAssertEqual(StrainScorer.zoneWeight(136, restingHR: 50, hrReserve: 140), 2)
+        // ...and that carries all the way through to the score, not just the zone.
+        let window = hr(136, 1200)   // well past the >=600-sample gate this file pins above
+        let asDefault = StrainScorer.strain(window, maxHR: 190, restingHR: 60)
+        let asMeasured = StrainScorer.strain(window, maxHR: 190, restingHR: 50)
+        XCTAssertNotNil(asDefault); XCTAssertNotNil(asMeasured)
+        XCTAssertGreaterThan(asMeasured!, asDefault!,
+                             "a lower measured resting puts the same HR in a higher zone, so Effort rises")
     }
 }

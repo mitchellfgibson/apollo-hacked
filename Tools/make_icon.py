@@ -1,84 +1,95 @@
 #!/usr/bin/env python3
-"""Generate the NOOP app icon: dark squircle + mint→emerald pulse waveform with glow."""
-import os
+"""NOOP app icon — Titanium & Gold v3.1 "gold on navy".
+
+A deep-navy tile + a THICK open gold recovery ring (round-capped, gold gradient
+along the sweep) + a solid gold core dot. Matches the in-app BrandMark geometry
+(open ~80% arc from 12 o'clock, clockwise) but on navy with a heavier stroke.
+
+Usage: make_icon.py            -> writes noop_icon_1024.png + noop_icon_432.png
+Distribute with distribute_icons.sh.
+"""
+import os, math, sys
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw
 
-S = 1024
-# --- rounded-rect dark gradient background ---
-inset, radius = 76, 205
-top = np.array([0x0B, 0x0D, 0x12], float)
-bot = np.array([0x14, 0x18, 0x24], float)
-grad = np.zeros((S, S, 3), float)
-for y in range(S):
-    grad[y, :, :] = top + (bot - top) * (y / (S - 1))
+OUT = os.path.dirname(os.path.abspath(__file__))
 
-# soft radial glow, top-left
-yy, xx = np.mgrid[0:S, 0:S]
-d = np.sqrt((xx - S * 0.30) ** 2 + (yy - S * 0.26) ** 2)
-glow = np.clip(1 - d / (S * 0.62), 0, 1) ** 2.2
-glowc = np.array([0x1B, 0x2A, 0x3A], float)
-for c in range(3):
-    grad[:, :, c] = np.clip(grad[:, :, c] + glow * glowc[c] * 0.5, 0, 255)
+def hx(h):
+    h = h.lstrip('#'); return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
 
-bg = Image.fromarray(grad.astype(np.uint8), "RGB").convert("RGBA")
-mask = Image.new("L", (S, S), 0)
-ImageDraw.Draw(mask).rounded_rectangle([inset, inset, S - inset, S - inset], radius=radius, fill=255)
-icon = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-icon.paste(bg, (0, 0), mask)
+NAVY_TOP = hx('#0A1322')   # navy canvas, slightly lifted at top
+NAVY_BOT = hx('#05080F')   # deeper navy at the bottom
+GLOW     = hx('#17263E')   # subtle cool glow
+GOLD_LIGHT = hx('#FCEBA8') # pale cream-gold (StrandPalette.goldLight)
+GOLD       = hx('#E8B84B') # brand gold (StrandPalette.gold)
+GOLD_DEEP  = hx('#C8902F') # deep antique gold (StrandPalette.goldDeep)
 
-# subtle top inner sheen
-sheen = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-sd = ImageDraw.Draw(sheen)
-sd.rounded_rectangle([inset, inset, S - inset, S - inset], radius=radius,
-                     outline=(255, 255, 255, 26), width=2)
-icon = Image.alpha_composite(icon, sheen)
-
-# --- pulse / ECG waveform (mint -> emerald gradient), with glow ---
-pts_n = [(0.16, 0.50), (0.34, 0.50), (0.41, 0.43), (0.46, 0.58),
-         (0.52, 0.20), (0.58, 0.80), (0.64, 0.50), (0.84, 0.50)]
-def to_px(p):
-    x = inset + p[0] * (S - 2 * inset)
-    y = inset + p[1] * (S - 2 * inset)
-    return (x, y)
-pts = [to_px(p) for p in pts_n]
-
-# resample the polyline densely so we can color-grade along its length
-def resample(points, step=3.0):
-    out = []
-    for a, b in zip(points, points[1:]):
-        seg = np.hypot(b[0] - a[0], b[1] - a[1])
-        n = max(2, int(seg / step))
-        for i in range(n):
-            t = i / (n - 1)
-            out.append((a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t))
-    return out
-dense = resample(pts)
-
-mint = np.array([0x34, 0xE5, 0xA0], float)   # emerald-mint (peak recovery)
-cyan = np.array([0x5B, 0xE0, 0xC7], float)   # bright mint-cyan
+def lerp(a, b, t): return tuple(a[i] + (b[i] - a[i]) * t for i in range(3))
 def grade(t):
-    c = cyan + (mint - cyan) * t
-    return (int(c[0]), int(c[1]), int(c[2]), 255)
+    """Gold ramp along the ring: pale -> brand -> deep."""
+    return lerp(GOLD_LIGHT, GOLD, t / 0.5) if t < 0.5 else lerp(GOLD, GOLD_DEEP, (t - 0.5) / 0.5)
 
-stroke = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-sd = ImageDraw.Draw(stroke)
-w = 50
-for i in range(len(dense) - 1):
-    t = i / (len(dense) - 2)
-    sd.line([dense[i], dense[i + 1]], fill=grade(t), width=w)
-for p in dense:  # round the joints
-    r = w / 2
-    t = dense.index(p) / (len(dense) - 1)
-    sd.ellipse([p[0] - r, p[1] - r, p[0] + r, p[1] + r], fill=grade(t))
+def render(S, ring_scale=1.0):
+    SS = 4                      # supersample for clean anti-aliasing
+    W = S * SS
 
-# glow = blurred, brightened copy of the stroke under it
-glow_layer = stroke.filter(ImageFilter.GaussianBlur(26))
-icon = Image.alpha_composite(icon, glow_layer)
-icon = Image.alpha_composite(icon, glow_layer)  # double for intensity
-icon = Image.alpha_composite(icon, stroke)
-# clip everything to the rounded mask
-icon.putalpha(Image.composite(icon.getchannel("A"), Image.new("L", (S, S), 0), mask))
+    # --- navy background: vertical gradient + soft upper radial glow ---
+    grad = np.empty((W, W, 3), float)
+    ys = np.linspace(0, 1, W)[:, None]
+    for c in range(3):
+        grad[:, :, c] = NAVY_TOP[c] + (NAVY_BOT[c] - NAVY_TOP[c]) * ys
+    yy, xx = np.mgrid[0:W, 0:W]
+    d = np.sqrt((xx - W * 0.5) ** 2 + (yy - W * 0.40) ** 2)
+    glow = np.clip(1 - d / (W * 0.72), 0, 1) ** 2.0
+    for c in range(3):
+        grad[:, :, c] = np.clip(grad[:, :, c] + glow * GLOW[c] * 0.6, 0, 255)
+    img = Image.fromarray(grad.astype(np.uint8), 'RGB').convert('RGBA')
 
-icon.save(os.path.join(os.path.dirname(os.path.abspath(__file__)), "noop_icon_1024.png"))
-print("wrote noop_icon_1024.png")
+    # --- gold mark layer ---
+    mark = Image.new('RGBA', (W, W), (0, 0, 0, 0))
+    md = ImageDraw.Draw(mark)
+    cx = cy = W / 2.0
+    outer_r = 0.39 * W * ring_scale
+    ring_w  = 0.135 * W * ring_scale
+    center_r = outer_r - ring_w / 2.0
+    core_r   = 0.090 * W * ring_scale
+    seg_r    = ring_w / 2.0
+
+    # Open ~84% ring with the gap centred at the TOP: pale cap at the upper-left
+    # (~11 o'clock), sweeping the long way (down the left, round the bottom, up the
+    # right) to the deep cap at the upper-right (~1 o'clock). Drawn as round dabs
+    # colour-graded pale -> deep along the sweep (round caps for free).
+    start_deg, span = 241.0, -302.0     # PIL angles (0=E, +CW); see note above
+    n = 1700
+    for i in range(n + 1):
+        t = i / n
+        a = math.radians(start_deg + span * t)
+        x, y = cx + center_r * math.cos(a), cy + center_r * math.sin(a)
+        col = tuple(int(v) for v in grade(t)) + (255,)
+        md.ellipse([x - seg_r, y - seg_r, x + seg_r, y + seg_r], fill=col)
+
+    # Core dot: SOLID gold disc (opaque). PIL's ImageDraw REPLACES pixels rather
+    # than blending, so a semi-transparent sheen drawn here would punch the navy
+    # through — instead the sheen rides on its own layer, alpha_composited below.
+    md.ellipse([cx - core_r, cy - core_r, cx + core_r, cy + core_r], fill=GOLD + (255,))
+
+    img = Image.alpha_composite(img, mark)
+
+    # Subtle lighter top-sheen on the core (own layer, properly blended).
+    sheen = Image.new('RGBA', (W, W), (0, 0, 0, 0))
+    sr = core_r * 0.92
+    ImageDraw.Draw(sheen).ellipse(
+        [cx - sr, cy - sr * 1.05, cx + sr, cy + sr * 0.35], fill=GOLD_LIGHT + (90,))
+    coremask = Image.new('L', (W, W), 0)
+    ImageDraw.Draw(coremask).ellipse(
+        [cx - core_r, cy - core_r, cx + core_r, cy + core_r], fill=255)
+    img.paste(Image.alpha_composite(img, sheen), (0, 0), coremask)
+    return img.resize((S, S), Image.LANCZOS)
+
+if __name__ == '__main__':
+    # Flatten to RGB (no alpha) for the iOS/macOS app icon. iOS app icons MUST be fully opaque, an
+    # RGBA icon renders glitched when applied as an alternate icon (#708). The art already fills the
+    # whole opaque navy tile, so dropping the all-255 alpha channel changes nothing visible.
+    render(1024, ring_scale=1.00).convert('RGB').save(os.path.join(OUT, 'noop_icon_1024.png'))   # iOS/macOS (squircle shows full art)
+    render(432,  ring_scale=0.80).save(os.path.join(OUT, 'noop_icon_432.png'))     # Android adaptive bg (ring inside safe-zone)
+    print('wrote noop_icon_1024.png, noop_icon_432.png, noop_icon_preview.png')

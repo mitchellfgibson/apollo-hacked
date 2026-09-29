@@ -104,25 +104,25 @@ public enum AppleHealthAggregator {
     // `AppleHealthImporter.stripPrefix`). We still accept the full identifier
     // form so callers feeding raw HK strings get the same mapping.
 
-    private static let restingHR = "RestingHeartRate"
-    private static let hrvSDNN = "HeartRateVariabilitySDNN"
-    private static let spo2 = "OxygenSaturation"
-    private static let respRate = "RespiratoryRate"
-    private static let walkingHR = "WalkingHeartRateAverage"
-    private static let heartRate = "HeartRate"
-    private static let stepCount = "StepCount"
-    private static let activeEnergy = "ActiveEnergyBurned"
-    private static let basalEnergy = "BasalEnergyBurned"
-    private static let vo2max = "VO2Max"
-    private static let bodyMass = "BodyMass"
-    private static let bodyFat = "BodyFatPercentage"
-    private static let leanMass = "LeanBodyMass"
-    private static let bodyMassIndex = "BodyMassIndex"
+    static let restingHR = "RestingHeartRate"
+    static let hrvSDNN = "HeartRateVariabilitySDNN"
+    static let spo2 = "OxygenSaturation"
+    static let respRate = "RespiratoryRate"
+    static let walkingHR = "WalkingHeartRateAverage"
+    static let heartRate = "HeartRate"
+    static let stepCount = "StepCount"
+    static let activeEnergy = "ActiveEnergyBurned"
+    static let basalEnergy = "BasalEnergyBurned"
+    static let vo2max = "VO2Max"
+    static let bodyMass = "BodyMass"
+    static let bodyFat = "BodyFatPercentage"
+    static let leanMass = "LeanBodyMass"
+    static let bodyMassIndex = "BodyMassIndex"
 
     /// Normalize a sample's `type` to the stripped HK identifier so matching
     /// works whether the caller passed `HeartRate` or
     /// `HKQuantityTypeIdentifierHeartRate`.
-    private static func normalizedType(_ raw: String) -> String {
+    static func normalizedType(_ raw: String) -> String {
         let prefixes = [
             "HKQuantityTypeIdentifier",
             "HKCategoryTypeIdentifier",
@@ -137,7 +137,7 @@ public enum AppleHealthAggregator {
     /// Whether a HealthKit mass unit string denotes pounds (`lb`, `lbs`).
     /// HealthKit normally exports BodyMass/LeanBodyMass in kg, but guard against
     /// pound-denominated exports.
-    private static func unitLooksLikePounds(_ unit: String?) -> Bool {
+    static func unitLooksLikePounds(_ unit: String?) -> Bool {
         guard let u = unit?.lowercased() else { return false }
         return u == "lb" || u == "lbs" || u.contains("pound")
     }
@@ -158,151 +158,17 @@ public enum AppleHealthAggregator {
     // MARK: - Sample daily aggregation
 
     /// Group `HealthSamples` by local day and apply the per-type reduction rules.
+    ///
+    /// This is the **batch** form. It is a thin wrapper over
+    /// `AppleDailySampleAccumulator` so the running (incremental) fold and the
+    /// batch fold share ONE set of reduction rules — the accumulator is the
+    /// single source of truth. The streaming importer feeds samples one-by-one
+    /// into the same accumulator so a multi-year export never has to hold the raw
+    /// `[HealthSample]` array in RAM.
     public static func daily(samples: [HealthSample]) -> [AppleDailyAggregate] {
-        // Per-day accumulators.
-        struct Acc {
-            var resting: [Double] = []
-            var hrv: [Double] = []
-            var spo2: [Double] = []
-            var resp: [Double] = []
-            var walking: [Double] = []
-            var hr: [Double] = []
-            var steps = 0.0
-            var hasSteps = false
-            var active = 0.0
-            var hasActive = false
-            var basal = 0.0
-            var hasBasal = false
-            // VO2Max: keep the latest by sample end time.
-            var vo2: Double?
-            var vo2At: Date?
-            // Body composition: keep the latest by sample end time.
-            var weight: Double?
-            var weightAt: Date?
-            var bodyFat: Double?
-            var bodyFatAt: Date?
-            var lean: Double?
-            var leanAt: Date?
-            var bmi: Double?
-            var bmiAt: Date?
-        }
-
-        var byDay: [String: Acc] = [:]
-        // Preserve first-seen day order for deterministic output before sort.
-        var order: [String] = []
-
-        for s in samples {
-            let type = normalizedType(s.type)
-            let day = localDay(s.start, tzOffsetMin: s.tzOffsetMin)
-            if byDay[day] == nil {
-                byDay[day] = Acc()
-                order.append(day)
-            }
-
-            switch type {
-            case restingHR:
-                if let v = s.value { byDay[day]!.resting.append(v) }
-            case hrvSDNN:
-                if let v = s.value { byDay[day]!.hrv.append(v) }
-            case spo2:
-                if let v = s.value {
-                    // Detect fraction (0..1) → percent. The importer already
-                    // scales OxygenSaturation by 100, but defend against raw
-                    // fractional values here too.
-                    let pct = (v > 0 && v <= 1.0) ? v * 100.0 : v
-                    byDay[day]!.spo2.append(pct)
-                }
-            case respRate:
-                if let v = s.value { byDay[day]!.resp.append(v) }
-            case walkingHR:
-                if let v = s.value { byDay[day]!.walking.append(v) }
-            case heartRate:
-                if let v = s.value { byDay[day]!.hr.append(v) }
-            case stepCount:
-                if let v = s.value { byDay[day]!.steps += v; byDay[day]!.hasSteps = true }
-            case activeEnergy:
-                if let v = s.value { byDay[day]!.active += v; byDay[day]!.hasActive = true }
-            case basalEnergy:
-                if let v = s.value { byDay[day]!.basal += v; byDay[day]!.hasBasal = true }
-            case vo2max:
-                if let v = s.value {
-                    let acc = byDay[day]!
-                    if acc.vo2 == nil || (acc.vo2At ?? .distantPast) <= s.end {
-                        byDay[day]!.vo2 = v
-                        byDay[day]!.vo2At = s.end
-                    }
-                }
-            case bodyMass:
-                if let v = s.value {
-                    // HealthKit stores BodyMass in kg by default. If the unit
-                    // looks like pounds, convert to kg; otherwise assume kg.
-                    let kg = Self.unitLooksLikePounds(s.unit) ? v * 0.453592 : v
-                    let acc = byDay[day]!
-                    if acc.weight == nil || (acc.weightAt ?? .distantPast) <= s.end {
-                        byDay[day]!.weight = kg
-                        byDay[day]!.weightAt = s.end
-                    }
-                }
-            case bodyFat:
-                if let v = s.value {
-                    // HealthKit stores a 0..1 fraction → percent. Defend against
-                    // already-percent values the same way SpO2 does.
-                    let pct = (v > 0 && v <= 1.0) ? v * 100.0 : v
-                    let acc = byDay[day]!
-                    if acc.bodyFat == nil || (acc.bodyFatAt ?? .distantPast) <= s.end {
-                        byDay[day]!.bodyFat = pct
-                        byDay[day]!.bodyFatAt = s.end
-                    }
-                }
-            case leanMass:
-                if let v = s.value {
-                    let kg = Self.unitLooksLikePounds(s.unit) ? v * 0.453592 : v
-                    let acc = byDay[day]!
-                    if acc.lean == nil || (acc.leanAt ?? .distantPast) <= s.end {
-                        byDay[day]!.lean = kg
-                        byDay[day]!.leanAt = s.end
-                    }
-                }
-            case bodyMassIndex:
-                if let v = s.value {
-                    let acc = byDay[day]!
-                    if acc.bmi == nil || (acc.bmiAt ?? .distantPast) <= s.end {
-                        byDay[day]!.bmi = v
-                        byDay[day]!.bmiAt = s.end
-                    }
-                }
-            default:
-                break
-            }
-        }
-
-        func mean(_ xs: [Double]) -> Double? {
-            xs.isEmpty ? nil : xs.reduce(0, +) / Double(xs.count)
-        }
-        func mx(_ xs: [Double]) -> Double? { xs.max() }
-
-        let result: [AppleDailyAggregate] = order.map { day in
-            let a = byDay[day]!
-            return AppleDailyAggregate(
-                day: day,
-                restingHr: mean(a.resting),
-                hrvSDNN: mean(a.hrv),
-                spo2Pct: mean(a.spo2),
-                respRate: mean(a.resp),
-                avgHr: mean(a.hr),
-                maxHr: mx(a.hr),
-                walkingHr: mean(a.walking),
-                steps: a.hasSteps ? a.steps : nil,
-                activeKcal: a.hasActive ? a.active : nil,
-                basalKcal: a.hasBasal ? a.basal : nil,
-                vo2max: a.vo2,
-                weightKg: a.weight,
-                bodyFatPct: a.bodyFat,
-                leanMassKg: a.lean,
-                bmi: a.bmi
-            )
-        }
-        return result.sorted { $0.day < $1.day }
+        var acc = AppleDailySampleAccumulator()
+        for s in samples { acc.add(s) }
+        return acc.finish()
     }
 
     // MARK: - Sleep daily aggregation
@@ -349,7 +215,15 @@ public enum AppleHealthAggregator {
     /// Full merge of sample-daily + sleep-daily into `[AppleDailyAggregate]`,
     /// one row per day present in either source, sorted ascending by day.
     public static func aggregate(_ result: AppleHealthImportResult) -> [AppleDailyAggregate] {
-        let sampleDaily = daily(samples: result.samples)
+        // When the importer pre-aggregated the samples incrementally (bounded
+        // memory — issue #355), `sampleDailies` is already populated and the raw
+        // `samples` array may have been dropped. Use the pre-aggregated form in
+        // that case; otherwise fall back to folding the raw samples here (the
+        // path tests take when they construct a result from raw `samples`). An
+        // empty export leaves both empty → daily([]) → [] — fine.
+        let sampleDaily = result.sampleDailies.isEmpty
+            ? daily(samples: result.samples)
+            : result.sampleDailies
         let sleep = sleepDaily(result.sleepIntervals)
 
         var byDay: [String: AppleDailyAggregate] = [:]
@@ -424,5 +298,185 @@ public enum AppleHealthAggregator {
             add("in_bed_min", d.inBedMin)
         }
         return out
+    }
+}
+
+// MARK: - Incremental (bounded-memory) sample accumulator
+
+/// A running, O(days)-memory accumulator that produces output **identical** to
+/// `AppleHealthAggregator.daily(samples:)` without ever holding the raw
+/// `[HealthSample]` array.
+///
+/// WHY this exists (issue #355): a multi-year Apple Health export with
+/// Apple-Watch continuous heart-rate is millions of `HealthSample` structs —
+/// hundreds of MB to >1 GB — which iOS jetsam-kills mid-import. The streaming
+/// SAX importer feeds each parsed sample straight into this accumulator and (on
+/// the app path) drops the raw struct, so peak memory is bounded to the number
+/// of distinct civil days, not the number of samples.
+///
+/// It mirrors `daily(samples:)` EXACTLY: same `normalizedType` + per-type switch,
+/// the same spo2/bodyFat fraction (0..1→percent) guards, the same pounds→kg unit
+/// check, the same "latest by `end`" rule for vo2/weight/bodyFat/lean/bmi, the
+/// same first-seen-day order preservation, and the same final
+/// `sorted { $0.day < $1.day }`. `daily(samples:)` is implemented as a thin loop
+/// over this type, so the existing `AppleHealthAggregatorTests` keep validating
+/// both the batch and incremental paths at once.
+public struct AppleDailySampleAccumulator {
+
+    /// Per-day running state. Means are kept as (sum, count) — no per-sample
+    /// arrays — and max as a running maximum, so memory is O(days).
+    private struct DayAcc {
+        // Means: running sum + count.
+        var restingSum = 0.0; var restingN = 0
+        var hrvSum = 0.0;     var hrvN = 0
+        var spo2Sum = 0.0;    var spo2N = 0
+        var respSum = 0.0;    var respN = 0
+        var walkingSum = 0.0; var walkingN = 0
+        var hrSum = 0.0;      var hrN = 0
+        // HeartRate max (running).
+        var hrMax: Double?
+        // Sums + presence flags.
+        // #589: per-SOURCE step sums. Apple Health keeps overlapping step samples from EACH device
+        // (an iPhone AND an Apple Watch both count the same walk); summing across sources double-counts
+        // (~2x). We sum WITHIN a source but take the MAX source per day at finish() — the de-overlap
+        // Apple's own Health app shows instead of a raw sum.
+        var stepsBySource: [String: Double] = [:]
+        var active = 0.0; var hasActive = false
+        var basal = 0.0;  var hasBasal = false
+        // Latest-by-end values.
+        var vo2: Double?;     var vo2At: Date?
+        var weight: Double?;  var weightAt: Date?
+        var bodyFat: Double?; var bodyFatAt: Date?
+        var lean: Double?;    var leanAt: Date?
+        var bmi: Double?;     var bmiAt: Date?
+    }
+
+    private var byDay: [String: DayAcc] = [:]
+    /// Preserve first-seen day order for deterministic output before the sort
+    /// (mirrors `daily(samples:)`'s `order` array).
+    private var order: [String] = []
+
+    public init() {}
+
+    /// Fold one sample into the running per-day state. Applies the SAME
+    /// reduction rules as `AppleHealthAggregator.daily(samples:)`.
+    public mutating func add(_ s: HealthSample) {
+        let type = AppleHealthAggregator.normalizedType(s.type)
+        let day = AppleHealthAggregator.localDay(s.start, tzOffsetMin: s.tzOffsetMin)
+        if byDay[day] == nil {
+            byDay[day] = DayAcc()
+            order.append(day)
+        }
+
+        switch type {
+        case AppleHealthAggregator.restingHR:
+            if let v = s.value { byDay[day]!.restingSum += v; byDay[day]!.restingN += 1 }
+        case AppleHealthAggregator.hrvSDNN:
+            if let v = s.value { byDay[day]!.hrvSum += v; byDay[day]!.hrvN += 1 }
+        case AppleHealthAggregator.spo2:
+            if let v = s.value {
+                // Detect fraction (0..1) → percent. The importer already scales
+                // OxygenSaturation by 100, but defend against raw fractional
+                // values here too. (Identical to daily().)
+                let pct = (v > 0 && v <= 1.0) ? v * 100.0 : v
+                byDay[day]!.spo2Sum += pct; byDay[day]!.spo2N += 1
+            }
+        case AppleHealthAggregator.respRate:
+            if let v = s.value { byDay[day]!.respSum += v; byDay[day]!.respN += 1 }
+        case AppleHealthAggregator.walkingHR:
+            if let v = s.value { byDay[day]!.walkingSum += v; byDay[day]!.walkingN += 1 }
+        case AppleHealthAggregator.heartRate:
+            if let v = s.value {
+                byDay[day]!.hrSum += v; byDay[day]!.hrN += 1
+                if let m = byDay[day]!.hrMax { byDay[day]!.hrMax = Swift.max(m, v) }
+                else { byDay[day]!.hrMax = v }
+            }
+        case AppleHealthAggregator.stepCount:
+            // Sum WITHIN a source, never across sources (iPhone + Watch overlap → double-count). (#589)
+            if let v = s.value { byDay[day]!.stepsBySource[s.sourceName ?? "", default: 0] += v }
+        case AppleHealthAggregator.activeEnergy:
+            if let v = s.value { byDay[day]!.active += v; byDay[day]!.hasActive = true }
+        case AppleHealthAggregator.basalEnergy:
+            if let v = s.value { byDay[day]!.basal += v; byDay[day]!.hasBasal = true }
+        case AppleHealthAggregator.vo2max:
+            if let v = s.value {
+                let acc = byDay[day]!
+                if acc.vo2 == nil || (acc.vo2At ?? .distantPast) <= s.end {
+                    byDay[day]!.vo2 = v
+                    byDay[day]!.vo2At = s.end
+                }
+            }
+        case AppleHealthAggregator.bodyMass:
+            if let v = s.value {
+                // HealthKit stores BodyMass in kg by default. If the unit looks
+                // like pounds, convert to kg; otherwise assume kg.
+                let kg = AppleHealthAggregator.unitLooksLikePounds(s.unit) ? v * 0.453592 : v
+                let acc = byDay[day]!
+                if acc.weight == nil || (acc.weightAt ?? .distantPast) <= s.end {
+                    byDay[day]!.weight = kg
+                    byDay[day]!.weightAt = s.end
+                }
+            }
+        case AppleHealthAggregator.bodyFat:
+            if let v = s.value {
+                // HealthKit stores a 0..1 fraction → percent. Defend against
+                // already-percent values the same way SpO2 does.
+                let pct = (v > 0 && v <= 1.0) ? v * 100.0 : v
+                let acc = byDay[day]!
+                if acc.bodyFat == nil || (acc.bodyFatAt ?? .distantPast) <= s.end {
+                    byDay[day]!.bodyFat = pct
+                    byDay[day]!.bodyFatAt = s.end
+                }
+            }
+        case AppleHealthAggregator.leanMass:
+            if let v = s.value {
+                let kg = AppleHealthAggregator.unitLooksLikePounds(s.unit) ? v * 0.453592 : v
+                let acc = byDay[day]!
+                if acc.lean == nil || (acc.leanAt ?? .distantPast) <= s.end {
+                    byDay[day]!.lean = kg
+                    byDay[day]!.leanAt = s.end
+                }
+            }
+        case AppleHealthAggregator.bodyMassIndex:
+            if let v = s.value {
+                let acc = byDay[day]!
+                if acc.bmi == nil || (acc.bmiAt ?? .distantPast) <= s.end {
+                    byDay[day]!.bmi = v
+                    byDay[day]!.bmiAt = s.end
+                }
+            }
+        default:
+            break
+        }
+    }
+
+    /// Emit the per-day aggregates (mean = sum/count, running max, sums, latest),
+    /// in first-seen order then sorted ascending by day — identical to
+    /// `daily(samples:)`.
+    public func finish() -> [AppleDailyAggregate] {
+        func mean(_ sum: Double, _ n: Int) -> Double? { n == 0 ? nil : sum / Double(n) }
+
+        let result: [AppleDailyAggregate] = order.map { day in
+            let a = byDay[day]!
+            return AppleDailyAggregate(
+                day: day,
+                restingHr: mean(a.restingSum, a.restingN),
+                hrvSDNN: mean(a.hrvSum, a.hrvN),
+                spo2Pct: mean(a.spo2Sum, a.spo2N),
+                respRate: mean(a.respSum, a.respN),
+                avgHr: mean(a.hrSum, a.hrN),
+                maxHr: a.hrMax,
+                walkingHr: mean(a.walkingSum, a.walkingN),
+                steps: a.stepsBySource.isEmpty ? nil : a.stepsBySource.values.max(),   // #589 max source, not cross-source sum
+                activeKcal: a.hasActive ? a.active : nil,
+                basalKcal: a.hasBasal ? a.basal : nil,
+                vo2max: a.vo2,
+                weightKg: a.weight,
+                bodyFatPct: a.bodyFat,
+                leanMassKg: a.lean,
+                bmi: a.bmi
+            )
+        }
+        return result.sorted { $0.day < $1.day }
     }
 }

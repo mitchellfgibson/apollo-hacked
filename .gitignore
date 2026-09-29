@@ -9,6 +9,21 @@ Icon?
 *.xcodeproj/
 *.xcworkspace/
 !*.xcworkspace/contents.xcworkspacedata
+# …EXCEPT the xcodeproj's SPM lockfile. The shipped app builds from this Package.resolved,
+# so it MUST be tracked — otherwise a clean checkout resolves a floating, uncommitted lockfile
+# that could drift to a newer (potentially compromised) upstream release. Supply-chain pin.
+# Git won't descend into an excluded directory, so re-include each ancestor on the path, then
+# re-exclude its contents with a wildcard so ONLY Package.resolved gets tracked (not the
+# generated project.pbxproj / contents.xcworkspacedata / xcuserdata cruft).
+!Strand.xcodeproj/
+Strand.xcodeproj/*
+!Strand.xcodeproj/project.xcworkspace/
+Strand.xcodeproj/project.xcworkspace/*
+!Strand.xcodeproj/project.xcworkspace/xcshareddata/
+Strand.xcodeproj/project.xcworkspace/xcshareddata/*
+!Strand.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/
+Strand.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/*
+!Strand.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
 build/
 DerivedData/
 .build/
@@ -54,6 +69,10 @@ android/app/release/
 # ── Misc / secrets (never commit) ───────────────────────────────
 *.log
 .env
+# Deployment credentials (PAT / signing / endpoints) — never commit. `.env` above
+# won't match `deploy.env`, so list it (and any `deploy.env.<stage>`) explicitly.
+deploy.env
+deploy.env.*
 secrets.*
 android/local.properties
 android/keystore.properties
@@ -68,3 +87,34 @@ export.xml
 export.zip
 *whoop_export*.zip
 *apple_health*.zip
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Local release artifacts (zips/ipas built for upload; never tracked)
+dist/
+err.txt
+
+# Oura OAuth app credentials (BYO; never committed)
+Strand/Oura/OuraSecrets.xcconfig
+
+# Personal bundle id prefix (BYO; never committed)
+Config/BundleIdSecrets.xcconfig
+
+# (#979) The linux-capture workbench moved from `tools/` to `Tools/` when the two case-colliding
+# trees were merged. On a case-SENSITIVE filesystem any capture a contributor already had stays
+# behind at the old path, where that tool's own .gitignore no longer reaches it — and those files
+# carry HR and timeline, while the .db carries the strap serial, session token and MAC.
+#
+# These are DATA patterns only, never the bare directory. Git folds case in .gitignore when
+# core.ignorecase is on (which it is on macOS), so `tools/linux-capture/` would also match the REAL
+# `Tools/linux-capture/` and silently ignore every new file added there — a new test suite would
+# vanish, which is the exact failure this whole normalisation exists to prevent. Every pattern below
+# is one that Tools/linux-capture/.gitignore already applies, so folding onto the real tree is a
+# no-op there while the orphaned old path stays covered here.
+tools/linux-capture/*.json
+tools/linux-capture/*.db
+tools/linux-capture/*.db-wal
+tools/linux-capture/*.db-shm
+tools/linux-capture/captures/

@@ -1,16 +1,29 @@
+#if !os(watchOS)
+// StrainGauge uses .onContinuousHover + ChartHover tooltips (unavailable on watchOS); the watch
+// uses GlowRing instead, so the whole view is excluded there. iOS/macOS unchanged.
 import SwiftUI
 
 // MARK: - Strain Gauge (§9.1 strain ramp)
 //
-// Ember → magenta gauge for the 0–21 Whoop strain scale. Same open-gauge
-// instrument language as the Recovery Ring, but warm (output / heat) instead of
-// the cool recovery scale. Filled to strain/21 of a 240° arc, with a soft bloom
-// and a leading bead at the tip.
+// Blue Effort gauge for the strain/effort scale (WHOOP: the always-blue effort ramp,
+// no gold). Same open-gauge instrument language as the Recovery Ring, but cardiovascular
+// output instead of the value-based recovery scale. Filled to strain/outOf of a 240° arc,
+// flat and crisp (no bloom) with a clean leading bead at the tip.
+//
+// `outOf` is the maximum of the scale the passed `strain` is ON (default 21 for the
+// WHOOP Day-Strain axis). The Effort hero gauge passes the value already converted to
+// the user's selected display scale (#268) plus its matching max (100 or 21), so the
+// arc fraction, the centre numeral and the "of N" caption all read on the same scale
+// instead of being hardcoded to 0–21. The gauge stays scale-agnostic — the caller owns
+// the conversion (EffortScale lives in the app layer, not this design package).
 
 public struct StrainGauge: View {
 
-    /// Strain value on the 0...21 scale.
+    /// Strain value on the displayed scale (its maximum is `outOf`).
     public var strain: Double
+    /// The maximum of the scale `strain` is on — the arc fills `strain/outOf` and the caption
+    /// reads "of \(outOf)". Defaults to 21 (WHOOP Day Strain) so existing call sites are unchanged.
+    public var outOf: Double
     /// Optional supporting line, e.g. "moderate cardiovascular load".
     public var supporting: String?
     public var diameter: CGFloat
@@ -23,6 +36,7 @@ public struct StrainGauge: View {
 
     public init(
         strain: Double,
+        outOf: Double = 21,
         supporting: String? = nil,
         diameter: CGFloat = 200,
         lineWidth: CGFloat = 14,
@@ -31,6 +45,7 @@ public struct StrainGauge: View {
         valueFormat: @escaping (Double) -> String = { String(format: "Strain %.1f", $0) }
     ) {
         self.strain = strain
+        self.outOf = outOf
         self.supporting = supporting
         self.diameter = diameter
         self.lineWidth = lineWidth
@@ -41,34 +56,46 @@ public struct StrainGauge: View {
 
     /// Cursor location while hovering, in gauge-local coordinates.
     @State private var hoverPoint: CGPoint? = nil
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    /// A short load word for the strain value, mirroring the recovery state idea.
-    private var strainWord: String {
-        switch strain {
-        case ..<6:   return "LIGHT"
-        case ..<10:  return "MODERATE"
-        case ..<14:  return "STRENUOUS"
-        case ..<18:  return "HIGH"
-        default:     return "ALL-OUT"
+    /// A short load word for the strain value, mirroring the recovery state idea. Computed off the
+    /// fraction (not the raw value) so the bands read the same on the 0–100 and 0–21 display scales.
+    public static func stateLabel(forFraction fraction: Double) -> String {
+        switch min(max(fraction, 0), 1) {
+        case ..<(6.0 / 21):   return String(localized: "LIGHT", bundle: .module)
+        case ..<(10.0 / 21):  return String(localized: "MODERATE", bundle: .module)
+        case ..<(14.0 / 21):  return String(localized: "STRENUOUS", bundle: .module)
+        case ..<(18.0 / 21):  return String(localized: "HIGH", bundle: .module)
+        default:              return String(localized: "ALL-OUT", bundle: .module)
         }
     }
+    private var strainWord: String { Self.stateLabel(forFraction: fraction) }
 
-    private let arcSpanDegrees: Double = 240
-    private var startAngle: Angle { .degrees(150) }
-    private var endAngle: Angle { .degrees(150 + arcSpanDegrees) }
-
+    // The 240° open-gauge geometry + bloom now live in the shared `BevelGauge`.
     @State private var animatedFraction: Double = 0
     @State private var bloomPulse = false
 
-    private var fraction: Double { min(max(strain / 21.0, 0), 1) }
-    private var tipColor: Color { StrandPalette.strainColor(strain) }
-    private var bloomOpacity: Double { 0.16 + 0.34 * fraction }
-    private var bloomRadius: CGFloat { lineWidth * (0.8 + 1.2 * fraction) }
+    private var fraction: Double { min(max(strain / outOf, 0), 1) }
+    /// Tip tint sampled by the fill FRACTION so it spans the full ember→amber ramp identically on the
+    /// 0–100 and 0–21 display scales (a maxed gauge reaches the bright-amber peak, not a stuck ember).
+    private var tipColor: Color { StrandPalette.effortTint(fraction: fraction) }
 
     public var body: some View {
         ZStack {
-            ring
-            if showsLabel { centerLabel }
+            BevelGauge(
+                fraction: fraction,
+                stops: StrandPalette.strainStops,
+                tipColor: tipColor,
+                numberText: strainString,
+                captionText: showsLabel ? "of \(Int(outOf.rounded()))" : nil,
+                stateText: showsLabel ? strainWord : nil,
+                supporting: supporting,
+                diameter: diameter,
+                lineWidth: lineWidth,
+                showsLabel: showsLabel,
+                animatedFraction: animatedFraction,
+                bloomActive: bloomPulse
+            )
             if showsHover, let pt = hoverPoint {
                 PositionedTooltip(
                     anchor: pt,
@@ -83,6 +110,10 @@ public struct StrainGauge: View {
             }
         }
         .frame(width: diameter, height: diameter)
+        // Collapse the loose center Text fragments into one coherent VoiceOver element.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(valueFormat(strain)))
+        .accessibilityValue(Text(strainWord))
         .contentShape(Rectangle())
         .onContinuousHover(coordinateSpace: .local) { phase in
             guard showsHover else { return }
@@ -92,97 +123,17 @@ public struct StrainGauge: View {
             }
         }
         .onAppear {
-            withAnimation(StrandMotion.drawIn) { animatedFraction = fraction }
-            bloomPulse = true
+            withAnimation(StrandMotion.drawIn(reduced: reduceMotion)) { animatedFraction = fraction }
+            // Reduce Motion: leave the bloom at its resting opacity instead of breathing.
+            if !reduceMotion { bloomPulse = true }
         }
-        .onChange(of: strain) { _ in
-            withAnimation(StrandMotion.drawIn) { animatedFraction = fraction }
-        }
-    }
-
-    private var ring: some View {
-        ZStack {
-            arc(to: animatedFraction)
-                .stroke(
-                    AngularGradient(
-                        gradient: StrandPalette.strainGradient,
-                        center: .center,
-                        startAngle: startAngle,
-                        endAngle: endAngle
-                    ),
-                    style: StrokeStyle(lineWidth: lineWidth * 1.05, lineCap: .round)
-                )
-                .blur(radius: bloomRadius)
-                .opacity(bloomOpacity * (bloomPulse ? 1.0 : 0.8))
-                .animation(StrandMotion.breathe, value: bloomPulse)
-                .blendMode(.plusLighter)
-
-            arc(to: 1.0)
-                .stroke(StrandPalette.hairline.opacity(0.55),
-                        style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
-
-            arc(to: animatedFraction)
-                .stroke(
-                    AngularGradient(
-                        gradient: StrandPalette.strainGradient,
-                        center: .center,
-                        startAngle: startAngle,
-                        endAngle: endAngle
-                    ),
-                    style: StrokeStyle(lineWidth: lineWidth, lineCap: .round)
-                )
-
-            if animatedFraction > 0.001 { bead }
-        }
-    }
-
-    private var bead: some View {
-        GeometryReader { geo in
-            let radius = (min(geo.size.width, geo.size.height) - lineWidth) / 2
-            let center = CGPoint(x: geo.size.width / 2, y: geo.size.height / 2)
-            let tipAngle = startAngle.radians + (arcSpanDegrees * .pi / 180) * animatedFraction
-            let pt = CGPoint(x: center.x + radius * cos(tipAngle),
-                             y: center.y + radius * sin(tipAngle))
-            ZStack {
-                Circle().fill(tipColor)
-                    .frame(width: lineWidth * 2.2, height: lineWidth * 2.2)
-                    .blur(radius: lineWidth * 0.85).opacity(0.7).blendMode(.plusLighter)
-                Circle().fill(Color.white)
-                    .frame(width: lineWidth * 0.58, height: lineWidth * 0.58)
-                    .overlay(Circle().fill(tipColor).opacity(0.35))
-            }
-            .position(pt)
-        }
-    }
-
-    private var centerLabel: some View {
-        VStack(spacing: 2) {
-            Text(strainString)
-                .font(StrandFont.display(diameter * 0.26))
-                .foregroundStyle(StrandPalette.textPrimary)
-                .contentTransition(.numericText())
-            Text("STRAIN")
-                .font(StrandFont.overline)
-                .tracking(StrandFont.overlineTracking)
-                .foregroundStyle(tipColor)
-            if let supporting {
-                Text(supporting)
-                    .font(StrandFont.footnote)
-                    .foregroundStyle(StrandPalette.textSecondary)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: diameter * 0.78)
-                    .padding(.top, 4)
-            }
+        .onChangeCompat(of: strain) { _ in
+            withAnimation(StrandMotion.drawIn(reduced: reduceMotion)) { animatedFraction = fraction }
         }
     }
 
     private var strainString: String {
         String(format: "%.1f", strain)
-    }
-
-    private func arc(to fraction: Double) -> RecoveryArc {
-        RecoveryArc(startAngle: startAngle, spanDegrees: arcSpanDegrees,
-                    fraction: fraction, lineWidth: lineWidth)
     }
 }
 
@@ -201,4 +152,5 @@ public struct StrainGauge: View {
     .background(StrandPalette.surfaceBase)
     .preferredColorScheme(.light)
 }
+#endif
 #endif

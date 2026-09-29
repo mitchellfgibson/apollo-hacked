@@ -1,9 +1,14 @@
 package com.noop.ui
 
+import com.noop.R
+import androidx.compose.ui.res.stringResource
+import android.content.Context
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -37,16 +42,25 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.noop.data.DailyMetric
+import com.noop.data.MoodStore
+import com.noop.ingest.NutritionCsvImporter
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.sqrt
@@ -80,6 +94,10 @@ data class CompareMetric(
     val unit: String,
     val source: String,      // "my-whoop" or "apple-health"
     val decimals: Int,
+    // Optional honesty note shown in the metric picker (e.g. BMI is derived from the profile height
+    // when it comes from Health Connect, since Health Connect carries no measured BMI record). The
+    // parity-locked [title] stays identical to the iOS MetricCatalog; the caveat lives here instead.
+    val note: String? = null,
 ) {
     val id: String get() = "$source:$key"
 
@@ -91,6 +109,37 @@ data class CompareMetric(
         }
         return if (unit.isEmpty()) n else "$n $unit"
     }
+
+    /** Unit-aware format (D#103): weight/lean_mass (kg) and skin_temp (°C / Δ°C) convert + relabel via
+     *  [UnitFormatter] / [SkinTempDisplay]; everything else falls through. */
+    fun format(v: Double, system: UnitSystem, temperature: TemperatureUnit): String = when (unit) {
+        "kg" -> UnitFormatter.massFromKilograms(v, system)
+        "°C" -> if (key == "skin_temp") {
+            // #622: absolute vs baseline-deviation share the same key — label Δ°C when deviation.
+            com.noop.analytics.SkinTempDisplay.format(
+                v,
+                fahrenheit = temperature == TemperatureUnit.FAHRENHEIT,
+                decimals = decimals,
+            )
+        } else {
+            UnitFormatter.temperatureFromCelsius(v, temperature, decimals)
+        }
+        else -> format(v)
+    }
+
+    /** Like [format] but for a DIFFERENCE: a temperature delta omits the +32 offset. */
+    fun formatDelta(v: Double, system: UnitSystem, temperature: TemperatureUnit): String = when (unit) {
+        "kg" -> UnitFormatter.massFromKilograms(v, system)
+        "°C" -> UnitFormatter.temperatureDeltaFromCelsius(v, temperature, decimals)
+        else -> format(v)
+    }
+
+    /** Displayed unit LABEL mapped to the active system (kg→lb, °C→°F); others unchanged. */
+    fun displayUnit(system: UnitSystem, temperature: TemperatureUnit): String = when (unit) {
+        "kg" -> UnitFormatter.massUnit(system)
+        "°C" -> UnitFormatter.temperatureUnit(temperature)
+        else -> unit
+    }
 }
 
 /**
@@ -99,7 +148,7 @@ data class CompareMetric(
  * [DailyMetric] so a my-whoop metric can be derived from the daily cache as a fallback.
  */
 private object CompareCatalog {
-    val categories = listOf("Heart", "Recovery", "Sleep", "Strain", "Health")
+    val categories = listOf("Heart", "Charge", "Rest", "Effort", "Health", "Nutrition", "Mind")
 
     val all: List<CompareMetric> = listOf(
         // Heart
@@ -107,34 +156,55 @@ private object CompareCatalog {
         CompareMetric("max_hr", "Max Heart Rate", "Heart", "bpm", "my-whoop", 0),
         CompareMetric("energy_kcal", "Calories", "Heart", "kcal", "my-whoop", 0),
         CompareMetric("vo2max", "VO₂ Max", "Heart", "", "apple-health", 1),
-        // Recovery
-        CompareMetric("recovery", "Recovery", "Recovery", "%", "my-whoop", 0),
-        CompareMetric("hrv", "Heart Rate Variability", "Recovery", "ms", "my-whoop", 0),
-        CompareMetric("rhr", "Resting Heart Rate", "Recovery", "bpm", "my-whoop", 0),
-        CompareMetric("resp_rate", "Respiratory Rate", "Recovery", "rpm", "my-whoop", 1),
-        CompareMetric("spo2", "Blood Oxygen", "Recovery", "%", "my-whoop", 0),
-        CompareMetric("skin_temp", "Skin Temperature", "Recovery", "°C", "my-whoop", 1),
-        // Sleep
-        CompareMetric("sleep_performance", "Sleep Performance", "Sleep", "%", "my-whoop", 0),
-        CompareMetric("sleep_total_min", "Asleep Time", "Sleep", "min", "my-whoop", 0),
-        CompareMetric("sleep_efficiency", "Sleep Efficiency", "Sleep", "%", "my-whoop", 0),
-        CompareMetric("sleep_deep_min", "Deep (SWS) Sleep", "Sleep", "min", "my-whoop", 0),
-        CompareMetric("sleep_rem_min", "REM Sleep", "Sleep", "min", "my-whoop", 0),
-        CompareMetric("sleep_light_min", "Light Sleep", "Sleep", "min", "my-whoop", 0),
-        // Strain
-        CompareMetric("strain", "Day Strain", "Strain", "/21", "my-whoop", 1),
-        CompareMetric("steps", "Steps", "Strain", "", "apple-health", 0),
-        CompareMetric("active_kcal", "Active Energy", "Strain", "kcal", "apple-health", 0),
+        CompareMetric("fitness_age", "Fitness Age", "Heart", "yrs", "my-whoop", 0),
+        CompareMetric("vo2max_est", "VO₂ Max (estimated)", "Heart", "", "my-whoop", 1),
+        CompareMetric("vitality", "Vitality", "Heart", "", "my-whoop", 0),
+        CompareMetric("body_age", "Body Age", "Heart", "yrs", "my-whoop", 0),
+        // Charge (was Recovery)
+        CompareMetric("recovery", "Charge", "Charge", "%", "my-whoop", 0),
+        CompareMetric("hrv", "Heart Rate Variability", "Charge", "ms", "my-whoop", 0),
+        CompareMetric("rhr", "Resting Heart Rate", "Charge", "bpm", "my-whoop", 0),
+        CompareMetric("resp_rate", "Respiratory Rate", "Charge", "rpm", "my-whoop", 1),
+        CompareMetric("spo2", "Blood Oxygen", "Charge", "%", "my-whoop", 0),
+        CompareMetric("skin_temp", "Skin Temperature", "Charge", "°C", "my-whoop", 1),
+        // Rest (was Sleep)
+        CompareMetric("sleep_performance", "Rest", "Rest", "%", "my-whoop", 0),
+        CompareMetric("sleep_total_min", "Asleep Time", "Rest", "min", "my-whoop", 0),
+        CompareMetric("sleep_efficiency", "Sleep Efficiency", "Rest", "%", "my-whoop", 0),
+        CompareMetric("sleep_deep_min", "Deep (SWS) Sleep", "Rest", "min", "my-whoop", 0),
+        CompareMetric("sleep_rem_min", "REM Sleep", "Rest", "min", "my-whoop", 0),
+        CompareMetric("sleep_light_min", "Light Sleep", "Rest", "min", "my-whoop", 0),
+        // Effort (was Strain)
+        CompareMetric("strain", "Effort", "Effort", "/100", "my-whoop", 1),
+        CompareMetric("steps", "Steps", "Effort", "", "apple-health", 0),
+        // On-device steps ESTIMATE for a WHOOP 4.0 (no real step count over BLE): the strap's daily
+        // motion volume scaled by a personal calibration, stored under the computed "-noop" source.
+        // Distinct from the real "steps" above — labelled "(estimated)" so it never reads as measured.
+        CompareMetric("steps_est", "Steps (estimated)", "Effort", "steps", "my-whoop", 0),
+        CompareMetric("active_kcal", "Active Energy", "Effort", "kcal", "apple-health", 0),
         // Health / Body
         CompareMetric("weight", "Weight", "Health", "kg", "apple-health", 1),
         CompareMetric("body_fat", "Body Fat", "Health", "%", "apple-health", 1),
         CompareMetric("lean_mass", "Lean Body Mass", "Health", "kg", "apple-health", 1),
-        CompareMetric("bmi", "BMI", "Health", "", "apple-health", 1),
+        CompareMetric(
+            "bmi", "BMI", "Health", "", "apple-health", 1,
+            note = "From Health Connect this is derived from your weight and profile height.",
+        ),
+        // Nutrition (imported from a food-tracker CSV — calories-in next to calories-out).
+        // Mirrors the macOS MetricCatalog entries exactly (same keys + sources, v2.2.0 parity).
+        CompareMetric("calories_in", "Calories In", "Nutrition", "kcal", NutritionCsvImporter.SOURCE_ID, 0),
+        CompareMetric("protein_g", "Protein", "Nutrition", "g", NutritionCsvImporter.SOURCE_ID, 0),
+        CompareMetric("carbs_g", "Carbs", "Nutrition", "g", NutritionCsvImporter.SOURCE_ID, 0),
+        CompareMetric("fat_g", "Fat", "Nutrition", "g", NutritionCsvImporter.SOURCE_ID, 0),
+        // Mind (daily mood check-in, 1–5; non-clinical self-tracking).
+        CompareMetric("mood", "Mood", "Mind", "/5", MoodStore.MOOD_DEVICE_ID, 0),
     )
 
     fun inCategory(c: String): List<CompareMetric> = all.filter { it.category == c }
 
     fun byKey(key: String): CompareMetric? = all.firstOrNull { it.key == key }
+
+    fun byId(id: String): CompareMetric? = all.firstOrNull { it.id == id }
 
     /** Map a my-whoop metric key to the matching DailyMetric column accessor, if any. */
     fun dailyPick(key: String): ((DailyMetric) -> Double?)? = when (key) {
@@ -168,6 +238,54 @@ private enum class CompareRange(val label: String, val days: Int?, val phrase: S
     /** This range plus every LARGER range, ascending — the auto-expand search order. */
     val widening: List<CompareRange>
         get() = entries.subList(ordinal, entries.size)
+}
+
+private val defaultCompareMetricKeys = listOf("recovery", "sleep_performance", "weight")
+
+internal fun parseCompareSelection(raw: String?, minSelection: Int, maxSelection: Int): List<CompareMetric>? {
+    if (raw == null) return null
+
+    val tokens = raw.split(",")
+        .map { it.trim() }
+        .filter { it.isNotEmpty() }
+    val parsed = tokens
+        .mapNotNull { CompareCatalog.byId(it) }
+        .distinctBy { it.id }
+        .take(maxSelection)
+
+    return if (parsed.size == tokens.distinct().size || parsed.size >= minSelection) {
+        parsed
+    } else {
+        null
+    }
+}
+
+private object ComparePrefs {
+    private const val KEY_RANGE = "compare.range"
+    private const val KEY_SELECTED = "compare.selectedMetrics"
+
+    fun readRange(context: Context): CompareRange {
+        val raw = NoopPrefs.of(context).getString(KEY_RANGE, null) ?: return CompareRange.Year
+        return CompareRange.entries.firstOrNull { it.name == raw } ?: CompareRange.Year
+    }
+
+    fun writeRange(context: Context, range: CompareRange) {
+        NoopPrefs.of(context).edit().putString(KEY_RANGE, range.name).apply()
+    }
+
+    fun readSelection(context: Context, minSelection: Int, maxSelection: Int): List<CompareMetric> {
+        val raw = NoopPrefs.of(context).getString(KEY_SELECTED, null)
+        parseCompareSelection(raw, minSelection, maxSelection)?.let { return it }
+
+        val picks = defaultCompareMetricKeys.mapNotNull { CompareCatalog.byKey(it) }
+        return (if (picks.isEmpty()) CompareCatalog.all.take(2) else picks).take(maxSelection)
+    }
+
+    fun writeSelection(context: Context, selected: List<CompareMetric>) {
+        NoopPrefs.of(context).edit()
+            .putString(KEY_SELECTED, selected.joinToString(",") { it.id })
+            .apply()
+    }
 }
 
 // MARK: - Per-series model
@@ -276,18 +394,21 @@ private object CorrelationEngine {
 fun CompareScreen(vm: AppViewModel) {
     val days by vm.recentDays.collectAsStateWithLifecycle()
 
+    // Liquid finish (pilot pattern): the time-of-day sky settles behind the top of the screen, gated on the
+    // same day-cycle-background preference the liquid Today honours. Off = the flat dark canvas path.
+    val context = LocalContext.current
+    val showDayCycleBackground = remember { NoopPrefs.showDayCycleBackground(context) }
+    val skyBehindCards = remember { NoopPrefs.skyBehindCards(context) }
+
     val maxSelection = 4
     val minSelection = 2
 
-    // Default starter selection (falls back gracefully if a key is missing).
-    val defaultKeys = listOf("recovery", "sleep_performance", "weight")
-
-    var range by remember { mutableStateOf(CompareRange.Year) }
+    var range by remember { mutableStateOf(ComparePrefs.readRange(context)) }
     // Ordered selection (max 4). Drives both the legend order and color mapping.
     val selected = remember {
-        val picks = defaultKeys.mapNotNull { CompareCatalog.byKey(it) }
-        val seed = if (picks.isEmpty()) CompareCatalog.all.take(2) else picks.take(maxSelection)
-        mutableStateListOf<CompareMetric>().apply { addAll(seed) }
+        mutableStateListOf<CompareMetric>().apply {
+            addAll(ComparePrefs.readSelection(context, minSelection, maxSelection))
+        }
     }
     // Full-history series per selected metric id (ascending by day).
     val fullSeries = remember { mutableStateMapOf<String, List<Pair<String, Double>>>() }
@@ -353,21 +474,41 @@ fun CompareScreen(vm: AppViewModel) {
         if (anyWidened) "$base · sparse widened" else base
     }
 
-    ScreenScaffold(title = "Compare", subtitle = "Overlay signals, draw conclusions.") {
+    LazyScreenScaffold(
+        title = uiString(R.string.l10n_compare_screen_compare_8d105cf4),
+        subtitle = "Overlay signals, draw conclusions.",
+        // Liquid sky backdrop (LiquidScreenSky.kt) in the scaffold's topBackground slot, gated on the
+        // day-cycle preference — the same pilot plumbing the liquid Today uses.
+        topBackground = screenBackdropSlot(showDayCycleBackground, skyBehindCards),
+        // Sky-behind-cards fills the viewport so the transparent cards reveal the sky the whole way
+        // down (Today / Trends / Sleep / metric-detail parity - same two prefs, same two behaviours).
+        fullBleedBackground = screenBackdropFullBleed(showDayCycleBackground, skyBehindCards),
+    ) {
 
         // ── Metric picker section (chips + range control)
+        item {
         Column(verticalArrangement = Arrangement.spacedBy(Metrics.gap)) {
-            SectionHeader("Metrics", overline = "Overlay 2–4 signals")
+            SectionHeader("Metrics", overline = "Overlay 2-4 signals")
             NoopCard {
                 Column(verticalArrangement = Arrangement.spacedBy(Metrics.gap)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        SegmentedPillControl(
-                            items = CompareRange.entries.toList(),
-                            selection = range,
-                            label = { it.label },
-                            onSelect = { range = it },
-                        )
-                        Spacer(Modifier.weight(1f))
+                    SegmentedPillControl(
+                        items = CompareRange.entries.toList(),
+                        selection = range,
+                        label = { it.label },
+                        onSelect = {
+                            range = it
+                            ComparePrefs.writeRange(context, it)
+                        },
+                    )
+
+                    // #492: this used to share a row with the segmented range picker. On narrow
+                    // screens the picker consumed the width and collapsed "Add metric" into a
+                    // one-character-wide column. Give the action its own trailing-aligned row so
+                    // both controls retain their intended intrinsic width.
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End,
+                    ) {
                         AddMetricMenu(
                             selectedCount = selected.size,
                             maxSelection = maxSelection,
@@ -379,6 +520,7 @@ fun CompareScreen(vm: AppViewModel) {
                                 } else if (selected.size < maxSelection) {
                                     selected.add(m)
                                 }
+                                ComparePrefs.writeSelection(context, selected)
                             },
                         )
                     }
@@ -393,7 +535,7 @@ fun CompareScreen(vm: AppViewModel) {
 
                     if (selected.isEmpty()) {
                         Text(
-                            "Nothing selected yet.",
+                            uiString(R.string.l10n_compare_screen_nothing_selected_yet_60968db6),
                             style = NoopType.subhead,
                             color = Palette.textTertiary,
                         )
@@ -404,30 +546,38 @@ fun CompareScreen(vm: AppViewModel) {
                                 val i = selected.indexOfFirst { it.id == m.id }
                                 if (i < 0) Palette.textSecondary else seriesPalette[i % seriesPalette.size]
                             },
-                            onRemove = { m -> selected.removeAll { it.id == m.id } },
+                            onRemove = { m ->
+                                selected.removeAll { it.id == m.id }
+                                ComparePrefs.writeSelection(context, selected)
+                            },
                         )
                     }
                 }
             }
         }
+        }
 
         if (selected.size < minSelection) {
-            EmptyNote("Pick at least two metrics above to overlay them and read how they move together.")
+            item {
+                EmptyNote("Pick at least two metrics above to overlay them and read how they move together.")
+            }
         } else {
             val nonEmpty = activeSeries.filter { it.rows.isNotEmpty() }
             if (nonEmpty.isEmpty()) {
                 if (loadedOnce) {
-                    DataPendingNote(
-                        title = "Compare needs at least two metrics with history",
-                        body = "Compare needs at least two metrics with history. Import your " +
-                            "WHOOP export in Data Sources first.",
-                    )
+                    item {
+                        DataPendingNote(
+                            title = uiString(R.string.l10n_compare_screen_compare_needs_at_least_two_metrics_2bfe1fad),
+                            body = "Compare needs at least two metrics with history. Import your " +
+                                "WHOOP export in Data Sources first.",
+                        )
+                    }
                 } else {
-                    EmptyNote("Reading your history…")
+                    item { EmptyNote("Reading your history…") }
                 }
             } else {
-                OverlaySection(nonEmpty, range, anyWidened)
-                CorrelationSection(activeSeries, range)
+                item { OverlaySection(nonEmpty, range, anyWidened) }
+                item { CorrelationSection(activeSeries, range) }
             }
         }
     }
@@ -437,34 +587,20 @@ fun CompareScreen(vm: AppViewModel) {
 
 /**
  * Load the full history for [metric] (ascending by day). Mirrors macOS
- * repo.series(key, source) over the generic metricSeries store; for core my-whoop
- * metrics with a matching DailyMetric column, falls back to the daily cache when the
- * generic store is empty so the screen shows real on-device data.
+ * repo.resolvedSeries(key, source) (PR#196): resolves across compatible sources freshest-wins —
+ * imported WHOOP > NOOP-computed > declared-compatible Apple Health — and gap-fills from the
+ * DailyMetric columns for the days the long-format metricSeries doesn't carry, so the screen shows
+ * real on-device data even when only the daily cache (not the generic importer) has populated.
  */
 private suspend fun loadFullSeries(
     vm: AppViewModel,
     metric: CompareMetric,
-    cachedDays: List<DailyMetric>,
+    @Suppress("UNUSED_PARAMETER") cachedDays: List<DailyMetric>,
 ): List<Pair<String, Double>> {
     // Wide window covering all of history (the macOS days = 4000 default).
     val to = todayDay(1)
     val from = todayDay(-4000)
-    val generic = vm.repo.metricSeries(metric.source, metric.key, from, to)
-        .map { it.day to it.value }
-        .sortedBy { it.first }
-    if (generic.isNotEmpty()) return generic
-
-    // Fallback: derive from the daily metric cache for my-whoop columns.
-    if (metric.source == "my-whoop") {
-        val pick = CompareCatalog.dailyPick(metric.key)
-        if (pick != null) {
-            // Merged: imported WHOOP days win; on-device computed days gap-fill the series.
-            val all = vm.repo.daysMerged("my-whoop")
-            val derived = if (all.isNotEmpty()) all else cachedDays
-            return derived.mapNotNull { d -> pick(d)?.let { d.day to it } }.sortedBy { it.first }
-        }
-    }
-    return emptyList()
+    return vm.repo.resolvedSeries(metric.key, metric.source, from, to, strapDeviceId = vm.activeStrapId).values
 }
 
 /** "yyyy-MM-dd" for today offset by [deltaDays], fixed UTC. */
@@ -504,7 +640,7 @@ private fun AddMetricMenu(
         ) {
             Icon(
                 Icons.Filled.Add,
-                contentDescription = "Add a metric to compare",
+                contentDescription = uiString(R.string.l10n_compare_screen_add_a_metric_to_compare_e6a7c9f1),
                 tint = tint,
                 modifier = Modifier.size(16.dp),
             )
@@ -512,6 +648,7 @@ private fun AddMetricMenu(
                 if (atMax) "Max 4" else "Add metric",
                 style = NoopType.subhead,
                 color = tint,
+                maxLines = 1,
             )
         }
 
@@ -548,11 +685,20 @@ private fun AddMetricMenu(
                                 }
                             },
                             text = {
-                                Text(
-                                    metric.title,
-                                    style = NoopType.body,
-                                    color = if (enabled) Palette.textPrimary else Palette.textTertiary,
-                                )
+                                Column {
+                                    Text(
+                                        metric.title,
+                                        style = NoopType.body,
+                                        color = if (enabled) Palette.textPrimary else Palette.textTertiary,
+                                    )
+                                    metric.note?.let {
+                                        Text(
+                                            it,
+                                            style = NoopType.footnote,
+                                            color = Palette.textTertiary,
+                                        )
+                                    }
+                                }
                             },
                         )
                     }
@@ -597,9 +743,14 @@ private fun MetricChip(
     modifier: Modifier = Modifier,
 ) {
     val shape = RoundedCornerShape(50)
+    // liquidPress on the whole pick chip, driven by the SAME interactionSource that drives its only tap
+    // target (the remove ✕) — so pressing to remove settles the chip inward, the pilot's tappable-card feel.
+    // The remove gesture is unchanged (still the ✕ tap → onRemove).
+    val interaction = remember { MutableInteractionSource() }
     Row(
         modifier = modifier
             .clip(shape)
+            .liquidPress(interaction)
             .background(Palette.surfaceOverlay)
             .border(1.dp, color.copy(alpha = 0.4f), shape)
             .padding(horizontal = 11.dp, vertical = 8.dp),
@@ -622,12 +773,16 @@ private fun MetricChip(
         )
         Icon(
             Icons.Filled.Close,
-            contentDescription = "Remove $title",
+            contentDescription = uiString(R.string.l10n_compare_screen_remove_title_ddb5361c, title),
             tint = Palette.textTertiary,
             modifier = Modifier
                 .size(18.dp)
                 .clip(CircleShape)
-                .clickableNoRippleLocal(enabled = true) { onRemove() }
+                .clickable(
+                    interactionSource = interaction,
+                    indication = null,
+                    onClick = onRemove,
+                )
                 .padding(3.dp),
         )
     }
@@ -643,14 +798,16 @@ private fun OverlaySection(
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(Metrics.gap)) {
         SectionHeader("Overlay", overline = range.phrase, trailing = "${series.size} series")
-        NoopCard {
+        // Anchor the overlay card to the brand-green chrome world; each line keeps its own categorical
+        // series colour so the overlaid lines stay distinguishable against the wash.
+        NoopCard(tint = Palette.accent) {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Overline("Normalized overlay")
                 Text(
                     if (anyWidened) {
-                        "Each line min–max normalized · sparse series widened past ${range.phrase}"
+                        "Each line min-max normalized · sparse series widened past ${range.phrase}"
                     } else {
-                        "Each line min–max normalized within ${range.phrase}"
+                        "Each line min-max normalized within ${range.phrase}"
                     },
                     style = NoopType.footnote,
                     color = Palette.textTertiary,
@@ -686,64 +843,345 @@ private fun OverlaySection(
  */
 @Composable
 private fun OverlayChart(series: List<CompareSeries>, modifier: Modifier) {
-    // Union of all day ordinals present → shared x domain.
-    val dayOrds = remember(series) {
-        series.flatMap { s -> s.rows.mapNotNull { dayOrdinal(it.first) } }
+    // PERF (#scroll-jank — drawing-bound): the old draw lambda re-parsed every day string (dayOrdinal)
+    // and re-normalised every value on EVERY frame, then rebuilt each series' Path. Precompute the
+    // expensive, size-INDEPENDENT part once per `series` change: the parsed (ordinal, normalized) pairs
+    // and the shared x-domain. The math is byte-identical to the old per-point computation; only its
+    // timing moves out of the hot draw loop.
+    val prepared = remember(series) {
+        // Per series: its rows reduced to (ordinal, norm0to1) pairs, dropping unparseable days exactly
+        // as the old `mapNotNull { dayOrdinal(...) }` did — same order, same drop rule, same normalize.
+        val perSeries = series.map { s ->
+            val points = s.rows.mapNotNull { (day, value) ->
+                val ord = dayOrdinal(day) ?: return@mapNotNull null
+                OverlayPreparedPoint(
+                    day = day,
+                    ordinal = ord,
+                    normalized = s.normalized(value).toFloat().coerceIn(0f, 1f),
+                    value = value,
+                )
+            }
+            OverlayPreparedSeries(color = s.color, points = points, source = s)
+        }
+        val dayOrdinals = linkedMapOf<String, Long>()
+        perSeries.forEach { preparedSeries ->
+            preparedSeries.points.forEach { point -> dayOrdinals[point.day] = point.ordinal }
+        }
+        val dayIndex = dayOrdinals.entries
+            .map { it.key to it.value }
+            .sortedBy { it.second }
+        val allOrds = dayIndex.map { it.second }
+        OverlayPrepared(
+            minOrd = allOrds.minOrNull(),
+            maxOrd = allOrds.maxOrNull(),
+            dayIndex = dayIndex,
+            perSeries = perSeries,
+        )
     }
-    val minOrd = dayOrds.minOrNull()
-    val maxOrd = dayOrds.maxOrNull()
+    var selectedDay by remember(prepared) { mutableStateOf<String?>(null) }
 
-    Canvas(modifier = modifier) {
-        val w = size.width
-        val h = size.height
-        if (w <= 0f || h <= 0f) return@Canvas
+    fun selectDay(x: Float, width: Float) {
+        selectedDay = nearestCompareDayForX(
+            dayIndex = prepared.dayIndex,
+            minOrd = prepared.minOrd,
+            maxOrd = prepared.maxOrd,
+            width = width,
+            x = x,
+        )
+    }
 
-        val topPad = 6f
-        val usableH = (h - topPad * 2f).coerceAtLeast(1f)
-
-        // Faint low / mid / high gridlines.
-        val gridColor = Palette.hairline.copy(alpha = 0.4f)
-        for (f in listOf(0f, 0.5f, 1f)) {
-            val y = topPad + (1f - f) * usableH
-            drawLine(
-                color = gridColor,
-                start = Offset(0f, y),
-                end = Offset(w, y),
-                strokeWidth = 1f,
+    val selectionModifier = Modifier
+        .pointerInput(prepared.dayIndex) {
+            detectTapGestures(onTap = { offset -> selectDay(offset.x, size.width.toFloat()) })
+        }
+        .pointerInput(prepared.dayIndex) {
+            detectHorizontalDragGestures(
+                onDragStart = { start -> selectDay(start.x, size.width.toFloat()) },
+                onHorizontalDrag = { change, _ ->
+                    selectDay(change.position.x, size.width.toFloat())
+                    change.consume()
+                },
+                onDragEnd = { selectedDay = null },
+                onDragCancel = { selectedDay = null },
             )
         }
 
-        if (minOrd == null || maxOrd == null) return@Canvas
-        val span = (maxOrd - minOrd).coerceAtLeast(1L).toFloat()
+    // Build the per-series Paths in drawWithCache — rebuilt only when the prepared pairs or the canvas
+    // size change (NOT on unrelated recompositions), instead of allocating a fresh Path every frame.
+    Box(
+        modifier = modifier.then(selectionModifier),
+    ) {
+        Box(
+            modifier = Modifier
+                .matchParentSize()
+                .drawWithCache {
+                    val w = size.width
+                    val h = size.height
+                    val topPad = 6f
+                    val usableH = (h - topPad * 2f).coerceAtLeast(1f)
+                    val minOrd = prepared.minOrd
+                    val maxOrd = prepared.maxOrd
 
-        series.forEach { s ->
-            val pts = s.rows.mapNotNull { (day, value) ->
-                val ord = dayOrdinal(day) ?: return@mapNotNull null
-                val x = if (maxOrd > minOrd) (ord - minOrd).toFloat() / span * w else w / 2f
-                val norm = s.normalized(value).toFloat().coerceIn(0f, 1f)
-                val y = topPad + (1f - norm) * usableH
-                Offset(x, y)
+                    // Pre-place each series' pixel points + Path once (size-dependent, so it lives here, keyed
+                    // on size by drawWithCache). x/y formulas are identical to the old per-frame computation.
+                    data class Built(val color: Color, val path: Path?, val singleDot: Offset?, val last: Offset?)
+                    val built = if (minOrd != null && maxOrd != null) {
+                        val span = (maxOrd - minOrd).coerceAtLeast(1L).toFloat()
+                        prepared.perSeries.map { preparedSeries ->
+                            val pts = preparedSeries.points.map { point ->
+                                val x = if (maxOrd > minOrd) {
+                                    (point.ordinal - minOrd).toFloat() / span * w
+                                } else {
+                                    w / 2f
+                                }
+                                val y = topPad + (1f - point.normalized) * usableH
+                                Offset(x, y)
+                            }
+                            when {
+                                pts.size < 2 -> Built(preparedSeries.color, null, pts.firstOrNull(), null)
+                                else -> {
+                                    val path = Path().apply {
+                                        moveTo(pts.first().x, pts.first().y)
+                                        for (i in 1 until pts.size) lineTo(pts[i].x, pts[i].y)
+                                    }
+                                    Built(preparedSeries.color, path, null, pts.last())
+                                }
+                            }
+                        }
+                    } else {
+                        emptyList()
+                    }
+
+                    val gridColor = Palette.hairline.copy(alpha = 0.4f)
+                    val tipCore = Palette.tipCore
+
+                    onDrawBehind {
+                        if (w <= 0f || h <= 0f) return@onDrawBehind
+
+                        // Faint low / mid / high gridlines.
+                        for (f in listOf(0f, 0.5f, 1f)) {
+                            val y = topPad + (1f - f) * usableH
+                            drawLine(
+                                color = gridColor,
+                                start = Offset(0f, y),
+                                end = Offset(w, y),
+                                strokeWidth = 1f,
+                            )
+                        }
+
+                        if (minOrd == null || maxOrd == null) return@onDrawBehind
+
+                        built.forEach { b ->
+                            if (b.singleDot != null) {
+                                // A single point still renders as a dot so the series is visible.
+                                drawCircle(b.color, radius = 3.5f, center = b.singleDot)
+                                return@forEach
+                            }
+                            if (b.path != null) {
+                                drawPath(
+                                    path = b.path,
+                                    color = b.color,
+                                    style = Stroke(width = 2.2f, cap = StrokeCap.Round, join = StrokeJoin.Round),
+                                )
+                            }
+                            // Bevel "now" end-cap on this series' latest point — soft halo + bright core + white centre.
+                            b.last?.let { last ->
+                                drawCircle(color = b.color.copy(alpha = 0.30f), radius = 8f, center = last)
+                                drawCircle(color = b.color.copy(alpha = 0.65f), radius = 5f, center = last)
+                                drawCircle(color = tipCore, radius = 2.2f, center = last)
+                            }
+                        }
+                    }
+                },
+        )
+
+        val selectedOrdinal = selectedDay?.let { day ->
+            prepared.dayIndex.firstOrNull { it.first == day }?.second
+        }
+        if (selectedDay != null && selectedOrdinal != null && prepared.minOrd != null && prepared.maxOrd != null) {
+            val selected = selectedDay!!
+            Canvas(modifier = Modifier.matchParentSize()) {
+                val w = size.width
+                val h = size.height
+                if (w <= 0f || h <= 0f) return@Canvas
+                val minOrd = prepared.minOrd
+                val maxOrd = prepared.maxOrd
+                val span = (maxOrd - minOrd).coerceAtLeast(1L).toFloat()
+                val x = if (maxOrd > minOrd) {
+                    (selectedOrdinal - minOrd).toFloat() / span * w
+                } else {
+                    w / 2f
+                }
+                val topPad = 6f
+                val usableH = (h - topPad * 2f).coerceAtLeast(1f)
+
+                drawLine(
+                    color = Palette.hairlineStrong,
+                    start = Offset(x, 0f),
+                    end = Offset(x, h),
+                    strokeWidth = 1.dp.toPx(),
+                )
+                prepared.perSeries.forEach { preparedSeries ->
+                    preparedSeries.pointsByDay[selected]?.let { point ->
+                        val y = topPad + (1f - point.normalized) * usableH
+                        drawCircle(
+                            color = Palette.surfaceBase,
+                            radius = 5.dp.toPx(),
+                            center = Offset(x, y),
+                        )
+                        drawCircle(
+                            color = preparedSeries.color,
+                            radius = 3.5.dp.toPx(),
+                            center = Offset(x, y),
+                        )
+                    }
+                }
             }
-            if (pts.size < 2) {
-                // A single point still renders as a dot so the series is visible.
-                pts.firstOrNull()?.let { drawCircle(s.color, radius = 3.5f, center = it) }
-                return@forEach
+
+            val selectedFraction = if (prepared.maxOrd > prepared.minOrd) {
+                (selectedOrdinal - prepared.minOrd).toFloat() / (prepared.maxOrd - prepared.minOrd).toFloat()
+            } else {
+                0.5f
             }
-            val path = Path().apply {
-                moveTo(pts.first().x, pts.first().y)
-                for (i in 1 until pts.size) lineTo(pts[i].x, pts[i].y)
-            }
-            drawPath(
-                path = path,
-                color = s.color,
-                style = Stroke(width = 2.2f, cap = StrokeCap.Round, join = StrokeJoin.Round),
+            CompareChartTooltip(
+                day = selected,
+                series = prepared.perSeries,
+                modifier = Modifier
+                    .align(if (selectedFraction < 0.5f) Alignment.TopEnd else Alignment.TopStart)
+                    .padding(4.dp),
             )
         }
     }
 }
 
+/** Pre-parsed overlay inputs (size-independent): the shared x-domain + each series' (ordinal, norm) pairs. */
+private data class OverlayPrepared(
+    val minOrd: Long?,
+    val maxOrd: Long?,
+    val dayIndex: List<Pair<String, Long>>,
+    val perSeries: List<OverlayPreparedSeries>,
+)
+
+private data class OverlayPreparedPoint(
+    val day: String,
+    val ordinal: Long,
+    val normalized: Float,
+    val value: Double,
+)
+
+private data class OverlayPreparedSeries(
+    val color: Color,
+    val points: List<OverlayPreparedPoint>,
+    val source: CompareSeries,
+) {
+    val pointsByDay: Map<String, OverlayPreparedPoint> = points.associateBy { it.day }
+}
+
+/**
+ * Maps a chart x-coordinate to the nearest day that has at least one value. The union may be sparse
+ * or irregular, so selecting by list index would snap to the wrong date; use the plotted day domain.
+ * Ties choose the earlier day, matching the Apple Compare chart.
+ */
+internal fun nearestCompareDayForX(
+    dayIndex: List<Pair<String, Long>>,
+    minOrd: Long?,
+    maxOrd: Long?,
+    width: Float,
+    x: Float,
+): String? {
+    if (dayIndex.isEmpty() || minOrd == null || maxOrd == null || width <= 0f) return null
+    if (dayIndex.size == 1 || maxOrd <= minOrd) return dayIndex.first().first
+
+    // Promote before division: Float rounding at an exact midpoint (e.g. 60f / 100f) can land just
+    // above the tie and incorrectly select the later day.
+    val fraction = (x.toDouble() / width.toDouble()).coerceIn(0.0, 1.0)
+    val target = minOrd.toDouble() + fraction * (maxOrd - minOrd).toDouble()
+    var low = 0
+    var high = dayIndex.size
+    while (low < high) {
+        val mid = (low + high) / 2
+        if (dayIndex[mid].second < target) low = mid + 1 else high = mid
+    }
+    if (low == 0) return dayIndex.first().first
+    if (low == dayIndex.size) return dayIndex.last().first
+    val before = dayIndex[low - 1]
+    val after = dayIndex[low]
+    return if (target - before.second <= after.second - target) before.first else after.first
+}
+
+@Composable
+private fun CompareChartTooltip(
+    day: String,
+    series: List<OverlayPreparedSeries>,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    val unitSystem = UnitPrefs.system(context)
+    val tempUnit = UnitPrefs.temperature(context)
+    val shape = RoundedCornerShape(10.dp)
+    Column(
+        modifier = modifier
+            .width(220.dp)
+            .clip(shape)
+            .background(Palette.surfaceOverlay)
+            .border(1.dp, Palette.hairline, shape)
+            .padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(5.dp),
+    ) {
+        Text(
+            prettyCompareDay(day),
+            style = NoopType.footnote,
+            color = Palette.textTertiary,
+        )
+        series.forEach { preparedSeries ->
+            val source = preparedSeries.source
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(7.dp),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(7.dp)
+                        .clip(CircleShape)
+                        .background(preparedSeries.color),
+                )
+                Text(
+                    source.metric.title,
+                    style = NoopType.caption,
+                    color = Palette.textSecondary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                Text(
+                    preparedSeries.pointsByDay[day]?.value?.let {
+                        source.metric.format(it, unitSystem, tempUnit)
+                    } ?: "\u2014",
+                    style = NoopType.captionNumber,
+                    color = Palette.textPrimary,
+                    maxLines = 1,
+                )
+            }
+        }
+    }
+}
+
+// Device locale so the weekday/month names translate (a non-English user shouldn't see an English
+// tooltip date). Same pattern + device locale as the iOS twin, so both localize consistently.
+private val compareTooltipDateFormatter: DateTimeFormatter =
+    DateTimeFormatter.ofPattern("EEE d MMM yyyy", Locale.getDefault())
+
+private fun prettyCompareDay(day: String): String =
+    runCatching { LocalDate.parse(day).format(compareTooltipDateFormatter) }.getOrDefault(day)
+
 @Composable
 private fun Legend(series: List<CompareSeries>) {
+    // Imperial/Metric display preference (D#103). Only weight/lean mass (kg) and skin temp (°C) in the
+    // catalog carry a convertible unit; the min–max labels re-label under the toggle. Display-only.
+    val context = LocalContext.current
+    val unitSystem = UnitPrefs.system(context)
+    val tempUnit = UnitPrefs.temperature(context)
     Column {
         series.forEachIndexed { idx, s ->
             Row(
@@ -769,7 +1207,7 @@ private fun Legend(series: List<CompareSeries>) {
                     modifier = Modifier.weight(1f),
                 )
                 Text(
-                    "${s.metric.format(s.realMin)} – ${s.metric.format(s.realMax)}",
+                    uiString(R.string.l10n_compare_screen_s_metric_format_s_realmin_unitsystem_0da2a1f2, s.metric.format(s.realMin, unitSystem, tempUnit), s.metric.format(s.realMax, unitSystem, tempUnit)),
                     style = NoopType.captionNumber,
                     color = Palette.textSecondary,
                 )
@@ -826,7 +1264,7 @@ private fun CorrelationSection(series: List<CompareSeries>, range: CompareRange)
         if (pairs.isEmpty()) {
             NoopCard {
                 Text(
-                    "Not enough overlapping days between these metrics in ${range.phrase}. Widen the range.",
+                    uiString(R.string.l10n_compare_screen_not_enough_overlapping_days_between_these_44563110, range.phrase),
                     style = NoopType.subhead,
                     color = Palette.textTertiary,
                 )
@@ -840,7 +1278,9 @@ private fun CorrelationSection(series: List<CompareSeries>, range: CompareRange)
 @Composable
 private fun PairCard(p: PairResult) {
     val tint = correlationColor(p.r)
-    NoopCard {
+    // Frosted card washed by the relationship's own colour (green positive / rose negative), with a
+    // TrendChip surfacing the signed direction at a glance — Today's delta idiom, applied to r.
+    NoopCard(tint = tint) {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -851,20 +1291,41 @@ private fun PairCard(p: PairResult) {
                     Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(p.b.color))
                 }
                 Text(
-                    "${p.a.metric.title} ↔ ${p.b.metric.title}",
+                    uiString(R.string.l10n_compare_screen_p_a_metric_title_p_b_06c36e56, p.a.metric.title, p.b.metric.title),
                     style = NoopType.headline,
                     color = Palette.textPrimary,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f),
                 )
-                Text("r = ${signedR(p.r)}", style = NoopType.number(18f), color = tint)
+                TrendChip(text = signedR(p.r), color = tint)
+                // Small liquid vessel accent for the headline single value: |r| fills the vessel in the
+                // relationship's own tint, with the signed r rolled up over it (white, tabular, hit-
+                // transparent so a tap falls through). Same r, same tint, same signedR formatting the plain
+                // "r = …" readout used — just visualised as a headline vessel. STATIC (animated = false):
+                // up to six of these render in a scrolling list, so they pose once (the pilot's small-gauge
+                // static-raster rule) rather than each running a live clock.
+                Box(modifier = Modifier.size(38.dp), contentAlignment = Alignment.Center) {
+                    LiquidVessel(
+                        value = abs(p.r).coerceIn(0.0, 1.0),
+                        tint = tint,
+                        animated = false,
+                        modifier = Modifier.size(38.dp),
+                    )
+                    CountUpText(
+                        value = p.r,
+                        format = { signedR(it) },
+                        style = NoopType.number(12f, weight = FontWeight.Bold),
+                        color = Color.White,
+                        modifier = Modifier.clearAndSetSemantics {},
+                    )
+                }
             }
 
             Text(insightSentence(p), style = NoopType.subhead, color = Palette.textSecondary)
 
             Text(
-                "${p.n} overlapping days · ${strengthWord(p.r)} ${directionWord(p.r)} correlation"
+                uiString(R.string.l10n_compare_screen_p_n_overlapping_days_strengthword_p_8a8f56c7, p.n, strengthWord(p.r), directionWord(p.r))
                     .replace("  ", " "),
                 style = NoopType.footnote,
                 color = Palette.textTertiary,
@@ -880,12 +1341,12 @@ private fun insightSentence(p: PairResult): String {
         "(${strengthWord(p.r)} ${directionWord(p.r)}) over ${p.n} shared days.")
         .replace("  ", " ").replace(" )", ")")
     if (abs(p.r) < 0.3) {
-        return "$head No clear relationship — they move largely independently."
+        return "$head No clear relationship - they move largely independently."
     }
     val aT = p.a.metric.title.lowercase()
     val bT = p.b.metric.title.lowercase()
     val verb = if (p.r < 0) "tends to fall" else "tends to rise"
-    return "$head When $aT rises, $bT $verb — a ${strengthWord(p.r)} ${directionWord(p.r)} link."
+    return "$head When $aT rises, $bT $verb - a ${strengthWord(p.r)} ${directionWord(p.r)} link."
 }
 
 private fun signedR(r: Double): String {

@@ -1,6 +1,7 @@
 import Foundation
 import WhoopProtocol
 import WhoopStore
+import StrandAnalytics
 
 /// The subset of WhoopStore the Collector needs. A protocol so tests can inject a spy
 /// (WhoopStore is `final`). WhoopStore conforms via the extension below.
@@ -10,7 +11,7 @@ protocol StoreWriting: AnyObject {
     @discardableResult
     func insert(_ streams: Streams, deviceId: String) async throws
         -> (hr: Int, rr: Int, events: Int, battery: Int,
-            spo2: Int, skinTemp: Int, resp: Int, gravity: Int, ppg: Int, imu: Int)
+            spo2: Int, skinTemp: Int, resp: Int, gravity: Int)
     func enqueueRawBatch(_ meta: RawBatchMeta, frames: [[UInt8]]) async throws
 }
 extension WhoopStore: StoreWriting {}
@@ -42,35 +43,96 @@ final class Collector {
     /// Concrete store for prune + stats (the StoreWriting seam covers the hot insert/enqueue path;
     /// prune/stats are infrequent so a direct reference is clearer than widening the protocol).
     private let concreteStore: WhoopStore?
-    private let deviceId: String
+    /// Device id new samples persist under. MUTABLE so a WHOOP↔WHOOP switch (BLEManager.setActiveDeviceId)
+    /// re-attributes the next flush/standard-HR persist immediately, rather than freezing the id captured
+    /// at construction. Single-WHOOP never switches, so this stays "my-whoop" exactly as a `let` would have.
+    var deviceId: String
     private let policy: CollectorPolicy
     /// Research toggle. When false (DEFAULT) no raw frames are persisted at all — the app is
     /// decoded-only. Injected for tests; backed by UserDefaults in the production init site.
     private let enableRawCapture: Bool
     private let now: () -> Int
+    /// The standard-HR host-received lines, summarised — see `LivePersistTrace.StandardHRHostReceivedTrace`.
+    private var hostReceived = LivePersistTrace.StandardHRHostReceivedTrace()
+    /// Whether the per-sample readout is wanted: the app wires this to the Test Centre's HRV and Connection
+    /// modes, and tests set it directly. Read once per sample, a Bool through a closure.
+    var hostReceivedDetail: () -> Bool = { false }
     private let monotonic: () -> TimeInterval
 
     /// Set once the GET_CLOCK correlation lands (E1). Until then, frames buffer un-persisted.
     var clockRef: ClockRef?
+    /// Strap family for the LIVE decode path. WHOOP 4.0 (default) parses the 4.0 envelope; 5/MG
+    /// parses the puffin envelope (records sit at +4 offsets). Set by BLEManager.configureCollector‐
+    /// Family alongside an identity clockRef — 5/MG live timestamps are already real-unix seconds.
+    var family: DeviceFamily = .whoop4
     /// On-demand bounded raw-capture window. ORs into the raw-persist gate so a "capture
     /// activity sample" action can persist raw even when `enableRawCapture` is off. The window's
     /// monotonic deadline auto-expires so a missed stop callback can't leak raw forever.
     private var rawCapture = RawCaptureWindow()
-    private var buffer: [[UInt8]] = []
-    /// Standard 0x2A37 HR/RR buffer — the reliable, always-on stream, recorded continuously
+    /// #47: buffer the (raw frame, pre-parsed) pair. The raw bytes are still needed for the raw-capture
+    /// outbox; the parse is the one the BLE seam already did, so `flush` doesn't re-decode the batch.
+    private var buffer: [(frame: [UInt8], parsed: ParsedFrame)] = []
+    /// #1118: strap-log sink for the per-transport R-R census. Optional and defaulted to nil so the
+    /// test fakes that construct a Collector are untouched; `BLEManager` wires its own `log`.
+    private let log: ((String) -> Void)?
+    /// #1635: rows ACCEPTED per stream, handed up so `BLEManager` can tally them per LINK and say which
+    /// streams banked when it writes the link epitaph. The counts already exist — `StreamStore.insert`
+    /// returns them and the standard-HR path already binds them for its own trace line — so this carries
+    /// a measurement that was being discarded, rather than taking a new one.
+    private let onBanked: ((BankedCounts) -> Void)?
+    /// #1118: last emit of each LIVE census line, unix seconds; 0 = never. Rate-limited — see
+    /// `RrEmissionStats.shouldEmitLiveCensus`.
+    ///
+    /// Lifetime DIVERGES from the Kotlin twin. These reset whenever `BLEManager.bootstrapStore()`
+    /// rebuilds the Collector (a store rebuild after unlock, among other paths), so a log can carry an
+    /// extra line after one of those. Android keeps its stamps on the process-wide `WhoopBleClient`
+    /// singleton, which a device switch mutates rather than rebuilds, so they never reset there.
+    /// Harmless either way — a rate-limit on a diagnostic, not a measurement — but a reader comparing
+    /// two logs should not have to work out why one has more lines than the other.
+    ///
+    /// @MainActor isolation makes these safe without a lock; the Kotlin fields are deliberately
+    /// unsynchronized instead, since a stale read there costs one duplicate line.
+    private var lastStdRrCensusSec: Int = 0
+    private var lastRealtimeRrCensusSec: Int = 0
+
+    /// Consecutive live-persist failures per transport, and when each last reported.
+    ///
+    /// Kept PER TRANSPORT because the standard 0x2A37 path and the puffin REALTIME_DATA path (#1118) fail
+    /// independently — a shared counter would let one path's success reset the other's run and report a
+    /// persistent failure as a string of first-failures. @MainActor isolation makes these safe without a
+    /// lock; the Kotlin twin uses AtomicInteger because its two flushes can run concurrently on the io
+    /// scope, and there the count is the load-bearing distinction between a transient and a run.
+    private var stdInsertFailures = 0
+    private var realtimeInsertFailures = 0
+    private var lastStdInsertFailureLogMs: Int64 = 0
+    private var lastRealtimeInsertFailureLogMs: Int64 = 0
+
+    /// Standard 0x2A37 HR/RR/contact buffer — the reliable, always-on stream, recorded continuously
     /// (independent of the custom realtime stream or which screen is open).
     private var stdHR: [HRSample] = []
     private var stdRR: [RRInterval] = []
+    private var stdContact: [WhoopEvent] = []
+    /// Last contact state buffered, so only transitions are recorded. See `shouldRecordContact`.
+    private var lastStdContact: StandardHRContact?
     private var batchStartedAt: TimeInterval
     var bufferedCount: Int { buffer.count }
+
+    /// The per-stream accepted-row counts `StreamStore.insert` returns, named so the closure that carries
+    /// them is readable at both ends.
+    typealias BankedCounts = (hr: Int, rr: Int, events: Int, battery: Int,
+                              spo2: Int, skinTemp: Int, resp: Int, gravity: Int)
 
     init(store: StoreWriting, deviceId: String,
          policy: CollectorPolicy = .default,
          enableRawCapture: Bool = false,
+         log: ((String) -> Void)? = nil,
+         onBanked: ((BankedCounts) -> Void)? = nil,
          now: @escaping () -> Int = { Int(Date().timeIntervalSince1970) },
          monotonic: @escaping () -> TimeInterval = { Date().timeIntervalSinceReferenceDate }) {
         self.store = store; self.deviceId = deviceId; self.policy = policy
         self.enableRawCapture = enableRawCapture
+        self.log = log
+        self.onBanked = onBanked
         self.now = now; self.monotonic = monotonic
         self.batchStartedAt = monotonic()
         self.concreteStore = store as? WhoopStore
@@ -82,6 +144,28 @@ final class Collector {
         return try? await s.storageStats()
     }
 
+    /// Decoded history rows in a stable long-form CSV for arbitrary user-selected export windows.
+    func historySensorsCSV(from: Int, to: Int) async -> Data {
+        guard let store = concreteStore, from <= to else { return Data("stream,unix_s,v1,v2,v3,v4\n".utf8) }
+        let limit = min(max(to - from + 1, 1) * 4, 1_000_000)
+        async let hr = try? store.hrSamples(deviceId: deviceId, from: from, to: to, limit: limit)
+        async let battery = try? store.batterySamples(deviceId: deviceId, from: from, to: to, limit: limit)
+        async let spo2 = try? store.spo2Samples(deviceId: deviceId, from: from, to: to, limit: limit)
+        async let temp = try? store.skinTempSamples(deviceId: deviceId, from: from, to: to, limit: limit)
+        async let steps = try? store.stepSamples(deviceId: deviceId, from: from, to: to, limit: limit)
+        async let resp = try? store.respSamples(deviceId: deviceId, from: from, to: to, limit: limit)
+        async let gravity = try? store.gravitySamples(deviceId: deviceId, from: from, to: to, limit: limit)
+        var lines = ["stream,unix_s,v1,v2,v3,v4"]
+        lines += await (hr ?? []).map { "heart_rate,\($0.ts),\($0.bpm),,," }
+        lines += await (battery ?? []).map { "battery,\($0.ts),\($0.soc.map { String($0) } ?? ""),\($0.mv.map { String($0) } ?? ""),," }
+        lines += await (spo2 ?? []).map { "spo2_raw,\($0.ts),\($0.red),\($0.ir),," }
+        lines += await (temp ?? []).map { "skin_temp_raw,\($0.ts),\($0.raw),\($0.aux1Raw.map { String($0) } ?? ""),\($0.aux2Raw.map { String($0) } ?? "")," }
+        lines += await (steps ?? []).map { "steps,\($0.ts),\($0.counter),\($0.activityClass.map { String($0) } ?? ""),," }
+        lines += await (resp ?? []).map { "resp_raw,\($0.ts),\($0.raw),,," }
+        lines += await (gravity ?? []).map { "gravity,\($0.ts),\($0.x),\($0.y),\($0.z),\($0.dynAccel.map { String($0) } ?? "")" }
+        return Data((lines.joined(separator: "\n") + "\n").utf8)
+    }
+
     /// Max persisted HR sample ts (the biometric "data frontier" for the stuck-strap watchdog).
     /// nil if there's no concrete store or nothing persisted yet. Mirrors storageStats().
     func latestHRSampleTs() async -> Int? {
@@ -89,22 +173,13 @@ final class Collector {
         return try? await s.latestHRSampleTs(deviceId: deviceId)
     }
 
-    /// Min persisted HR sample ts (our OLDEST record). Compared to the strap's oldest reported record
-    /// to answer "is there still older history on the strap to pull". nil if nothing persisted.
-    func oldestHRSampleTs() async -> Int? {
-        guard let s = concreteStore else { return nil }
-        return (try? await s.oldestHRSampleTs(deviceId: deviceId)) ?? nil
-    }
-
-
-    /// Distinct hour-buckets covered by stored HR in [from, to] — feeds the sync ring's coverage %.
-    func coveredHours(from: Int, to: Int) async -> Int {
-        guard let s = concreteStore else { return 0 }
-        return (try? await s.coveredHours(deviceId: deviceId, from: from, to: to)) ?? 0
-    }
+    // MARK: - Sync-ring coverage (fork-local)
+    //
+    // Two thin pass-throughs to `SyncCoverageReads`. They live here, rather than in an extension
+    // beside those reads, only because `concreteStore` is private to this type.
 
     /// Seconds our newest persisted HR record lags behind `now` (nil if none). Feeds the sync ring's
-    /// freshness-based progress — how caught-up we are, ignoring off-wrist gaps.
+    /// freshness half — how caught-up we are, ignoring off-wrist gaps.
     func secondsBehind(now: Int) async -> Int? {
         guard let s = concreteStore else { return nil }
         return (try? await s.secondsBehind(deviceId: deviceId, now: now)) ?? nil
@@ -117,6 +192,15 @@ final class Collector {
         return (try? await s.wearCompleteness(deviceId: deviceId, from: from, to: to)) ?? (0, 0)
     }
 
+    /// Recent gravity samples for the inactivity reminder (#419): the strap's motion over `[from, to]`,
+    /// the input to the shipped `SedentaryDetector`. Empty if there's no concrete store or the read
+    /// throws. Mirrors latestHRSampleTs() — the BLE offload hook reads gravity through the Collector
+    /// because the Collector owns the concrete store.
+    func recentGravity(from: Int, to: Int, limit: Int = 100_000) async -> [GravitySample] {
+        guard let s = concreteStore else { return [] }
+        return (try? await s.gravitySamples(deviceId: deviceId, from: from, to: to, limit: limit)) ?? []
+    }
+
     /// Apply the raw-retention policy. Returns rows pruned (0 if no concrete store).
     @discardableResult
     func prune() async -> Int {
@@ -126,10 +210,21 @@ final class Collector {
                                 maxUnsyncedBytes: PrunePolicy.maxUnsyncedBytes)) ?? 0
     }
 
-    /// Buffer one complete frame (synchronous: preserves delegate arrival order).
-    /// Auto-flushes via a detached Task when the cadence threshold is hit (flush is async).
+    /// Parse-then-buffer shim (#47). Kept for callers/tests that pass raw bytes; the live seam calls
+    /// `ingest(frame:parsed:)` with the parse it already did.
     func ingest(_ frame: [UInt8]) {
-        buffer.append(frame)
+        ingest(frame: frame, parsed: parseFrame(frame, family: family))
+    }
+
+    /// Buffer one complete frame + its pre-parsed decode (synchronous: preserves delegate arrival order).
+    /// Auto-flushes via a detached Task when the cadence threshold is hit (flush is async). (#47)
+    func ingest(frame: [UInt8], parsed: ParsedFrame) {
+        #if DEBUG
+        assert(parsed == parseFrame(frame, family: family),
+               "Collector.ingest: threaded ParsedFrame != fresh parse (#47 parse-once invariant)")
+        #endif
+        recordGroundTruthImu(frame)
+        buffer.append((frame, parsed))
         // Pre-clock only: bound memory if GET_CLOCK never lands while data keeps flowing.
         // Drop OLDEST beyond the cap (keep most recent). Post-clock this branch is skipped —
         // the cadence flush below bounds the buffer instead.
@@ -142,6 +237,7 @@ final class Collector {
         }
     }
 
+
     /// Persist + queue everything buffered. No-op when empty or before a clock ref exists.
     /// Buffer is snapshotted and cleared SYNCHRONOUSLY before the first await so that any
     /// concurrent ingest() calls during persistence accumulate into the NEXT batch cleanly.
@@ -149,16 +245,45 @@ final class Collector {
         guard let ref = clockRef, !buffer.isEmpty else { return }
         // SNAPSHOT + CLEAR before any await: decoded-before-raw ordering AND the
         // buffer-snapshot-before-await invariant are both satisfied here.
-        let frames = buffer
+        let batch = buffer
         buffer.removeAll(keepingCapacity: true)
 
-        let parsed = frames.map { parseFrame($0) }
-        let streams = extractStreams(parsed, deviceClockRef: ref.device, wallClockRef: ref.wall)
+        let frames = batch.map(\.frame)         // still needed for the raw-capture outbox
+        let parsed = batch.map(\.parsed)        // #47: the seam already decoded these — don't re-parse
+        let streams = extractStreams(parsed, deviceClockRef: ref.device, wallClockRef: ref.wall,
+                                     family: family)
+        // #1118: the SECOND live transport. `flushStandardHR` stamps a beat at the second it arrived over
+        // 0x2A37; this one stamps it from the strap's own record clock. The same beat reaching both lands
+        // on two different seconds, which no same-second de-dup can collapse — the signature every
+        // affected night prints as `crossSecondOverCount`.
+        if !streams.rr.isEmpty {
+            let nowSec = now()
+            if RrEmissionStats.shouldEmitLiveCensus(lastEmitSec: lastRealtimeRrCensusSec, nowSec: nowSec) {
+                lastRealtimeRrCensusSec = nowSec
+                let census = RrEmissionStats.compute(streams.rr.map { (ts: $0.ts, rrMs: $0.rrMs) })
+                log?(RrEmissionStats.logLine(path: "live-realtime", offered: streams.rr.count,
+                                             inserted: nil, census))
+            }
+        }
         do {
-            try await store.insert(streams, deviceId: deviceId)   // DECODED FIRST (durable)
+            let inserted = try await store.insert(streams, deviceId: deviceId)   // DECODED FIRST (durable)
+            realtimeInsertFailures = 0
+            onBanked?(inserted)
         } catch {
-            // Re-buffer at the front so these frames are retried on the next cadence.
-            buffer.insert(contentsOf: frames, at: 0)
+            // Re-buffer at the front so these frames (and their parses) are retried on the next cadence.
+            buffer.insert(contentsOf: batch, at: 0)
+            // Swallowing this made the census above read like success: a store rejecting everything still
+            // reported what was OFFERED, with nothing to say none of it landed.
+            realtimeInsertFailures += 1
+            let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+            if LivePersistTrace.shouldEmitLiveInsertFailure(lastEmitMs: lastRealtimeInsertFailureLogMs,
+                                                            nowMs: nowMs) {
+                lastRealtimeInsertFailureLogMs = nowMs
+                log?(LivePersistTrace.liveInsertFailedLine(
+                    transport: "live-realtime", errorName: String(describing: type(of: error)),
+                    message: error.localizedDescription, hrFrames: streams.hr.count,
+                    rrFrames: streams.rr.count, consecutiveFailures: realtimeInsertFailures))
+            }
             return
         }
         // Reset only after a successful insert so the interval trigger keeps firing if
@@ -181,25 +306,91 @@ final class Collector {
 
     /// Buffer one standard Heart-Rate-Measurement reading. No clock correlation needed —
     /// these carry a wall-clock `ts` directly. Auto-flushes ~every 30 readings (~30s).
-    func ingestStandardHR(hr: Int, rr: [Int], at ts: Int) {
-        if hr >= 30, hr <= 220 { stdHR.append(HRSample(ts: ts, bpm: hr)) }
-        for r in rr where r >= 250 && r <= 3000 { stdRR.append(RRInterval(ts: ts, rrMs: r)) }
-        if stdHR.count + stdRR.count >= 30 {
-            Task { @MainActor in await self.flushStandardHR() }
+    func ingestStandardHR(hr: Int, rr: [Int], contact: StandardHRContact? = nil,
+                          family: DeviceFamily? = nil, at ts: Int) {
+        let acceptedHR = (30...220).contains(hr) ? 1 : 0
+        let acceptedRR = rr.filter { (250...3000).contains($0) }
+        if acceptedHR == 1 { stdHR.append(HRSample(ts: ts, bpm: hr)) }
+        let source: RRSourceChannel? = family == .whoop5 ? .whoop5Standard
+            : (family == .whoop4 ? .whoop4Standard : nil)
+        stdRR.append(contentsOf: acceptedRR.map { RRInterval(ts: ts, rrMs: $0, srcChannel: source) })
+        // Only the CHANGES. Advanced here rather than at flush because the event travels in the buffer
+        // until it persists: a failed insert re-inserts it at the front, so nothing has to be unwound.
+        if let contact, StandardHRMapping.shouldRecordContact(previous: lastStdContact, current: contact) {
+            lastStdContact = contact
+            stdContact.append(contentsOf: StandardHRMapping.samples(
+                fromHR: hr, rr: [], contact: contact, at: ts
+            ).events)
+        }
+        // One line a minute, not one a second: a refusal is written at once, the routine ones are counted, and
+        // the full per-sample readout comes back while a Test Centre mode is on (`hostReceivedDetail`).
+        for line in hostReceived.record(
+            .init(hostUnixSeconds: ts,
+                  acceptedHRRows: acceptedHR, acceptedRRRows: acceptedRR.count,
+                  rejectedHRRows: 1 - acceptedHR, rejectedRRRows: rr.count - acceptedRR.count,
+                  pendingHRRows: stdHR.count, pendingRRRows: stdRR.count),
+            detailed: hostReceivedDetail()) {
+            log?(line)
+        }
+        if stdHR.count + stdRR.count + stdContact.count >= 30 {
+            Task { @MainActor in await self.flushStandardHR(reason: .cadence) }
         }
     }
 
-    /// Persist the buffered standard HR/RR. Re-buffers on failure so nothing is lost.
-    func flushStandardHR() async {
-        guard !stdHR.isEmpty || !stdRR.isEmpty else { return }
-        let hr = stdHR, rr = stdRR
+    /// Persist the buffered standard HR/RR/contact. Re-buffers on failure so nothing is lost.
+    func flushStandardHR(reason: LivePersistTrace.StandardHRFlushReason = .explicit) async {
+        // The stream is ending, not just filling: write the window so far, or the last minute of a session
+        // leaves with the process. A cadence flush is mid-stream and keeps counting.
+        if reason != .cadence, reason != .explicit {
+            for line in hostReceived.close() { log?(line) }
+        }
+        guard !stdHR.isEmpty || !stdRR.isEmpty || !stdContact.isEmpty else { return }
+        let hr = stdHR, rr = stdRR, contact = stdContact
         stdHR.removeAll(keepingCapacity: true)
         stdRR.removeAll(keepingCapacity: true)
+        stdContact.removeAll(keepingCapacity: true)
+        log?(LivePersistTrace.standardHRFlushAttemptLine(
+            reason: reason, offeredHRRows: hr.count, offeredRRRows: rr.count))
+        // #1118: census this batch BEFORE it is stored, exactly as the historical path does, so a strap
+        // log carries one `ratioRep` per transport. If each transport reports ~1.0 while the stored night
+        // reads 2.77, the over-count is the UNION of the transports and no single decoder is at fault —
+        // which is the question this instrumentation exists to settle.
+        if !rr.isEmpty {
+            let nowSec = now()
+            if RrEmissionStats.shouldEmitLiveCensus(lastEmitSec: lastStdRrCensusSec, nowSec: nowSec) {
+                lastStdRrCensusSec = nowSec
+                let census = RrEmissionStats.compute(rr.map { (ts: $0.ts, rrMs: $0.rrMs) })
+                // `inserted` is NIL, not echoed from `offered`: the store's conflict key decides that and
+                // this census runs before the insert. The line renders `inserted=n/a`.
+                log?(RrEmissionStats.logLine(path: "live-standard", offered: rr.count,
+                                             inserted: nil, census))
+            }
+        }
         do {
-            try await store.insert(Streams(hr: hr, rr: rr), deviceId: deviceId)
+            let inserted = try await store.insert(Streams(hr: hr, rr: rr, events: contact), deviceId: deviceId)
+            stdInsertFailures = 0
+            onBanked?(inserted)
+            log?(LivePersistTrace.standardHRFlushSucceededLine(
+                reason: reason, offeredHRRows: hr.count, offeredRRRows: rr.count,
+                insertedHRRows: inserted.hr, insertedRRRows: inserted.rr))
         } catch {
             stdHR.insert(contentsOf: hr, at: 0)
             stdRR.insert(contentsOf: rr, at: 0)
+            stdContact.insert(contentsOf: contact, at: 0)
+            stdInsertFailures += 1
+            log?(LivePersistTrace.standardHRRebufferedForRetryLine(
+                reason: reason, attemptedHRRows: hr.count, attemptedRRRows: rr.count,
+                pendingHRRows: stdHR.count, pendingRRRows: stdRR.count,
+                consecutiveFailures: stdInsertFailures))
+            let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+            if LivePersistTrace.shouldEmitLiveInsertFailure(lastEmitMs: lastStdInsertFailureLogMs,
+                                                            nowMs: nowMs) {
+                lastStdInsertFailureLogMs = nowMs
+                log?(LivePersistTrace.liveInsertFailedLine(
+                    transport: "live-standard", errorName: String(describing: type(of: error)),
+                    message: error.localizedDescription, hrFrames: hr.count, rrFrames: rr.count,
+                    consecutiveFailures: stdInsertFailures))
+            }
         }
     }
 
@@ -209,6 +400,11 @@ final class Collector {
     /// research toggle off. Auto-expires at the (clamped) monotonic deadline.
     func beginRawCapture(seconds: TimeInterval) {
         rawCapture.open(at: monotonic(), duration: seconds)
+    }
+
+    private func recordGroundTruthImu(_ frame: [UInt8]) {
+        _ = ImuSessionFileStore.shared.append(deviceId: deviceId, frame: frame,
+            receivedAtMs: Int64(Date().timeIntervalSince1970 * 1_000))
     }
 
     /// Flush WHILE the window is still active so the just-captured frames get persisted as raw,

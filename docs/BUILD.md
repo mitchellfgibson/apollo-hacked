@@ -16,8 +16,10 @@ works only with **your own data**.
 ## Repository layout
 
 The codebase is split into reusable, cross-platform Swift packages plus a thin platform-specific
-app layer. The **macOS app is the reference implementation**; iOS and Android targets are planned
-and reuse the same packages where they can.
+app layer. The **macOS app is the reference implementation**; **Android ships as a full app** under
+`android/`, and **iOS ships as a build-from-source target (`NOOPiOS`)** folded into main in v1.94 —
+built in Xcode, not distributed (no App Store / TestFlight, to stay anonymous). All reuse the same
+packages where they can.
 
 ```
 Strand/
@@ -33,6 +35,9 @@ Strand/
 │   ├── System/                 # MacActions (lock screen, run Shortcut), ProjectInfo
 │   └── Resources/              # Info.plist, Strand.entitlements, Assets.xcassets (AppIcon)
 ├── StrandTests/                # macOS app unit tests
+├── StrandiOS/                  # iOS SwiftUI app shell (product name: NOOPiOS)
+├── StrandiOSShared/            # shared iOS-only app code (BLE/scene wiring)
+├── StrandiOSWidgets/           # iOS WidgetKit + Live Activity extension
 ├── Packages/
 │   ├── WhoopProtocol/          # BLE frame parsing, CRC, command/event/packet decode
 │   ├── WhoopStore/             # GRDB/SQLite persistence (migrations, streams, caches)
@@ -81,6 +86,44 @@ brew install xcodegen
 The packages themselves only need a Swift toolchain — they build and test with plain `swift build`
 / `swift test`, no Xcode project required.
 
+### Swift package tests on Linux
+
+Install Swift 6 or newer plus a C compiler, `curl`, and `unzip`. GRDB uses SQLite's snapshot API,
+which distribution builds commonly omit, so build a private snapshot-enabled library:
+
+```bash
+SQLITE_SNAPSHOT_DIR="$(mktemp -d)"
+curl -fsSLo "$SQLITE_SNAPSHOT_DIR/sqlite.zip" https://sqlite.org/2026/sqlite-amalgamation-3530400.zip
+unzip -p "$SQLITE_SNAPSHOT_DIR/sqlite.zip" sqlite-amalgamation-3530400/sqlite3.c > "$SQLITE_SNAPSHOT_DIR/sqlite3.c"
+unzip -p "$SQLITE_SNAPSHOT_DIR/sqlite.zip" sqlite-amalgamation-3530400/sqlite3.h > "$SQLITE_SNAPSHOT_DIR/sqlite3.h"
+echo "b1dd5d74ec7f29055a6684fa06fb3c2f6821c87dd38f9a458dfd2e8a1db28189  $SQLITE_SNAPSHOT_DIR/sqlite3.c" | sha256sum --check
+cc -shared -fPIC -DSQLITE_ENABLE_SNAPSHOT=1 "$SQLITE_SNAPSHOT_DIR/sqlite3.c" -o "$SQLITE_SNAPSHOT_DIR/libsqlite3.so.0"
+ln -s libsqlite3.so.0 "$SQLITE_SNAPSHOT_DIR/libsqlite3.so"
+cd Packages/StrandAnalytics
+LD_LIBRARY_PATH="$SQLITE_SNAPSHOT_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  swift test -Xcc -I"$SQLITE_SNAPSHOT_DIR" -Xlinker -L"$SQLITE_SNAPSHOT_DIR"
+```
+
+This currently runs 1,523 platform-neutral package tests with one intentional skip. It does not run
+iOS simulator/UI tests or Darwin's Compression-backed raw outbox. The existing package CI remains
+macOS-only.
+
+The same two flags work for the other GRDB-linked packages — swap the `cd` and repeat:
+
+| Package | Linux status |
+|---|---|
+| `StrandAnalytics` | builds + tests (1,523, one skip) |
+| `WhoopStore` | builds + tests (439) |
+| `StrandImport` | builds + tests (249, one skip) |
+| `NoopLocalAccess` | builds + tests (9) |
+| `StrandDesign` | macOS only (SwiftUI) |
+
+The Compression-backed raw outbox is Darwin-only, so the tests that drive it (`RawOutboxTests`,
+`PruneTests`, and the raw half of `ReadTests.testStorageStats`) compile out off Darwin. Everything they
+cover still runs in the macOS CI job.
+
+Because none of this runs in CI, treat a green Linux run as a convenience rather than a guarantee.
+
 ---
 
 ## macOS build & run (reference implementation)
@@ -127,10 +170,10 @@ The app is **sandboxed** and requests Bluetooth + user-selected-file access. Fro
 <key>com.apple.security.files.user-selected.read-write</key> <true/>
 ```
 
-`project.yml` deliberately keeps `DEVELOPMENT_TEAM` empty, `ENABLE_HARDENED_RUNTIME: NO`, and uses
-**ad-hoc signing** — no Apple Developer account is required to run a personal build. To produce the
-runnable bundle, build without disabling signing so Xcode applies the sandbox + Bluetooth
-entitlements with an ad-hoc identity:
+`project.yml` deliberately leaves `DEVELOPMENT_TEAM` empty by default (see `Config/BundleId.xcconfig`),
+keeps `ENABLE_HARDENED_RUNTIME: NO`, and uses **ad-hoc signing** — no Apple Developer account is
+required to run a personal build. To produce the runnable bundle, build without disabling signing so
+Xcode applies the sandbox + Bluetooth entitlements with an ad-hoc identity:
 
 ```bash
 xcodebuild \
@@ -211,70 +254,66 @@ swift run backfill
 
 ---
 
-## iOS (planned — packages are ready)
+## iOS (build-from-source only)
 
-All five packages already target `.iOS(.v16)`, so the **non-UI core compiles for iOS today**.
-There is currently no iOS app target; adding one is mostly app-layer wiring, not package work.
+iOS ships as a **build-from-source-only** target, folded into main in v1.94. There is **no App
+Store or TestFlight build** — both require a real Apple Developer identity, which is fundamentally
+at odds with NOOP staying anonymous, so the only way to run it is to build it yourself in Xcode.
+The iOS app is **newer and less battle-tested** than macOS and Android: live BLE on a real iPhone
+isn't yet fully validated. It shares the same analytics packages, so once data is in, results match
+macOS.
 
-### Adding an iOS app target
+The `NOOPiOS` app target (plus the `NOOPiOSWidgets` WidgetKit / Live Activity extension) already
+exists in `project.yml` — you don't need to add it. All five packages target `.iOS(.v16)`, so the
+protocol, storage, analytics, import, and design cores compile for iOS unmodified; the iOS app
+shell lives in `StrandiOS/` with shared iOS code in `StrandiOSShared/`.
 
-1. **Reuse the packages directly.** In `project.yml`, add an iOS application target that depends on
-   the same packages the macOS target uses:
+### Build & run
 
-   ```yaml
-   targets:
-     StrandiOS:
-       type: application
-       platform: iOS
-       deploymentTarget: "16.0"
-       sources: [StrandiOS]          # iOS-specific app layer
-       dependencies:
-         - package: WhoopProtocol
-         - package: WhoopStore
-         - package: StrandAnalytics
-         - package: StrandImport
-         - package: StrandDesign
-   ```
+```bash
+cd /path/to/Strand
+xcodegen generate
 
-   Then `xcodegen generate` and build with `-scheme StrandiOS -destination 'generic/platform=iOS'`
-   (or a simulator destination). `WhoopProtocol`, `WhoopStore`, `StrandAnalytics`, `StrandImport`,
-   and most of `StrandDesign` need **no changes**.
+# build for a connected iPhone (real device — BLE doesn't work in the simulator):
+xcodebuild \
+  -project Strand.xcodeproj \
+  -scheme NOOPiOS \
+  -destination 'generic/platform=iOS' \
+  build
+```
 
-2. **CoreBluetooth on iOS.** `BLEManager` already uses CoreBluetooth, which is identical API on iOS.
-   The differences are:
-   - Add `NSBluetoothAlwaysUsageDescription` to the iOS Info.plist (the macOS one already exists).
-   - For background offload, request the `bluetooth-central` background mode and consider
-     CoreBluetooth **state restoration** — `BLEManager` already handles
-     `CBCentralManagerRestoredStatePeripheralsKey`, so restoration is wired but the iOS
-     background-modes entitlement must be added.
-   - Replace the macOS app-sandbox + `com.apple.security.device.bluetooth` entitlements with the
-     iOS signing/capabilities equivalents.
+Or open the generated project and run the `NOOPiOS` scheme from Xcode:
 
-3. **App-layer code that needs an iOS variant.** The packages are clean; the macOS *app* directory
-   has a handful of AppKit dependencies that must be ported (or `#if os(macOS)`-gated) when building
-   the iOS app:
+```bash
+open Strand.xcodeproj
+```
 
-   | macOS app code | File | iOS replacement |
-   |----------------|------|-----------------|
-   | `NSPasteboard.general` (copy donation address) | `Strand/Screens/SupportView.swift` | `UIPasteboard.general` |
-   | `NSWorkspace.shared.open(url:)` / `.icon(forFile:)` | `Strand/System/MacActions.swift`, `Strand/Data/NotificationSettingsStore.swift` | `UIApplication.shared.open(_:)`; app icons aren't available on iOS |
-   | `NSImage` for app icons | `Strand/Data/NotificationSettingsStore.swift` | `UIImage` (and rethink the macOS-only notification-mirroring feature) |
-   | `MenuBarExtra` + `MenuBarContent` (menu-bar HR) | `Strand/App/StrandApp.swift`, `Strand/MenuBar/` | No menu bar on iOS — use a widget / Live Activity instead |
-   | `MacActions.lockScreen()` (login.framework) and `runShortcut(_:)` | `Strand/System/MacActions.swift` | macOS-only; the strap-double-tap actions have no direct iOS analogue |
-   | `.windowStyle(.hiddenTitleBar)` / `.defaultSize` window chrome | `Strand/App/StrandApp.swift` | Drop window modifiers; use a normal iOS scene |
+Notes:
 
-   Because the design system (`StrandDesign`) already bridges `NSColor`/`UIColor` behind
-   `#if canImport(AppKit) / #elseif canImport(UIKit)`, the palette, fonts, and most components carry
-   over without edits.
+- The `NOOPiOS` and `NOOPiOSWidgets` targets deploy to **iOS 17.0**. (The shared packages still
+  declare a floor of iOS 16 — `.iOS(.v16)` — but the app targets require iOS 17.)
+- Running on a physical iPhone needs a signing identity selected in Xcode (a free personal Apple ID
+  works for on-device builds). Set `DEVELOPMENT_TEAM` in `Config/BundleIdSecrets.xcconfig` (see
+  `Config/BundleIdSecrets.example.xcconfig`) to avoid re-selecting a team in Xcode after every
+  `xcodegen generate`. **BLE requires a real device** — the iOS simulator can't reach a
+  physical strap.
+- The iOS app reuses `BLEManager` (CoreBluetooth is identical API on iOS) and the shared analytics,
+  store, import, and design packages. `StrandDesign` already bridges `NSColor`/`UIColor` behind
+  `#if canImport(AppKit) / #elseif canImport(UIKit)`, so the palette, fonts, and components carry
+  over. macOS-only surfaces (the menu-bar HR extra, screen-lock / Shortcut strap actions) have no
+  iOS equivalent and are `#if os(macOS)`-gated; iOS uses a widget / Live Activity instead.
 
 ---
 
-## Android (planned)
+## Android (shipped)
 
-A native Android client is planned as a separate, Kotlin/Gradle module rather than a port of the
-Swift app. When present, it lives under **`android/`** with its own `README`.
+Android ships as a **full, native client** — a separate Kotlin/Gradle module rather than a port of
+the Swift app. It lives under **`android/`** with its own `README`, and a pre-built APK
+(`NOOP-full.apk`) is published in [Releases](https://github.com/ryanbr/noop/releases). A sample-data **demo** flavour still
+exists for exploring every screen with no strap, but it's now **build-from-source only**
+(`./gradlew assembleDemoDebug`) — it is no longer published as a release asset.
 
-Expected toolchain:
+Toolchain:
 
 | Tool            | Version |
 |-----------------|---------|
@@ -287,9 +326,8 @@ facts in `WhoopProtocol/Resources/whoop_protocol.json` are language-agnostic). B
 instructions live in **`android/README.md`** — open the `android/` directory in Android Studio, let
 Gradle sync, and run on a device with Bluetooth (an emulator cannot reach a physical strap).
 
-> The `android/` directory may not yet exist in your checkout. Until it lands, the macOS app above is
-> the reference implementation and the shared packages define the protocol, storage, analytics, and
-> import behavior any future client must match.
+> The macOS app remains the reference implementation; the shared packages define the protocol,
+> storage, analytics, and import behavior every client matches.
 
 ---
 
@@ -312,7 +350,7 @@ xcodebuild -project Strand.xcodeproj -scheme Strand -destination 'platform=macOS
 
 ## Credits
 
-NOOP builds on prior open-source reverse-engineering and interoperability work:
+NOOP builds on prior community reverse-engineering and interoperability work:
 
 - **`johnmiddleton12/my-whoop`** — WHOOP 4.0 BLE protocol; the `WhoopProtocol` and `WhoopStore`
   packages are adapted from this work.

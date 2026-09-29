@@ -1,13 +1,13 @@
 # NOOP — System Architecture
 
-NOOP is a standalone, fully **offline** tool to own your WHOOP strap's data (4.0 and 5.0). It talks
-directly to the strap over Bluetooth Low Energy, stores everything on-device in SQLite, and computes
+NOOP is a standalone, fully **offline** companion app for WHOOP straps (4.0 and 5.0). It talks
+directly to the strap over Bluetooth Low Energy, stores everything on-device in SQLite (GRDB on Mac/iOS, Room on Android), and computes
 recovery, strain, HRV, and sleep locally. There is no WHOOP cloud, no account —
 the app interoperates with **your own device and your own data**. It can also import data you already
 own: WHOOP CSV exports and Apple Health exports.
 
 > **Not affiliated with WHOOP.** NOOP is an independent, interoperability project built on
-> open-source reverse-engineering of the strap's Bluetooth protocol. It is **not a medical device**
+> community reverse-engineering of the strap's Bluetooth protocol. It is **not a medical device**
 > and produces **approximate** physiological estimates that must not be used for diagnosis or
 > treatment. See [`DISCLAIMER.md`](../DISCLAIMER.md) and [`ATTRIBUTION.md`](../ATTRIBUTION.md).
 
@@ -102,10 +102,11 @@ Packages/                       Cross-platform Swift packages (iOS 16+ / macOS 1
 Tools/Backfill/                 CLI offload/replay tool
 ```
 
-The app target (`Strand/`) is the **macOS reference implementation**. iOS and Android apps are
-planned; the five packages already declare `.iOS(.v16)` and `.macOS(.v13)` and keep all
-UI-framework code behind `#if canImport(UIKit)` / `#if canImport(AppKit)` guards so the cores port
-unchanged.
+The app target (`Strand/`) is the **macOS reference implementation**. The same five packages back the
+**iOS** app (`StrandiOS/`, `StrandiOSShared/`, `StrandiOSWidgets/` — **build-from-source only**, no
+App Store/TestFlight; see [`IOS.md`](./IOS.md)) and the **Android** app (`android/`, Room/Kotlin). The
+packages already declare `.iOS(.v16)` and `.macOS(.v13)` and keep all UI-framework code behind
+`#if canImport(UIKit)` / `#if canImport(AppKit)` guards so the cores port unchanged.
 
 ---
 
@@ -285,7 +286,7 @@ shell doesn't re-render on every beat.
 
 ## 7. Storage model (WhoopStore / SQLite)
 
-GRDB drives a migrator (`WhoopStoreInfo.schemaVersion`, currently `9`). The schema groups into four
+GRDB drives a migrator (`WhoopStoreInfo.schemaVersion`, currently `11`). The schema groups into four
 concerns:
 
 **Durable decoded streams** — natural key `(deviceId, ts)`, one row per sample:
@@ -389,7 +390,7 @@ computed locally.
 
 ## Attribution
 
-NOOP's BLE protocol work builds on open-source reverse-engineering of the WHOOP straps:
+NOOP's BLE protocol work builds on community reverse-engineering of the WHOOP straps:
 
 - **johnmiddleton12/my-whoop** — WHOOP 4.0 protocol.
 - **b-nnett/goose** — WHOOP 5.0 protocol.

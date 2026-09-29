@@ -40,7 +40,29 @@ data class UserProfile(
     val age: Double = 30.0,
     /** "male" | "female" | "nonbinary". */
     val sex: String = "nonbinary",
-)
+    /**
+     * Counter ticks per real step for the @57 motion counter (#139). The WHOOP 5/MG
+     * counter overcounts and its true tick rate is unknown, so the daily-steps total
+     * divides by this. 1.0 = raw pass-through (default); the engine clamps ≥ 0.5.
+     */
+    val stepTicksPerStep: Double = 1.0,
+    /**
+     * Waist circumference (cm) for the Fitness Age VO₂max estimate (Phase 2). 0 = not set.
+     * Optional — it UNLOCKS the VO₂max readout but does NOT sharpen the headline Fitness Age
+     * (the body term cancels out of the age formula). Default param so existing call-sites compile.
+     */
+    val waistCm: Double = 0.0,
+) {
+    /**
+     * Every stored field, for a cache key that must change when the profile does (the per-cycle load cache,
+     * `IntelligenceEngine.loadCacheKey`). Named explicitly rather than read from the generated `toString`,
+     * which is not a contract. A new field belongs here too. Doubles by bit pattern, so the key is exact.
+     * Twin of Swift `UserProfile.cacheKey`.
+     */
+    val cacheKey: String
+        get() = "w=${weightKg.toRawBits()},h=${heightCm.toRawBits()},a=${age.toRawBits()},s=$sex," +
+            "t=${stepTicksPerStep.toRawBits()},waist=${waistCm.toRawBits()}"
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Sleep staging output shapes (SleepStager.swift)
@@ -75,6 +97,16 @@ data class DetectedSleep(
     val restingHR: Int?,
     /** Mean RMSSD over 5-min windows across the session (ms), or null. */
     val avgHRV: Double?,
+    /**
+     * Staged WITHOUT a motion spine, from heart rate alone (#1801).
+     *
+     * True only for a strap that streams HR but banks no motion, where Stage 0's gravity-stillness spine
+     * has nothing to work with. Such a night is weaker by construction, not by tuning: with motion gone a
+     * quiet evening at rest can sit in the sleep band. It is allowed to describe itself — duration,
+     * stages, Rest — and must NOT reach anything it cannot be unwound from, which is why
+     * [restingHR] and [avgHRV] are left null on one rather than filtered out downstream.
+     */
+    val hrOnly: Boolean = false,
 )
 
 /**
@@ -132,6 +164,11 @@ data class ExerciseSession(
     val hrmaxSource: String,
     val caloriesKcal: Double?,
     val caloriesKJ: Double?,
+    /** #1545: how much of the bout the HR sensor actually saw, as a percentage of 60-second buckets that
+     *  contain at least one reading. null when not measured. A WHOOP 4.0's optical sensor is weak under
+     *  gripping — exactly what lifting is — so a low Effort has two very different causes: the metric not
+     *  rating the work, or the strap not having seen it. Those deserve opposite advice. */
+    val hrCoveragePct: Double? = null,
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -219,6 +256,7 @@ data class ProfileBaselines(
     val hrv: BaselineState? = null,
     val restingHR: BaselineState? = null,
     val resp: BaselineState? = null,
+    val skinTemp: BaselineState? = null,
 )
 
 /**
@@ -236,8 +274,65 @@ data class DayResult(
     val sleepSessions: List<DetectedSleep>,
     /** Detected workout/exercise sessions. */
     val workouts: List<ExerciseSession>,
-    /** Recovery score [0,100] or null (cold-start / no HRV baseline). */
+    /** Charge (recovery) score [0,100] or null (cold-start / no HRV baseline). */
     val recovery: Double?,
-    /** Day strain [0,21] or null (insufficient HR samples / invalid HRR). */
+    /** Effort (strain) score [0,100] or null (insufficient HR samples / invalid HRR). */
     val strain: Double?,
+    /**
+     * Rest (sleep_performance) composite [0,100] or null (no asleep time). The persistence /
+     * series layer stores this under the `sleep_performance` key. Replaces the bare efficiency
+     * proxy (duration-vs-need 0.50 + efficiency 0.20 + restorative 0.20 + consistency 0.10).
+     */
+    val rest: Double? = null,
+    /**
+     * Wear-gated mean in-bed skin temperature (°C) for this night, or null when no worn in-bed
+     * samples were available. Baseline-INDEPENDENT (like avgHrv): the caller seeds a personal
+     * skin-temp baseline from these nightly means and re-derives [com.noop.data.DailyMetric.skinTempDevC]
+     * in a second pass. APPROXIMATE. (PR #85)
+     */
+    val nightlySkinTempC: Double? = null,
+    /** Per-score certainty tier for Charge (recovery). Mirrors Swift. */
+    val chargeConfidence: ScoreConfidence = ScoreConfidence.CALIBRATING,
+    /** Per-score certainty tier for Effort (strain). Mirrors Swift. */
+    val effortConfidence: ScoreConfidence = ScoreConfidence.CALIBRATING,
+    /** Per-score certainty tier for Rest (sleep_performance composite). Mirrors Swift. */
+    val restConfidence: ScoreConfidence = ScoreConfidence.CALIBRATING,
+    /**
+     * Per-session per-epoch MOTION magnitudes (H8), keyed by each matched session's detected start
+     * ([DetectedSleep.start]), on the same 30 s epoch grid as that session's `stagesJSON`. The caller
+     * persists these via `WhoopRepository.persistSessionMotion` after upserting the sleep-session rows. A
+     * session with too little gravity to grid is OMITTED (no key), so the caller never persists a fabricated
+     * zero series. Mirrors Swift `DayResult.sessionMotionByStart`. (H8)
+     */
+    val sessionMotionByStart: Map<Long, List<Double>> = emptyMap(),
+    /**
+     * Per-session per-epoch BAND sleep_state (#175), keyed by each matched session's detected start, on the
+     * same 30 s grid as `stagesJSON` / [sessionMotionByStart]. The strap's OWN @81 code (0 wake/1 still/2
+     * asleep/3 up) gridded per session, for the caller to persist via `WhoopRepository.persistSessionSleepState`.
+     * A session with no band-state samples is OMITTED (no key), so the caller persists NULL there rather than a
+     * fabricated array. Feeds the H7 re-onset CONFIRM guard on the NEXT pass; never overrides the derived
+     * hypnogram. Empty on a WHOOP 4.0. Mirrors Swift `DayResult.sessionSleepStateByStart`. (#175)
+     */
+    val sessionSleepStateByStart: Map<Long, List<Int>> = emptyMap(),
+    /**
+     * Whether this day's on-device sleep staging ran on SPARSE motion coverage
+     * ([SleepStager.isGravitySparse], #345) — the same signal that downgrades Rest confidence. The caller
+     * stamps it onto each persisted `SleepSession.stagingSparse` so the Sleep tab can caption a possibly
+     * under-detected night ("slept 8h, shows 1h"). Transient (not persisted on DayResult itself). Mirrors
+     * the value Swift's `analyzeDay` writes directly onto its `CachedSleepSession.stagingSparse`.
+     */
+    val gravitySparse: Boolean = false,
+    /**
+     * #1545: where the detector lost every candidate workout on this day. null only when detection did not
+     * run. Always populated otherwise — including (especially) when [workouts] is empty, which is the case
+     * the counts exist to explain. Trailing + defaulted so every existing construction site is unchanged.
+     */
+    val detectionFunnel: WorkoutDetector.DetectionFunnel? = null,
+    /**
+     * The bounds of the day's MAIN-night group, the SAME `mainGroup` the sleep aggregates and the
+     * refused-main-night HRV rule use; empty when the day has no main night. Exposed so the `hrv diag` line
+     * can describe the night the #1118 gate actually judged instead of re-deriving it (#2425). Trailing +
+     * defaulted so every existing construction site is unchanged. Mirrors Swift `DayResult.mainNightBlocks`.
+     */
+    val mainNightBlocks: List<SleepStageTotals.NightBlock> = emptyList(),
 )

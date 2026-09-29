@@ -11,16 +11,20 @@ enum MacActionKind: String, Codable, CaseIterable, Identifiable {
     case lockScreen
     case buzzBack
     case markMoment
+    case sleepMark
+    case hapticClock
     case runShortcut
 
     var id: String { rawValue }
     var label: String {
         switch self {
-        case .none:        return "Nothing"
-        case .lockScreen:  return "Lock the Mac"
-        case .buzzBack:    return "Buzz back (confirm)"
-        case .markMoment:  return "Mark a moment"
-        case .runShortcut: return "Run a Shortcut…"
+        case .none:        return String(localized: "Nothing")
+        case .lockScreen:  return String(localized: "Lock \(Platform.deviceNounPhrase)")
+        case .buzzBack:    return String(localized: "Buzz back (confirm)")
+        case .markMoment:  return String(localized: "Mark a moment")
+        case .sleepMark:   return String(localized: "Log a sleep mark")
+        case .hapticClock: return String(localized: "Buzz the time")
+        case .runShortcut: return String(localized: "Run a Shortcut…")
         }
     }
     var symbol: String {
@@ -29,6 +33,8 @@ enum MacActionKind: String, Codable, CaseIterable, Identifiable {
         case .lockScreen:  return "lock.fill"
         case .buzzBack:    return "waveform.path"
         case .markMoment:  return "mappin.and.ellipse"
+        case .sleepMark:   return "moon.zzz.fill"
+        case .hapticClock: return "clock.fill"
         case .runShortcut: return "bolt.fill"
         }
     }
@@ -44,6 +50,7 @@ enum MacActions {
     /// so callers can fall back to a "Lock Screen" Shortcut.
     @discardableResult
     static func lockScreen() -> Bool {
+        #if os(macOS)
         let path = "/System/Library/PrivateFrameworks/login.framework/login"
         guard let handle = dlopen(path, RTLD_NOW) else { return false }
         defer { dlclose(handle) }
@@ -52,16 +59,21 @@ enum MacActions {
         let fn = unsafeBitCast(sym, to: LockFn.self)
         _ = fn()
         return true
+        #else
+        return false   // a third-party app cannot lock an iPhone — callers fall back to a Shortcut
+        #endif
     }
 
-    /// Run a macOS Shortcut by name via the `shortcuts://` URL scheme. Anything the user can build in
-    /// Shortcuts (lock, mute, set Focus, open an app, automations) is reachable this way.
+    /// Run a Shortcut by name via the `shortcuts://` URL scheme. Anything the user can build in
+    /// Shortcuts (lock, mute, set Focus, open an app, automations) is reachable this way. Opens via the
+    /// platform handler (`NSWorkspace` on macOS, `UIApplication` on iOS) through `PlatformOpen`.
+    @MainActor
     static func runShortcut(_ name: String) {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               let encoded = trimmed.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
               let url = URL(string: "shortcuts://run-shortcut?name=\(encoded)") else { return }
-        NSWorkspace.shared.open(url)
+        PlatformOpen.url(url)
     }
 }
 #endif // os(macOS)

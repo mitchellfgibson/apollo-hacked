@@ -56,16 +56,16 @@ struct DataSourcesView: View {
                 Button {
                     picking = true
                 } label: {
-                    Label(model.importing ? "Importing…" : "Choose export…",
+                    Label(model.isImporting(.whoop) ? "Importing…" : "Choose export…",
                           systemImage: "tray.and.arrow.down")
                         .padding(.horizontal, 6)
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(StrandPalette.accent)
-                .disabled(model.importing)
-                if model.importing { ProgressView().controlSize(.small) }
+                .disabled(model.isImporting(.whoop))
+                if model.isImporting(.whoop) { ProgressView().controlSize(.small) }
             }
-            if let s = model.importSummary {
+            if let s = model.whoopImportSummary {
                 Text(s).font(StrandFont.subhead).foregroundStyle(StrandPalette.statusPositive)
             }
             Text("\(repo.days.count) days · \(repo.sleeps.count) sleeps stored")
@@ -78,12 +78,12 @@ struct DataSourcesView: View {
              subtitle: "Import an Apple Health export (Health app → profile → Export All Health Data → export.zip). 7 years of HR, HRV, sleep, SpO₂, steps and more — streamed locally. Large exports take a minute or two.") {
             HStack(spacing: 12) {
                 Button { pickingApple = true } label: {
-                    Label(model.importing ? "Working…" : "Choose export.zip…", systemImage: "tray.and.arrow.down")
+                    Label(model.isImporting(.appleHealth) ? "Working…" : "Choose export.zip…", systemImage: "tray.and.arrow.down")
                         .padding(.horizontal, 6)
                 }
                 .buttonStyle(.borderedProminent).tint(StrandPalette.accent)
-                .disabled(model.importing)
-                if model.importing { ProgressView().controlSize(.small) }
+                .disabled(model.isImporting(.appleHealth))
+                if model.isImporting(.appleHealth) { ProgressView().controlSize(.small) }
             }
         }
     }

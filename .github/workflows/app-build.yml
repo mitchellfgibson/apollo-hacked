@@ -1,0 +1,145 @@
+# Compile-only verification for the macOS and iOS app targets.
+#
+# Why this exists: the iOS app is a build-from-source community port (no App Store —
+# NOOP stays anonymous), so it isn't exercised on a device by the maintainer. This job
+# compiles both app targets on every relevant change so a shared-code change can't
+# silently break iOS (or regress macOS). It is anonymity-safe: CODE_SIGNING_ALLOWED=NO,
+# no secrets, no signing identity, no artifacts uploaded — it only checks that it builds.
+# (The shipped macOS .app is still produced and anonymized by hand; this is a compile gate.)
+name: App build (macOS + iOS)
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Strand/**'
+      # The app-target TESTS, not just the sources they cover. The `Test Strand` step below runs
+      # StrandTests, but a PR touching only those tests matched nothing here, so it built and ran
+      # nothing: one that failed to compile, or simply failed, merged unverified and went red on the
+      # next unrelated PR that happened to touch `Strand/**`, mis-attributing the breakage to whoever
+      # that was.
+      #
+      # This is the only test directory that needs naming, and the reason is layout rather than
+      # oversight: Android's tests sit under `android/**` and the package suites under `Packages/**`,
+      # both already inside their subject's glob, while StrandTests is a SIBLING of `Strand/` instead
+      # of part of it. `project.yml` does not cover it either — the target takes
+      # `sources: [StrandTests]`, a directory, so adding a test file changes no other tracked path.
+      - 'StrandTests/**'
+      - 'StrandiOS/**'
+      - 'StrandiOSShared/**'
+      - 'StrandiOSWidgets/**'
+      # The watch app and its complications, for the same reason StrandTests is named above: the
+      # NOOPiOS scheme BUILDS them (NOOPiOS embeds NOOPWatch, which embeds NOOPWatchComplications),
+      # but neither directory sits under any glob here, so a PR touching only them matched nothing
+      # and compiled nothing. A broken watch target merged unverified and surfaced on the next PR
+      # that happened to touch Strand/**, pointing at the wrong change. #2227 translated 25
+      # complication strings and got no build at all, which is what surfaced this.
+      - 'NOOPWatch/**'
+      - 'NOOPWatchComplications/**'
+      - 'Packages/**'
+      - 'project.yml'
+      - '.github/workflows/app-build.yml'
+  # No `push: main` leg. Every change reaches main through a PR, which the trigger above already
+  # gates, so a push run rebuilt content that had just been built - on macOS runners, which GitHub
+  # bills at 10x Linux for a two-runner matrix (macos-15 for the universal macOS leg, macos-26 for
+  # the iOS 26 SDK). A RELEASE pushes straight to main with no PR, but fork-release.yml builds both
+  # Strand and NOOPiOS itself, so that path keeps its own compile gate. The gap this leaves is a
+  # direct non-release push to main; `workflow_dispatch` below covers checking one on demand.
+  # `pr:` builds a PR's MERGE RESULT without pushing anything. Checking "does this PR compile once
+  # merged?" used to mean creating a throwaway `ci/` branch holding main+PR and dispatching at it —
+  # which left a "Compare & pull request" banner behind for every probe, because GitHub keys that
+  # banner off the PUSH EVENT and it outlives the branch the cleanup job deletes. GitHub already
+  # maintains exactly the ref we were hand-building, at refs/pull/<n>/merge, so no branch is needed.
+  #
+  # Leave it blank to build whatever ref you dispatched against, unchanged.
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number to build as merged into main (blank = build this ref as-is)"
+        required: false
+        default: ""
+
+concurrency:
+  # Keyed on the PR when one is given, so two probes of the SAME pr supersede each other while probes
+  # of different PRs (all dispatched from main) do not cancel one another.
+  group: app-build-${{ inputs.pr && format('pr-{0}', inputs.pr) || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # #51: the macOS build must be universal — 'platform=macOS' on an Apple-Silicon runner thins to
+          # arm64-only. Use the generic destination + explicit ARCHS so this CI verify catches an x86_64
+          # break at PR time (matches the release/testing workflows).
+          - scheme: Strand
+            destination: 'generic/platform=macOS'
+            extra_args: 'ARCHS="x86_64 arm64" ONLY_ACTIVE_ARCH=NO'
+            runner: macos-15
+          # iOS needs the iOS 26 SDK (Liquid Glass's `glassEffect`, landed 2026-07-07) which macos-15's
+          # default Xcode doesn't ship — matches the runner fork-testing-build.yml / fork-release.yml
+          # already use for their NOOPiOS legs. macos-15 stays correct for the macOS/Strand leg above.
+          - scheme: NOOPiOS
+            destination: 'generic/platform=iOS Simulator'
+            extra_args: ''
+            runner: macos-26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          # The PR's HEAD, then merge current main below. NOT refs/pull/<n>/merge: GitHub freezes that
+          # ref at the last time the PR merged CLEANLY, so for a conflicting or simply stale PR it is a
+          # merge against an old main and it still resolves. Probing #931 through it would have compiled
+          # main as of 30 July, 30+ commits behind, and reported SUCCESS - a false green, and worse than
+          # the branch it replaced. Merging here is always against main as it is right now.
+          ref: ${{ inputs.pr && format('refs/pull/{0}/head', inputs.pr) || '' }}
+          # QUOTED '0': GitHub expressions treat the number 0 as FALSY, so `inputs.pr && 0 || 1`
+          # silently yields 1 and leaves the clone shallow - the merge below then dies with
+          # "refusing to merge unrelated histories" (exit 128) for EVERY pr, mergeable or not.
+          fetch-depth: ${{ inputs.pr && '0' || '1' }}
+
+      - name: Merge current main
+        if: inputs.pr != ''
+        run: |
+          git fetch --no-tags origin main
+          echo "PR #${{ inputs.pr }} head: $(git log --oneline -1 HEAD)"
+          echo "merging into:  $(git log --oneline -1 FETCH_HEAD)"
+          git -c user.name=ci -c user.email=ci@local merge --no-edit FETCH_HEAD
+
+      - name: Say what is being built
+        run: |
+          if [ -n "${{ inputs.pr }}" ]; then
+            echo "Built: PR #${{ inputs.pr }} merged into current main"
+          else
+            echo "Built: ${GITHUB_REF_NAME} as-is"
+          fi
+          git log --oneline -1
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build ${{ matrix.scheme }}
+        run: >-
+          xcodebuild -scheme '${{ matrix.scheme }}' -configuration Debug
+          -destination '${{ matrix.destination }}' ${{ matrix.extra_args }}
+          CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+          build
+
+      # Run the app-target unit tests (StrandTests, wired into the Strand scheme's test action in
+      # project.yml). ONLY the macOS/Strand leg: StrandTests is hosted in the macOS app; the NOOPiOS
+      # leg stays compile-only. Uses a concrete (runnable) macOS destination, not the universal
+      # generic one above. This is what runs the pure app-target logic tests (backfill continuation,
+      # scheduled-report / strain-target policy, etc.) that swift-packages can't reach.
+      - name: Test ${{ matrix.scheme }}
+        if: matrix.scheme == 'Strand'
+        run: >-
+          xcodebuild -scheme Strand -configuration Debug
+          -destination 'platform=macOS'
+          CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+          test

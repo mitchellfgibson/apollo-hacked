@@ -4,6 +4,7 @@ import ZIPFoundation
 
 final class ImportCoordinatorTests: XCTestCase {
 
+    private let appleHealthFixture = "sample_health_data.xml"
     private var tempDirs: [URL] = []
 
     override func tearDownWithError() throws {
@@ -58,7 +59,7 @@ final class ImportCoordinatorTests: XCTestCase {
 
     func testAppleHealthFromZipNested() throws {
         let zip = try makeZip(named: "export.zip", entries: [
-            ("apple_health_export/export.xml", "export.xml"),
+            ("apple_health_export/export.xml", appleHealthFixture),
         ])
         let result = try ImportCoordinator().importAppleHealth(from: zip)
         XCTAssertGreaterThan(result.samples.count, 0)
@@ -72,12 +73,24 @@ final class ImportCoordinatorTests: XCTestCase {
     // MARK: - Auto detection
 
     func testDetectKindAppleHealthByXMLExtension() throws {
-        let result = try ImportCoordinator().detectAndImport(from: Fixtures.url("export.xml"))
+        let result = try ImportCoordinator().detectAndImport(from: Fixtures.url(appleHealthFixture))
         XCTAssertEqual(result.kind, .appleHealth)
         if case .appleHealth(let r) = result {
             XCTAssertGreaterThan(r.samples.count, 0)
         } else {
             XCTFail("expected appleHealth")
+        }
+    }
+
+    /// #3 (review): a genuinely missing file must surface fileNotFound, NOT get silently misrouted to the
+    /// wearable importer (which would then report a misleading "not an Oura/Fitbit/Garmin export").
+    /// detectAndImport falls through to the wearable importer ONLY for the notAZipOrFolder case.
+    func testDetectAndImportMissingFileThrowsFileNotFound() {
+        let missing = URL(fileURLWithPath: "/nonexistent/noop/import/definitely-not-here.json")
+        XCTAssertThrowsError(try ImportCoordinator().detectAndImport(from: missing)) { error in
+            guard case ImportError.fileNotFound = error else {
+                return XCTFail("expected ImportError.fileNotFound, got \(error)")
+            }
         }
     }
 
@@ -97,7 +110,7 @@ final class ImportCoordinatorTests: XCTestCase {
 
     func testDetectKindAppleHealthByZipEntry() throws {
         let zip = try makeZip(named: "export.zip", entries: [
-            ("apple_health_export/export.xml", "export.xml"),
+            ("apple_health_export/export.xml", appleHealthFixture),
         ])
         let result = try ImportCoordinator().detectAndImport(from: zip)
         XCTAssertEqual(result.kind, .appleHealth)

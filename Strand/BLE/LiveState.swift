@@ -1,5 +1,9 @@
 import Foundation
 import Combine
+import StrandAnalytics
+import WhoopProtocol
+import WhoopStore
+import OuraProtocol
 
 /// Observable snapshot of the live connection + biometric state, driven by FrameRouter
 /// (from decoded frames) and BLEManager (from CoreBluetooth callbacks).
@@ -7,23 +11,534 @@ import Combine
 @MainActor
 public final class LiveState: ObservableObject {
     @Published public var connected: Bool = false
+    // NOTE: do NOT auto-clear `pairingHint` when `bonded` flips true. On a 5/MG, `bonded` is also set by
+    // the live-HR shortcut (BLEManager — HR over the unbonded standard profile), so clearing the hint
+    // there hides the still-accurate "free the strap" guidance from users who are streaming HR but never
+    // got the real encrypted bond (issue #69). The genuine bond path clears the hint itself (the
+    // CLIENT_HELLO ack), and a fresh connect attempt resets it.
     @Published public var bonded: Bool = false
+    /// True ONLY when the link reached a GENUINE encrypted bond — the WHOOP 5/MG CLIENT_HELLO ack, the
+    /// WHOOP 4 confirmed-write bond, or a restored already-bonded link. Deliberately NOT set by the
+    /// live-HR shortcut that flips `bonded` true when HR streams over the *unbonded* standard profile on
+    /// a 5/MG (issue #69) — so `bonded` can be true while `encryptedBond` is false ("Live HR, not fully
+    /// paired"). WHOOP 4 always reaches a genuine bond, so the two track together there. Reset on
+    /// connect/disconnect. Drives the Live pill's two-state distinction; the encrypted channel (buzz,
+    /// alarm, double-tap, history offload) only works when this is true.
+    @Published public var encryptedBond: Bool = false
+    /// True once this strap can actually hand over history — the UI mirror of `BLEManager`'s
+    /// `connectHandshakeDone`, which `beginBackfill` already requires before it will request an offload.
+    ///
+    /// Exposed because `bonded` is NOT that condition and reads true too early: the live-HR path sets it
+    /// for a 5/MG that has never completed a handshake, so the sync controls were offered, accepted, and
+    /// then refused deeper down in silence. Gating on this makes them unavailable exactly when the sync
+    /// would have been declined anyway — never when it would have run. Kotlin twin: `LiveState.historyReady`.
+    @Published public var historyReady: Bool = false
+    /// #34: bumped by BLEManager once a WHOOP 4.0 connection has BOTH run its connect handshake (hello +
+    /// SET_CLOCK, exactly once — `connectHandshakeDone`) AND had the cmd-notify characteristic confirm
+    /// subscribed (`didUpdateNotificationStateFor` for it fired with `isNotifying == true`) — whichever of
+    /// the two lands second. `bonded` alone fires the instant the confirmed-write bond ack lands, which is
+    /// BEFORE either of those — arming the firmware alarm off `bonded` sent SET_ALARM_TIME/GET_ALARM_TIME
+    /// while the cmd-notify channel wasn't confirmed active yet, so the strap's GET_ALARM_TIME readback
+    /// was silently dropped (evidenced in a v8.6.2 strap log, issue #34). A monotonic counter (not a Bool)
+    /// so a re-arm-eligible sink can `.dropFirst()` the initial published value and fire on every bump,
+    /// exactly once per settled connection. Reset to a fresh (un-bumped) state is implicit: BLEManager's
+    /// per-connection guards (`connectHandshakeDone`, the cmd-notify-confirmed flag) reset on disconnect,
+    /// so the next connection can bump this again.
+    @Published public var connectSettled: Int = 0
+    /// True ONLY when a non-WHOOP live source (currently the Oura ring) is actively streaming live HR.
+    /// This is the green "STREAMING" signal for sources that have no WHOOP-style encrypted bond: it is
+    /// DELIBERATELY separate from `bonded`, which carries WHOOP encrypted-bond + buzz semantics (it gates
+    /// haptics in AppModel / BreathingView) and must not be set by the Oura path. The menu-bar pill reads
+    /// this to show STREAMING for a live ring while leaving the WHOOP bonded logic untouched. The owning
+    /// source sets it true in its streaming branch and false at every teardown (stop / needs-pairing /
+    /// radio-off / connect-fail / disconnect). Twin of the Android LiveState.streamingLiveHR.
+    @Published public var streamingLiveHR: Bool = false
     @Published public var heartRate: Int? = nil
+    /// Whether the heavy R10/R11 realtime burst is currently armed (the "live feed"). Tracks the
+    /// realtime INTENT (startRealtime/stopRealtime), NOT `heartRate` — the lightweight 0x2A37 profile
+    /// keeps setting heartRate while bonded, so a heartRate-driven toggle could never read "off". The
+    /// menu-bar Start/Stop-live-feed button reads this.
+    @Published public var liveFeedActive: Bool = false
+    /// Latest R-R packet exactly as it arrived from the strap. Keep this as the "fresh packet"
+    /// surface for stress/breathing logic that reacts to the most recent arrival (and the standard
+    /// 0x2A37 profile, which is the reliable R-R source). Drive it ONLY via `setRRIntervals(_:)`.
     @Published public var rr: [Int] = []
+    /// Monotonic count of R-R packet arrivals, bumped by every `setRRIntervals(_:)` call. Consume
+    /// packets via `onRRPackets` (keyed on this), never by watching `rr` — see RRPacketObserver.swift.
+    /// Twin of Android LiveState.rrSeq.
+    @Published public private(set) var rrSeq: Int = 0
+    /// Rolling UI buffer of recent R-R intervals (capped, oldest dropped first). Standard BLE HR
+    /// notifications usually carry only one or two intervals per packet, so the Live console needs a
+    /// separate short history to render an actually-moving R-R strip / rolling RMSSD. Appended (never
+    /// replaced) by `setRRIntervals(_:)`; emptied by `clearBiometrics()`.
+    @Published public private(set) var rrRecent: [Int] = []
+    /// The WHOOP strap's last reported charge. NOT the active device's.
+    ///
+    /// Two properties make this dangerous to read on its own, and both are deliberate. It is the
+    /// strap's alone, with no other source writing it. And it is never cleared: [clearBiometrics]
+    /// blanks the ring's charge beside it and leaves this, so a strap's last percentage outlives its
+    /// link on purpose, which is what lets a reconnect show a number before the first fresh reading.
+    ///
+    /// So `connected` does not qualify it. That flag goes true the moment ANY source streams, including
+    /// a ring's first live heart rate, at which point a stale strap percentage satisfies both halves of
+    /// the obvious gate. That is #2076 and #2208, the same bug found twice, across ten surfaces.
+    ///
+    /// Any readout naming the ACTIVE device must go through `LiveConsoleReadout.batteryPercent`, which
+    /// substitutes the ring's own charge. Any readout labelled as the strap's must pair this with
+    /// [activeIsWhoop] and show nothing when it is false: substituting there would put a ring's number
+    /// under a WHOOP heading. Which of the two a surface needs depends on what it claims to be showing,
+    /// and that is a question about the label rather than about this field.
     @Published public var batteryPct: Double? = nil
+    /// Strap battery pack VOLTAGE (mV), decoded from the ~8-min BATTERY_LEVEL event (mv@21/@25) and the
+    /// GET_EXTENDED_BATTERY_INFO response (#592). Shown on the Devices card as a "x.xx V" readout beside the
+    /// percent; nil until the first battery event lands. Twin of the Android LiveState.batteryMv.
+    @Published public var batteryMv: Int? = nil
+    /// Charging flag. Two sources, and they mean different things (#1935).
+    ///
+    /// The authority is the strap's BATTERY_LEVEL event — wire observation: u8 bit0 in the payload
+    /// (4.0 @26 / 5.0 @30), pushed ~every 8 min on captured links. That is a LEVEL signal from the
+    /// strap's own gauge: every live battery event rewrites this flag, whatever it was.
+    ///
+    /// On a 5/MG it is ALSO set by `BATTERY_PACK_CONNECTED(21)` and cleared by
+    /// `BATTERY_PACK_REMOVED(22)`, which is a latency win — 21 leads `CHARGING_ON(7)` by up to ~17 s in
+    /// captures, so the pill responds when the pack goes on. But 21 means A PACK WAS ATTACHED, not that
+    /// charging began. They diverge on a depleted pack or a poor contact: 21 fires, 7 never does, and
+    /// this reads true while nothing charges.
+    ///
+    /// THAT STATE IS BOUNDED, which is why it is documented rather than split. It does not last until 22:
+    /// the next live BATTERY_LEVEL overwrites it from the strap's own GAUGE, so the window is about one
+    /// battery cadence, and the gauge always gets the last word.
+    ///
+    /// It gets the last word only because nothing else repeats, which is a real constraint rather than an
+    /// observation (#1935). The pack record reaches this platform LOG-ONLY (`FrameRouter`, Test Centre
+    /// gated) and writes nothing here. Android learned the same rule the hard way: its pushed pack-info
+    /// event (109) once wrote `charging = true` on pack PRESENCE every couple of minutes, outran the
+    /// gauge, and held a flat pack at "charging" for its whole attachment. An EDGE may set this flag
+    /// (7, 21, 22); a repeating presence signal must not, or the gauge cannot correct it.
+    ///
+    /// It matters beyond the pill. `BLEManager.lowPowerThrottleActive` reads it and gates THREE levers, not
+    /// one: the low-battery offload cadence, the connection-priority throttle, and the continuous-capture
+    /// pause behind the user's own "Pause HRV capture" percentage. So a pack attached but not charging can
+    /// keep background capture running at low battery after the user asked for it to stop, for that
+    /// window. `BLEManager.batteryPollDue` also reads it, polling every tick instead of every
+    /// other, which is harmless and arguably wanted with a pack on.
+    ///
+    /// nil until the first event of a session; cleared on disconnect so a stale flag can't outlive the
+    /// link. Flag ONLY — the battery % keeps its family-specific source (#77).
+    @Published public var charging: Bool? = nil
+
+    /// The Oura ring's current wear/charge state (nil for non-Oura straps or before any evidence this
+    /// session). Driven by OuraLiveSource from the live-HR push + the ring's STATE charger strings: a live
+    /// beat only comes from a finger (`.worn`); "chg. detected"/"stopped" bracket `.charging`; a silent
+    /// live-HR stream drops to `.off` (removed). Lets the Live view show On wrist / Off wrist.
+    @Published public var ouraWearState: OuraWearState? = nil
+
+    /// The RING's own charge, when a ring is the live source. Separate from [batteryPct], which is the
+    /// WHOOP's, because `LiveState` is ONE object both sources write into: a bonded WHOOP beside a
+    /// streaming ring leaves the WHOOP's charge sitting in `batteryPct`, and a console that reads it
+    /// while a ring is the active device reports the wrong band's battery under the right band's name.
+    /// That is #2075, where a ring on 93% displayed the strap's 72%. Nil when no ring has reported.
+    @Published public var ouraBatteryPct: Int? = nil
+
+    /// Whether the ACTIVE device is a WHOOP, published so a readout can answer "whose charge is this"
+    /// without observing `AppModel`.
+    ///
+    /// It sits here because [batteryPct] does, and the two are only meaningful together. `batteryPct` is
+    /// the strap's and is never cleared, deliberately, so on its own it cannot say whether it describes
+    /// the device the wearer is currently looking at. Every surface that reads it needs this alongside,
+    /// and `Today` in particular cannot reach the device registry: it observes `BLEManager` rather than
+    /// `AppModel` on purpose, because `AppModel` publishes on the 1 Hz heart-rate tick and observing it
+    /// would re-render the whole screen every second.
+    ///
+    /// Written in ONE place, `SourceCoordinator.activeDeviceChanged`, from the same `activeDeviceId`
+    /// transition that decides which live source runs. Defaults to true, matching
+    /// `LiveConsoleReadout.activeIsWhoop`'s WHOOP-first default for an unresolvable row.
+    ///
+    /// Not cleared by [clearBiometrics]: which device is active is not a biometric and does not stop
+    /// being true when a link drops. (#2208)
+    @Published public var activeIsWhoop: Bool = true
+
+    // MARK: - Battery runtime estimate (#713)
+
+    /// Rolling buffer of `(unix-seconds, SoC%)` battery readings banked from the live link, the twin of
+    /// `rrRecent` for the battery series. `setBattery` appends each reading (with a small dedupe so a
+    /// repeated identical % at a near-identical time doesn't pad the buffer), and `batteryEstimate` fits
+    /// the recent discharge slope over it. Capped + bounded so it can't grow without limit; cleared on
+    /// disconnect so a stale estimate can't outlive the link.
+    @Published public private(set) var batterySamples: [(ts: Int, soc: Double)] = []
+    /// Cap on the SoC buffer. Battery events arrive only every ~8 minutes, so a few hundred readings
+    /// already spans a couple of days, plenty to fit a discharge slope against.
+    static let maxBatterySamples = 400
+
+    // MARK: - Sleep & Rest test-mode live readout (Group E)
+
+    /// Rolling buffer of recent live HR samples, banked ONLY while the Sleep test mode is active so the
+    /// Test Centre readout can show live HR density (samples/min) the detector sees. Appended via
+    /// `recordSleepLiveSample` from the central live-HR ingest; empty (no work, no allocation) when the
+    /// mode is off. Capped + bounded; cleared on disconnect with the rest of the live biometrics.
+    @Published public private(set) var recentHrSamples: [HRSample] = []
+    /// Rolling buffer of recent live gravity samples, banked ONLY while the Sleep test mode is active so
+    /// the readout can show live gravity coverage. The twin of `recentHrSamples`.
+    @Published public private(set) var recentGravitySamples: [GravitySample] = []
+    /// Cap on each live-readout buffer. ~30 min of 1 Hz live HR is plenty to read a density/coverage
+    /// snapshot; bounded so an active test mode can never grow it without limit.
+    static let maxSleepReadoutSamples = 2000
+
+    /// Bank one live HR sample for the Sleep readout. Side-effect-only; the caller already gated on
+    /// `TestCentre.active(.sleep)`, so this does NO work when the mode is off (it is simply not called).
+    public func recordSleepLiveHr(ts: Int, bpm: Int) {
+        recentHrSamples.append(HRSample(ts: ts, bpm: bpm))
+        if recentHrSamples.count > Self.maxSleepReadoutSamples {
+            recentHrSamples.removeFirst(recentHrSamples.count - Self.maxSleepReadoutSamples)
+        }
+    }
+
+    /// Bank live gravity samples for the Sleep readout. Caller-gated on `TestCentre.active(.sleep)`.
+    public func recordSleepLiveGravity(_ samples: [GravitySample]) {
+        guard !samples.isEmpty else { return }
+        recentGravitySamples.append(contentsOf: samples)
+        if recentGravitySamples.count > Self.maxSleepReadoutSamples {
+            recentGravitySamples.removeFirst(recentGravitySamples.count - Self.maxSleepReadoutSamples)
+        }
+    }
+
+    /// The strap's typical full-charge life in hours, chosen by generation, used as the cold-start
+    /// fallback before enough of the user's own discharge is banked. The today lane / coordinator sets
+    /// this from the connected `WhoopModel` (WHOOP 4.0 vs 5.0/MG); it defaults to the WHOOP 4.0 figure so
+    /// an estimate is sensible before the strap generation is known.
+    @Published public var batteryRatedHours: Double = BatteryEstimator.ratedLifeHoursWhoop4
+
+    /// "~X days left" runtime estimate for the connected strap, computed from the banked SoC samples and
+    /// `batteryRatedHours`. nil until there's at least one reading. The Today badge reads this.
+    public var batteryEstimate: BatteryEstimator.Estimate? {
+        BatteryEstimator.estimate(samples: batterySamples, ratedHours: batteryRatedHours)
+    }
+
+    /// The discharge-run / fitted-slope / gate trace for the banked SoC series (#713, Test Centre Battery
+    /// mode). Pure: delegates to BatteryEstimator.estimateTrace, which returns the SAME Estimate as
+    /// batteryEstimate plus the trace lines, so reading this never changes any displayed number.
+    public var batteryEstimateTraceLines: [String] {
+        BatteryEstimator.estimateTrace(samples: batterySamples, ratedHours: batteryRatedHours).trace
+    }
+
+    /// Emit the discharge-run / slope / gate trace once, tagged .battery, when the Battery test mode is on.
+    /// The readout / Today lane calls this on each refresh; it is a no-op (zero cost) when the mode is off.
+    public func emitBatteryTrace() {
+        guard TestCentre.active(.battery) else { return }
+        for line in batteryEstimateTraceLines { append(log: line, domain: .battery) }
+    }
+
+    /// Resolve one of the Battery mode's liveReadout ids ("currentSoc" / "estimateDaysLeft" /
+    /// "slopeSource") to a short display string the Test Centre Battery panel binds to. Returns "--" when
+    /// there is no estimate yet or the id is unknown. Reads the SAME values the Today badge shows, so the
+    /// readout never diverges from the headline number.
+    public func batteryReadout(_ id: String) -> String {
+        guard let e = batteryEstimate else { return "--" }
+        switch id {
+        case "currentSoc":       return "\(Int(e.currentSoc.rounded()))%"
+        case "estimateDaysLeft": return BatteryEstimator.label(hours: e.remainingHours)
+        case "slopeSource":      return e.source.rawValue
+        default:                 return "--"
+        }
+    }
+
+    // MARK: - Strap clock-drift snapshot (universal export self-diagnostic, RTC cluster #531/#767/#804/#812)
+
+    /// The strap's last-decoded banked-record window + firmware layout, banked from the GET_DATA_RANGE reply
+    /// and the offload's hist_version. It is what the export assembler turns into the UNIVERSAL clock-drift
+    /// line that rides EVERY Test Centre export (UniversalTrace.clockDriftLine), so a clock-broken strap
+    /// self-diagnoses on a Sleep / Battery / any-mode report, not only when the Connection mode is on. Set
+    /// unconditionally (it is observability, not gated) and cleared on disconnect so a stale window can't
+    /// outlive the link. nil until the strap first reports its range this session.
+    public struct StrapRange: Equatable, Sendable {
+        public var newestUnix: Int
+        public var oldestUnix: Int?
+        public var firmwareLayout: Int?
+        public init(newestUnix: Int, oldestUnix: Int? = nil, firmwareLayout: Int? = nil) {
+            self.newestUnix = newestUnix; self.oldestUnix = oldestUnix; self.firmwareLayout = firmwareLayout
+        }
+    }
+    @Published public private(set) var strapRange: StrapRange?
+
+    // MARK: - R-R transport snapshot (#2117)
+
+    /// What this device has banked versus what its unit policy can actually score.
+    ///
+    /// Banked here for the same reason `strapRange` is: the export assembler turns it into a UNIVERSAL
+    /// line that rides EVERY Test Centre report, so a wearer whose HRV went blank self-diagnoses without
+    /// having known to turn a mode on. Observability only, never gated, and cleared on disconnect so a
+    /// stale answer cannot outlive the link. nil until resolved for this session.
+    ///
+    /// The judgement lives in `UniversalTrace.rrTransportLine`, not here. This carries facts.
+    public struct RRTransport: Equatable, Sendable {
+        public var strictWhoop5: Bool
+        public var firstRecordedUnix: Int?
+        public var firstScorableUnix: Int?
+        public init(strictWhoop5: Bool, firstRecordedUnix: Int?, firstScorableUnix: Int?) {
+            self.strictWhoop5 = strictWhoop5
+            self.firstRecordedUnix = firstRecordedUnix
+            self.firstScorableUnix = firstScorableUnix
+        }
+    }
+    @Published public private(set) var rrTransport: RRTransport?
+
+    /// Bank the device's R-R transport facts. Two indexed MINs at the call site, so this is cheap enough
+    /// to refresh on connect rather than being cached across links.
+    public func setRRTransport(strictWhoop5: Bool, firstRecordedUnix: Int?, firstScorableUnix: Int?) {
+        rrTransport = RRTransport(strictWhoop5: strictWhoop5, firstRecordedUnix: firstRecordedUnix,
+                                  firstScorableUnix: firstScorableUnix)
+    }
+
+    /// Clear the banked facts. Deliberately NOT called from `clearBiometrics` the way `clearStrapRange`
+    /// is, because the two describe different things: a strap range is the STRAP's own clock, which must
+    /// not outlive the link that reported it, while these describe what OUR database holds, which stays
+    /// true after a disconnect.
+    ///
+    /// That difference decides whether the line is present when it is wanted. The wearer this exists for
+    /// is the one who notices a blank HRV, opens Test Centre and exports, and the strap is quite possibly
+    /// not connected by then. Clearing on disconnect would drop the line from precisely that export.
+    /// Re-read on each connect, so a newly banked history is picked up.
+    public func clearRRTransport() { rrTransport = nil }
+
+    /// Bank the strap's reported banked-record window (from GET_DATA_RANGE). Additive observability: the
+    /// universal clock-drift export line reads this. `oldest` keeps the previously-known value when this
+    /// reply carries only the upper bound, so a half/short range reply never clears a good lower bound.
+    public func setStrapRange(newestUnix: Int, oldestUnix: Int?) {
+        let firmware = strapRange?.firmwareLayout
+        let oldest = oldestUnix ?? strapRange?.oldestUnix
+        strapRange = StrapRange(newestUnix: newestUnix, oldestUnix: oldest, firmwareLayout: firmware)
+        // #34: persist the strap's newest banked record so the debug export can flag a reset/stale clock.
+        UserDefaults.standard.set(newestUnix, forKey: "strap.newestRecordTs")
+    }
+
+    /// Bank the historical record-layout version (hist_version: 18/24/25/26) the strap emits, so the
+    /// universal clock-drift line is firmware-aware even before a fresh range reply lands. Keeps the
+    /// already-known window; a nil range (firmware seen before any range) stores a firmware-only snapshot.
+    public func setStrapFirmwareLayout(_ version: Int) {
+        if let r = strapRange {
+            strapRange = StrapRange(newestUnix: r.newestUnix, oldestUnix: r.oldestUnix, firmwareLayout: version)
+        } else {
+            strapRange = StrapRange(newestUnix: 0, oldestUnix: nil, firmwareLayout: version)
+        }
+    }
+
+    /// Drop the strap-range snapshot (called on disconnect with the other live clears) so a stale clock-drift
+    /// window can't outlive the link.
+    public func clearStrapRange() { strapRange = nil }
+
     @Published public var lastFrameType: String? = nil
     @Published public var lastEvent: String? = nil
+    /// #987: unix of the most recent strap frame FrameRouter routed. Deliberately NOT @Published - the
+    /// raw flood arrives per-notification and a published write per frame would re-render every observer
+    /// at frame rate (the exact churn the lastFrameType change-guard exists to avoid). The Test Centre
+    /// Connection readout reads it on its own render cadence, which is plenty for a freshness label.
+    /// Cleared with the other live readouts in clearBiometrics so it can't outlive the link.
+    public private(set) var lastFrameAtUnix: Int?
+
+    /// Stamp the last-frame instant (#987). One plain Int write per routed frame; called by FrameRouter
+    /// after the CRC guard so bad bytes never count as liveness.
+    public func noteFrameRouted(now: Int = Int(Date().timeIntervalSince1970)) { lastFrameAtUnix = now }
+    /// The strap's BLE advertising name, read back from firmware via GET_ADVERTISING_NAME_HARVARD
+    /// (cmd 76 — sent in the connect handshake, parsed by FrameRouter). nil until the first reply.
+    /// WHOOP 4.0 only; the rename control in Settings shows this as the strap's current name.
+    @Published public var advertisingName: String? = nil
+    /// The connected strap's firmware version, read during the connect handshake: WHOOP 4.0 via
+    /// REPORT_VERSION_INFO (`fw_harvard`), WHOOP 5/MG via GET_HELLO (`fw_version`). FrameRouter
+    /// publishes it; the Devices card shows it next to battery. nil until the reply lands, and
+    /// cleared on disconnect so a stale version can't outlive the link. Twin of the Android
+    /// LiveState.strapFirmware.
+    @Published public var strapFirmware: String? = nil
+    /// True while a user-initiated reboot (#166) is in flight — from sending REBOOT_STRAP until the strap
+    /// reconnects (or the settle timeout gives up). Combined with `!connected` it drives the Devices
+    /// card's transient "Reconnecting…" pill so the restart reads as intentional. Twin of the Android
+    /// LiveState.rebootInProgress.
+    @Published public var rebootInProgress: Bool = false
+    /// Transient, human-readable result of the most recent strap-rename attempt — the
+    /// SET_ADVERTISING_NAME_HARVARD ack, or a local validation message from BLEManager.renameStrap.
+    /// Surfaced under the rename field; overwritten by the next attempt.
+    @Published public var renameStatus: String? = nil
+    /// #592: the read-only extended-battery probe result (raw hex + payload triage + capture diff), or a
+    /// `" waiting"` sentinel while a probe is in flight; nil otherwise. Drives the Devices result dialog so
+    /// a capture is readable/copyable without a full log export. BLEManager writes it; cleared on disconnect
+    /// and on dialog dismiss. Twin of the Android StateFlow LiveState/WhoopBleClient.extendedBatteryProbe.
+    @Published public var extendedBatteryProbe: String? = nil
+
+    /// #690: the body-location probe result (or the waiting sentinel), shown + copied in the Devices dialog.
+    /// Cleared on disconnect and on dialog dismiss. Twin of the Android WhoopBleClient.bodyLocationProbe flow.
+    @Published public var bodyLocationProbe: String? = nil
+
+    /// #761: the READ-ONLY feature-flag enumeration report — the flag NAMES the strap's own firmware lists
+    /// (`START_FF_KEY_EXCHANGE`/`SEND_NEXT_FF`), or the waiting sentinel while the walk runs. Nothing is
+    /// written to the strap to produce it. Cleared on disconnect and on dialog dismiss. Twin of the Android
+    /// WhoopBleClient.featureFlagProbe flow.
+    @Published public var featureFlagProbe: String? = nil
+
+    /// The WHOOP MG ECG ("Labrador") probe result (or the waiting sentinel), shown + copied in the Devices
+    /// dialog. Cleared on disconnect and on dialog dismiss. Instrumentation only — the text it carries is
+    /// explicitly not a medical measurement.
+    @Published public var ecgProbe: String? = nil
+
+    /// The 5-generation hardware variant resolved from the strap's Device Information Service
+    /// (`Whoop5Variant.label`: "MG" / "5.0" / "—"), nil before any DIS string has landed. Published so an
+    /// MG-only capability can gate on POSITIVELY identified hardware instead of guessing from a model
+    /// string; `.unknown` is not MG, so a feature stays off until the strap attests. Diagnostic + gating
+    /// only — it never changes how a frame is parsed (see the note on `Whoop5Variant`).
+    @Published public var whoop5Variant: String? = nil
+
+    /// #103: the READ-ONLY device-config read report — what `GET_DEVICE_CONFIG_VALUE`(121) and
+    /// `GET_FF_VALUE`(128) answer when asked for a key's VALUE (the #761 follow-up), or the waiting
+    /// sentinel while the walk runs. Nothing is written to the strap to produce it. Cleared on disconnect
+    /// and on dialog dismiss. Twin of the Android WhoopBleClient.deviceConfigProbe flow.
+    @Published public var deviceConfigProbe: String? = nil
+
+    /// #174: the R22 DISABLE report — the per-key result of writing `'0'` to the sixteen feature flags and
+    /// reading every one of them back with `GET_FF_VALUE`(128), or the waiting sentinel while the run walks.
+    /// Unlike the two probes above this one DOES write, which is exactly why it reports the value the strap
+    /// stores rather than the write's own ack. Cleared on disconnect and on dialog dismiss. Twin of the
+    /// Android WhoopBleClient.r22DisableReport flow.
+    @Published public var r22DisableReport: String? = nil
+
+    /// #891: the result of the last `enable_raw_data_w_ecg` write, AFTER its mandatory
+    /// `GET_DEVICE_CONFIG_VALUE(121)` read-back — the write's own ack is never reported as the outcome.
+    /// nil until a write is attempted. Like the R22 disable report (and unlike the read-only probes), a
+    /// write interrupted mid-verification by a disconnect is RENDERED here rather than dropped — it has
+    /// already written to the strap — and a completed result persists until the next write or
+    /// `clearEcgRawDataGate()`. Twin of the Android WhoopBleClient.ecgRawDataGate flow.
+    @Published public var ecgRawDataGate: EcgRawDataGateReport? = nil
+
     /// Wrist-wear state from WRIST_ON/WRIST_OFF events. Defaults true so wear-gated features work
     /// before the first event arrives; flipped by FrameRouter on a real event.
     @Published public var worn: Bool = true
+
+    /// #580 — true when a connected WHOOP 5/MG streams live HR fine but its firmware hands over no history
+    /// offload (consecutive empty backfills). Lets the home state read "connected, history sync is
+    /// experimental on 5.0" instead of a WHOOP-4-style "not recording"/sync-error. Reset on connect/disconnect.
+    @Published public var historySyncExperimental: Bool = false
+
+    /// #689/#815 — the strap's ring-buffer page backlog, sampled ONCE from the connect-time
+    /// GET_DATA_RANGE reply and never re-polled mid-offload: the link is already firmware-paced, and #377
+    /// rules out re-polling just to feed a readout. So this is a figure AT CONNECT rather than a live one,
+    /// and the Today sync chip's copy says so — a static number under a "syncing" label otherwise reads as
+    /// a stalled live one. A bounded ring measure (write pointer − read pointer against the ring size),
+    /// never a percentage: the strap never reveals a total record count. Confirmed against real captures
+    /// on WHOOP 4.0 and 5.0/MG. nil before the first reply this session, or when the frame did not decode.
+    /// Twin of Android `LiveState.pagesBehindAtConnect`.
+    @Published public var pagesBehindAtConnect: Int? = nil
+
+    /// #612 — true when the WHOOP-4/generic empty-offload streak (`EmptySyncTracker`, `BLEManager`) is
+    /// currently SUSTAINED (3+ consecutive completed-but-empty offloads). Not 5/MG-specific and not
+    /// coupled to HR: a connected strap that keeps handing over nothing has this true regardless of
+    /// whether live HR is streaming. Reset on disconnect; re-derived from the next offload.
+    @Published public var sustainedEmptyOffload: Bool = false
+
+    // MARK: - Standard fitness-sensor live metrics (RSC / CSC / CPS — additive, never HR)
+    //
+    // Live instantaneous speed / cadence / power from a connected standard fitness sensor (a footpod, a
+    // bike speed/cadence sensor, a power meter) read ALONGSIDE the HR profile by `StandardHRSource`. These
+    // are a PURE ADDITIVE surface for the in-exercise readout: they never touch `heartRate`, `rr`, or any
+    // scoring input — a workout is still recorded by the existing HR-driven live-workout flow. nil when no
+    // such sensor is connected / before its first packet; cleared on disconnect so a stale panel can't
+    // outlive the link. Honest: speed/cadence from CSC/CPS are DERIVED from successive packets, so they
+    // appear only once two have arrived.
+
+    /// Instantaneous speed in km/h from a connected RSC/CSC/CPS sensor (RSC direct; CSC/CPS derived).
+    @Published public var sensorSpeedKmh: Double? = nil
+    /// Instantaneous cadence — running steps/min (RSC) or crank rpm (CSC/CPS) — from a connected sensor.
+    @Published public var sensorCadence: Double? = nil
+    /// Instantaneous power in watts from a connected cycling-power (CPS) sensor.
+    @Published public var sensorPowerWatts: Int? = nil
+
+    /// Clear the standard fitness-sensor live metrics (called on disconnect / source teardown), the twin
+    /// of `clearBiometrics()` for the additive sensor surface. Leaves HR + R-R untouched.
+    public func clearSensorMetrics() {
+        sensorSpeedKmh = nil
+        sensorCadence = nil
+        sensorPowerWatts = nil
+    }
+
+    /// True when ANY standard fitness-sensor metric is currently present — drives whether the additive
+    /// in-workout sensor readout shows at all (it stays hidden until a real sensor feeds a value, so a
+    /// workout with only HR looks exactly as it does today).
+    public var hasSensorMetrics: Bool {
+        sensorSpeedKmh != nil || sensorCadence != nil || sensorPowerWatts != nil
+    }
+
+    /// Pure, honest display strings for the additive in-workout sensor readout. Each returns nil when the
+    /// sensor hasn't sent that field (the UI then hides the tile rather than showing a fabricated value).
+    /// Units are the sensor's native ones, no unit-conversion guessing: speed km/h (the decode/derivation
+    /// unit), cadence per-minute (steps/min for a footpod, crank rpm for a bike sensor — both "/min", and
+    /// LiveState doesn't carry the kind, so the neutral honest label is used), power watts. Mirrors the
+    /// JVM-tested Kotlin `StandardHrSource.formatSensor*` so the two platforms read identically. `static`
+    /// so they're trivially unit-testable away from the @MainActor instance.
+    static func formatSpeedKmh(_ kmh: Double?) -> String? {
+        guard let kmh, kmh.isFinite, kmh >= 0 else { return nil }
+        return String(format: "%.1f", kmh)
+    }
+    static func formatCadence(_ perMin: Double?) -> String? {
+        guard let perMin, perMin.isFinite, perMin >= 0 else { return nil }
+        return String(Int(perMin.rounded()))
+    }
+    static func formatPowerWatts(_ watts: Int?) -> String? {
+        guard let watts, watts >= 0 else { return nil }
+        return String(watts)
+    }
     /// Rolling log of human-readable lines for the on-device verification checklist.
-    @Published public var log: [String] = []
+    ///
+    /// NOT `@Published`, deliberately (#2547). `LiveState` carries dozens of `@Published` properties on one
+    /// `ObservableObject`, and an `ObservableObject` invalidates EVERY observer on ANY published change, so
+    /// publishing per appended line woke every view in the app for each line. A history drain plus a
+    /// re-score burst emits hundreds a minute and iOS killed the app for sustained background CPU (#2521).
+    ///
+    /// Reads are still SYNCHRONOUS and uncoalesced: this returns the buffer as it is right now, so code that
+    /// appends and then inspects the log in the same turn sees its own line. Only the PUBLISH is coalesced,
+    /// via `logRevision`. Capture is never delayed or dropped.
+    public var log: [String] { logBuffer }
+
+    /// The backing store. Mutated only by `append(log:)`.
+    private var logBuffer: [String] = []
+
+    /// Ticks when the log has changed, at most once per `publishCoalesceSeconds` however fast lines arrive.
+    ///
+    /// This is the property SwiftUI observes for the log. The Android twin is
+    /// `boundedRevision(ble.logRevision, coalesceMs = 250)` in `TestCentreScreen.kt`, which throttles the
+    /// same way; this brings the platforms level.
+    @Published public private(set) var logRevision: UInt64 = 0
+
+    // MARK: - Connection status (single source of truth, #266)
+
+    /// Short connection-status label shared by the sidebar footer (RootView) and the Settings strap
+    /// card, so the two can't disagree the way they did in #266 (sidebar "Connecting…" vs Settings
+    /// "Connected" for the same connected-but-unbonded 5/MG link). Once the link is up and HR is
+    /// flowing — even over the unbonded standard profile — this reads "Connected", never "Connecting…".
+    ///
+    /// "Bonded" means [encryptedBond], never [bonded]. The 5/MG live-HR shortcut (#69) sets `bonded` while
+    /// HR streams over the OPEN profile with no pairing at all, so keying the green bonded state off it
+    /// told a strap with no encrypted pairing that it had one — and the encrypted bond is exactly what
+    /// gates buzz, alarms, double-tap and history sync. LiveView has drawn this line since #69; this
+    /// shared label (sidebar + Settings) had not, so the two screens disagreed about the same link.
+    public var connectionStatusLabel: String {
+        if connected && encryptedBond { return "Bonded · streaming" }
+        if connected && bonded { return "Live HR (not fully paired)" }
+        if connected { return "Connected" }
+        if encryptedBond { return "Bonded · idle" }
+        // No `bonded`-only idle arm: without an encrypted bond there was never a pairing to be idle from.
+        return "Disconnected"
+    }
+    /// True when the link is up with a REAL encrypted bond → status reads green. A live-HR-only link is
+    /// amber via [connectionStatusIsIdle]: it works, but every pairing-gated feature is unavailable.
+    public var connectionStatusIsActive: Bool { connected && encryptedBond }
+    /// True when previously paired but not currently connected, OR connected with live HR but no
+    /// encrypted bond → amber either way.
+    public var connectionStatusIsIdle: Bool { (!connected && bonded) || (connected && !encryptedBond) }
 
     /// Fired (live only) when the strap reports a DOUBLE_TAP gesture. Wired by AppModel to the
     /// user's chosen action. Debounced in AppModel.
     public var onDoubleTap: (() -> Void)?
     /// Fired (live only) when wrist-wear changes (true = put on, false = taken off).
     public var onWristChange: ((Bool) -> Void)?
+    /// Fired (live only) when the strap reports it executed its firmware alarm
+    /// (STRAP_DRIVEN_ALARM_EXECUTED). Wired by AppModel to re-arm the next day's alarm.
+    public var onSmartAlarmFired: (() -> Void)?
 
     /// True when the stuck-strap watchdog finds the strap has newer records than us but our frontier
     /// won't advance (likely needs a manual reboot; ~never after high-freq-sync removal). Banner-only.
@@ -33,26 +548,37 @@ public final class LiveState: ObservableObject {
     /// came — i.e. caught up). Drives the sync tile + the staleness nudge.
     @Published public var lastSyncedAt: TimeInterval?
 
-    /// True while a historical offload (backfill) is actively pulling the strap's stored data.
-    @Published public var backfilling = false
+    /// Set when an offload ended abnormally (the idle watchdog fired — the strap went quiet mid-sync),
+    /// so a stalled history download isn't silent. Cleared by the next successful HISTORY_COMPLETE.
+    /// Process-local on purpose (mirrors Android, ed6a31d): the next connect / 15-min tick re-offloads
+    /// anyway, so persisting a stale error across launches would outlive its relevance.
+    @Published public var lastSyncError: String? = nil
 
-    /// Sync progress 0…1 — the fraction of the strap's ~14-day stored window that we've actually
-    /// offloaded, measured by HOUR COVERAGE (distinct hours with data ÷ hours in the window). This
-    /// reflects real completeness including GAPS in the middle — unlike a frontier check, which reads
-    /// "caught up" whenever live HR keeps the newest record fresh even with a week of holes behind it.
-    /// Recomputed by BLEManager after each offload + on a timer; NOT derived per-render.
+    /// True while a historical offload session is running, so screens can say "Syncing strap
+    /// history…" instead of presenting half-loaded data as final (#77).
+    @Published public var backfilling = false
+    /// #1164 — true when the strap reports banked records newer than our local HR frontier (the strap has
+    /// data we haven't ingested yet), even when no offload is actively running. Set by BLEManager from the
+    /// GET_DATA_RANGE newest vs. the collector's latest HR sample, with the same 5-min `behindGapSeconds`
+    /// the auto-continue predicate uses. Cleared on disconnect so a stale "pending" can't outlive the link.
+    /// Drives the Today Rest "Pending sync" state so a provisional score isn't shown as final before the
+    /// full night is offloaded. Twin of the Android LiveState.historyPendingSync.
+    @Published public var historyPendingSync = false
+
+    // MARK: - Sync ring + bond gate (fork-local)
+
+    /// Sync progress 0…1 — the fraction of the strap's ~14-day stored window we've actually
+    /// offloaded, measured by HOUR COVERAGE (distinct hours with data ÷ hours in the window),
+    /// gated on freshness. This reflects real completeness including GAPS in the middle — unlike a
+    /// frontier check, which reads "caught up" whenever live HR keeps the newest record fresh even
+    /// with a week of holes behind it. Recomputed by `SyncProgressCalculator`; NOT derived per-render.
     @Published public var syncProgress: Double = 0
 
     /// True only when we've pulled essentially the whole stored window (the ring is "live" / full).
     public var isLive: Bool { syncProgress >= 0.98 }
 
-    /// Optional hook invoked on every battery update (wired by LiveViewModel to the alert monitor).
-    /// Kept as a closure so LiveState stays a plain observable snapshot with no alert dependency.
-    public var onBatteryUpdate: ((Double) -> Void)?
-
-    public init() {}
-
-    /// True only while the strap link is CURRENTLY live enough to use the app. The gate waits on this.
+    /// True only while the strap link is CURRENTLY live enough to use the app. The bond gate waits
+    /// on this.
     ///
     /// It must require `connected` (which drops to false on disconnect), because `heartRate`,
     /// `lastFrameType` and `lastEvent` are sticky — they keep their last value after a disconnect,
@@ -64,16 +590,686 @@ public final class LiveState: ObservableObject {
         guard connected else { return false }
         return bonded || heartRate != nil
     }
+    /// Chunks acked during the current offload session — an honest progress signal (total pending is
+    /// unknowable from the protocol, so a count, never a percent).
+    @Published public var syncChunksThisSession: Int = 0
+
+    /// Undecodable HISTORICAL_DATA record frames seen this offload session whose raw bytes WERE
+    /// preserved to the on-device archive (#77 / #91). Drives the honest "saved on this Mac" sync
+    /// status. Reset at session start.
+    @Published public var rejectedFramesThisSession: Int = 0
+    /// Undecodable record frames the archive could NOT preserve this session (the ~5 MB cap was
+    /// reached). Kept separate so the sync status never claims "saved" for bytes that were not.
+    @Published public var rejectedFramesUnarchived: Int = 0
+    /// Per-session chunk tallies that separate an EMPTY completed sync (the strap handed over only
+    /// console/diagnostic frames — it isn't banking to flash, #77 family) from a clean one. Reset at
+    /// session start. `decodedChunks == 0` with `consoleChunks` high ⇒ the strap's clock has lost sync.
+    @Published public var decodedChunksThisSession: Int = 0
+    @Published public var consoleChunksThisSession: Int = 0
+
+    /// EXPERIMENTAL R22 telemetry (#174). How many of the 15 `enable_r22_*` SET_CONFIG flags the strap
+    /// has ACKed since the last "Send enable sequence" tap — 15 means the strap accepted the whole
+    /// sequence (hardware-confirmed: it returns a COMMAND_RESPONSE per flag). Reset on each new attempt.
+    @Published public var r22FlagsAccepted: Int = 0
+    /// Count of type-0x2F records seen this session OUTSIDE our own history offload. #494 showed these are
+    /// historical-offload data (e.g. another BLE client pulling the strap's backlog over the shared notify
+    /// channel), NOT a separate live R22 stream — type-0x2F is only ever the historical offload. Kept as a
+    /// diagnostic counter, not a "deep stream unlocked" signal. Reset per session.
+    @Published public var deepPacketsThisSession: Int = 0
+
+    /// Optional hook invoked on every battery update (wired by LiveViewModel to the alert monitor).
+    /// Kept as a closure so LiveState stays a plain observable snapshot with no alert dependency.
+    public var onBatteryUpdate: ((Double) -> Void)?
+
+    /// Number of WHOOP 5/MG ("puffin") frames captured this session (when frame capture is enabled in
+    /// Settings → Experimental). Drives the capture status line + export button.
+    @Published public var puffinCaptureCount: Int = 0
+    /// On-disk location of the current puffin capture file, once anything has been flushed. The
+    /// Settings "Export" / "Reveal" actions target this URL.
+    @Published public var puffinCaptureURL: URL?
+
+    /// Set when a WHOOP 5/MG strap refuses the encrypted bond on first connect ("Encryption/Authentication
+    /// is insufficient") — CoreBluetooth won't start a fresh just-works bond against a strap still bonded to
+    /// the official WHOOP app. Surfaced as actionable pairing-mode guidance; cleared once the link bonds.
+    @Published public var pairingHint: String? = nil
+
+    /// Set when a connect attempt fails because the strap wiped its bond ("Peer removed pairing
+    /// information") — a firmware update, or the official WHOOP app re-bonding it. macOS keeps re-presenting
+    /// the now-stale pairing key, so reconnects loop on the same error with no recovery. Carries an
+    /// actionable forget-and-re-pair guide; cleared on the next successful connect. (5/MG firmware reset, 2026-06)
+    @Published public var reconnectGuide: String? = nil
+
+    /// Set when NOOP detects a marginal Bluetooth radio that can't sustain the WHOOP 4 R10/R11 raw realtime
+    /// stream (#80 — a 2016 Mac / OpenCore drops the link the instant that high-bandwidth burst is armed).
+    /// After repeated arm-then-timeout cycles NOOP stops arming the heavy stream and falls back to the
+    /// low-bandwidth 0x2A37 standard Heart Rate profile, so live HR can still flow on a radio that otherwise
+    /// looped forever. Informational note for the Live screen; cleared on a clean reconnect or Live re-open.
+    @Published public var standardHRMode: String? = nil
+
+    public init() {}
 
     /// Single funnel for battery readings — updates the published value AND notifies the hook,
     /// so both write sites (FrameRouter, BLEManager) drive the alert monitor identically.
     public func setBattery(_ pct: Double) {
         batteryPct = pct
+        bankBatterySample(pct)
         onBatteryUpdate?(pct)
     }
 
-    public func append(log line: String) {
-        log.append(line)
-        if log.count > 200 { log.removeFirst(log.count - 200) }
+    /// Append a SoC reading to the rolling `batterySamples` buffer for the runtime estimate (#713). The
+    /// strap emits battery events every ~8 minutes, so we skip a reading that's the SAME % as the last one
+    /// within ten minutes (a duplicate event, not new discharge information) to keep the slope fit clean;
+    /// any change in %, or enough elapsed time, banks a fresh point. The oldest readings fall off once the
+    /// buffer is full. `now` is injectable so the estimate is unit-testable without a live clock.
+    func bankBatterySample(_ pct: Double, now: Int = Int(Date().timeIntervalSince1970)) {
+        if let last = batterySamples.last, last.soc == pct, now - last.ts < 600 { return }
+        batterySamples.append((ts: now, soc: pct))
+        if batterySamples.count > Self.maxBatterySamples {
+            batterySamples.removeFirst(batterySamples.count - Self.maxBatterySamples)
+        }
+        // Battery test mode: one tagged (t, soc) line per banked reading, gated zero-cost when off (the
+        // gate is one UserDefaults bool read, and the string below is only built when the mode is on).
+        // Rides the redacting sink; the banked SoC series is the readout + trace source (#713, Test Centre).
+        if TestCentre.active(.battery) {
+            append(log: "bank soc=\(String(format: "%.1f", pct)) t=\(now)s", domain: .battery)
+            // Also emit the discharge-run / slope / gate ANALYSIS trace, once per banked reading. The strap
+            // banks at most one SoC point every ~8 minutes (the dedup above), so this is a natural throttle,
+            // never a tight loop. emitBatteryTrace re-checks the same gate and is pure (it reads batteryEstimate,
+            // changing no displayed number), so the headline "~X left" badge is unaffected. (#713, Test Centre.)
+            emitBatteryTrace()
+        }
+    }
+
+    /// Seed the SoC buffer from the persisted battery table on connect/bootstrap (#7). `batterySamples` is
+    /// otherwise fed ONLY by live BLE events (`bankBatterySample`), so after a reconnect the "~X days left"
+    /// estimate restarted from an empty buffer and ignored the long discharge history already on disk.
+    /// Android seeds from its persisted battery table over a 14-day window; iOS/macOS did not, so the two
+    /// platforms diverged. The BLEManager bootstrap path does one async read of the persisted series and
+    /// passes it here. De-dupes against any points already banked from live events this session (by ts) so a
+    /// seed that races a couple of live readings can't double-count them, then re-sorts and caps the buffer.
+    /// Only banks the historical points that aren't already present, so calling it twice is idempotent.
+    public func seedBatterySamples(_ seed: [(ts: Int, soc: Double)]) {
+        guard !seed.isEmpty else { return }
+        let existing = Set(batterySamples.map { $0.ts })
+        let fresh = seed.filter { !existing.contains($0.ts) }
+        guard !fresh.isEmpty else { return }
+        batterySamples.append(contentsOf: fresh)
+        batterySamples.sort { $0.ts < $1.ts }
+        if batterySamples.count > Self.maxBatterySamples {
+            batterySamples.removeFirst(batterySamples.count - Self.maxBatterySamples)
+        }
+    }
+
+    /// Drop the banked SoC buffer (called on disconnect) so a stale runtime estimate can't outlive the
+    /// link, the twin of the `charging = nil` clear on the same path.
+    public func clearBatterySamples() {
+        batterySamples.removeAll()
+    }
+
+    /// Single funnel for R-R intervals from EITHER source (the standard 0x2A37 profile in BLEManager,
+    /// the REALTIME_DATA frame in FrameRouter). Updates the fresh-packet `rr` AND appends the valid
+    /// intervals onto the bounded `rrRecent` rolling buffer so the Live console can show a moving
+    /// strip. Non-positive sentinels (a strap "no interval this beat" placeholder) are dropped from the
+    /// rolling buffer. `recentLimit` caps the buffer; the oldest intervals fall off first.
+    public func setRRIntervals(_ intervals: [Int], recentLimit: Int = 60) {
+        rr = intervals
+        rrSeq += 1
+        let valid = intervals.filter { $0 > 0 }
+        guard !valid.isEmpty else { return }
+        rrRecent.append(contentsOf: valid)
+        if rrRecent.count > recentLimit {
+            rrRecent.removeFirst(rrRecent.count - recentLimit)
+        }
+    }
+
+    /// Blank the live heart rate and the latest R-R packet while the link stays up: the strap reported itself
+    /// off the wrist, or sent a run of samples it could not measure (`LiveHeartRateReadability`). `rrRecent`
+    /// and `rrSeq` are left alone. The next readable sample sets the heart rate again.
+    ///
+    /// R-R first: the heart-rate write is the one the surfaces listen for, and by the time it lands both are gone,
+    /// so `AppModel`'s median resets on it and the banner is handed nil rather than the old number.
+    public func clearLiveHeartRate() {
+        if !rr.isEmpty { rr.removeAll() }
+        if heartRate != nil { heartRate = nil }
+    }
+
+    /// How long the live heart rate may stand with no readable sample before it is cleared. A WHOOP 5.0 taken off the
+    /// wrist can simply go quiet, with the link still up — no 0 bpm, no WRIST_OFF (a tester's log, 23 Sep 2026) — and
+    /// nothing else would ever clear the last number. Normal gaps between samples were at most 2 s in that log, so ten
+    /// seconds cannot blank a strap that is being worn.
+    public static let heartRateSilenceSeconds: TimeInterval = 10
+    /// Instance copy of `heartRateSilenceSeconds`, so a test can shorten the wait.
+    var heartRateSilence: TimeInterval = LiveState.heartRateSilenceSeconds
+    private var heartRateSilenceTimer: DispatchSourceTimer?
+    private var heartRateSilenceArmedAt: DispatchTime?
+
+    /// A readable heart-rate sample arrived (`BLEManager`'s standard profile, `FrameRouter`'s realtime frames): move the
+    /// silence deadline on. One timer, rescheduled at most every tenth of the wait (once a second in use), so it costs
+    /// nothing while samples flow and fires once when they stop.
+    public func noteReadableHeartRate() {
+        let now = DispatchTime.now()
+        let rearmNanos = UInt64(heartRateSilence / 10 * 1_000_000_000)
+        if let armed = heartRateSilenceArmedAt, now.uptimeNanoseconds &- armed.uptimeNanoseconds < rearmNanos { return }
+        heartRateSilenceArmedAt = now
+        let timer = heartRateSilenceTimer ?? {
+            let t = DispatchSource.makeTimerSource(queue: .main)
+            t.setEventHandler { [weak self] in MainActor.assumeIsolated { self?.heartRateWentSilent() } }
+            t.resume()
+            heartRateSilenceTimer = t
+            return t
+        }()
+        timer.schedule(deadline: now + heartRateSilence, leeway: .nanoseconds(Int(rearmNanos)))
+    }
+
+    private func heartRateWentSilent() {
+        heartRateSilenceArmedAt = nil
+        guard heartRate != nil else { return }
+        append(log: AppModel.stamped("HR: no readable heart-rate sample for \(Int(heartRateSilence)) s; "
+                                     + "live heart rate cleared"))
+        clearLiveHeartRate()
+    }
+
+    /// Blank all live biometric readouts (HR + R-R + the rolling buffer) so a stale heart rate or
+    /// R-R strip can't outlive the link. Called on CoreBluetooth disconnect (BLEManager), the twin of
+    /// the `charging = nil` / `encryptedBond = false` clears on the same path.
+    public func clearBiometrics() {
+        heartRate = nil
+        rr.removeAll()
+        rrRecent.removeAll()
+        clearBatterySamples()   // a stale runtime estimate must not outlive the link either (#713)
+        recentHrSamples.removeAll()       // Sleep readout buffers must not outlive the link (Group E)
+        recentGravitySamples.removeAll()
+        clearStrapRange()                 // a stale clock-drift window must not outlive the link either
+        lastFrameAtUnix = nil             // #987: a stale "last frame" freshness must not outlive it either
+        ouraWearState = nil               // a stale worn/charging badge must not outlive the link either
+        ouraBatteryPct = nil              // nor a stale ring charge (#2075)
+    }
+
+    /// Cap on the in-app strap-log ring buffer. Raised from the old ~1h (200 lines) to retain a rolling
+    /// ~24h of activity (#510 — maddognik's protocol RE wants a full day to correlate against), when a busy
+    /// live session emitted a few lines a minute. Since the once-a-second standard-HR transport line (#1767)
+    /// a streaming strap fills it in about 50 minutes, so exports read the whole log from disk (`archive`);
+    /// this buffer drives the Live log card and the Test Centre readouts. Each line is a short redacted string
+    /// (~100 bytes), so the worst-case buffer is well under ~1 MB — bounded, never unbounded.
+    /// The tail of `log` that the Live screen's card RENDERS: its last `tailLines` lines.
+    ///
+    /// Returns a SLICE, not a range, and that is the load-bearing part. The card draws it in a `LazyVStack`,
+    /// whose row closures can run in a later main-actor turn than the body that produced them (on scroll,
+    /// with no re-evaluation). A range plus `log[idx]` would then read a buffer that `append(log:)` may have
+    /// trimmed in between and crash out of bounds. A slice is a copy-on-write value snapshot, so the rows it
+    /// hands out stay valid however the live buffer moves.
+    ///
+    /// Its `indices` are ABSOLUTE positions in `log`, which is what makes them usable as identity: between
+    /// trims an append shifts only the window edges, so every shared row keeps its id, and
+    /// `scrollTo(log.indices.last)` always addresses a row that is actually rendered, which a LEADING window
+    /// would not. Empty log or a non-positive tail yields an empty slice. (#2521)
+    ///
+    /// `nonisolated` because it is pure over its arguments and touches nothing on the actor, the same way
+    /// `redactPii` and `logSafeDeviceName` below are. Without it the method inherits `LiveState`'s
+    /// `@MainActor` and a plain `XCTestCase` cannot call it at all.
+    nonisolated static func renderedTail(_ log: [String], tailLines: Int) -> ArraySlice<String> {
+        guard tailLines > 0 else { return log[log.endIndex..<log.endIndex] }
+        return log.suffix(tailLines)
+    }
+
+    static let maxLogLines = 5_000
+
+    /// Amortize the ring trim: let the buffer overrun by this slack, then trim back to the cap in one batch
+    /// — turning an O(n) `Array.removeFirst` on every line at steady state into one per `trimSlack` lines.
+    /// Still hard-bounded (never exceeds `maxLogLines + trimSlack`).
+    private static let trimSlack = 256
+
+    public func append(log line: String, domain: TestDomain? = nil) {
+        // Tag inert when nil (today's behaviour, byte-identical). When tagged, prefix a compact,
+        // parseable marker the export filters on. Redaction is STILL the only scrub point
+        // (redactPii below); tagging happens BEFORE redaction so the scrub covers the whole line.
+        let tagged = domain.map { "[\($0.id)] " + line } ?? line
+        let safe = Self.redactPii(tagged)
+        logBuffer.append(safe)
+        // Batched trim: overrun by `trimSlack`, then trim back to the cap in one shot (amortized O(1)/line).
+        if logBuffer.count > Self.maxLogLines + Self.trimSlack {
+            logBuffer.removeFirst(logBuffer.count - Self.maxLogLines)
+        }
+        // Onto disk as it is logged, so a restart loses nothing and an export carries the runs before it.
+        // BEFORE the coalesced publish and never inside it: capture is per line, only the notification waits.
+        Self.archive.append(safe)
+        publishLogCoalesced()
+        // #990: fold the Backfiller's per-session "session persisted N rows" summary into the persisted
+        // ALL-TIME drained-rows tally, right here at the single log sink (no new BLE seam). The summary
+        // is emitted unconditionally whenever rows landed (#150), so the cumulative counter accrues on
+        // every session, not only while the Connection test mode is on. The contains() pre-check keeps
+        // the common per-line cost to one substring scan.
+        if line.contains("session persisted"), let rows = ConnectionReadout.drainedRowsFromSummary(line) {
+            TestCentre.noteDrainedRows(rows)
+        }
+    }
+
+    /// How often at most the log publishes, however fast lines arrive. Matches the Android twin's 250ms.
+    ///
+    /// `nonisolated` because a `static let` in a `@MainActor` type IS actor-isolated, and this is the default
+    /// argument of the `nonisolated` decision function below, which could not then reach it. Same reason
+    /// `legacyTailKey` further down carries the keyword.
+    nonisolated static let publishCoalesceSeconds: Double = 0.25
+
+    /// What the coalescer should do, given when it last published and whether a flush is already queued.
+    ///
+    /// Pure, so the policy is tested without a clock or a run loop: the async half below is then a thin
+    /// adapter with no decisions of its own. Leading edge plus a trailing flush, which is what makes the
+    /// contract "the last line of a burst always lands" rather than "the last line is dropped until the next
+    /// one arrives". (#2547)
+    /// `Equatable` compares the `scheduleIn` payload EXACTLY, and it is the result of floating-point
+    /// subtraction, so a test asserting a whole expected case is comparing doubles for equality. Destructure
+    /// and use an accuracy instead: `0.25 - (100.10 - 100)` is `0.15000000000000568`, not `0.15`.
+    enum LogPublishDecision: Equatable {
+        /// Enough time has passed; publish on this line.
+        case publishNow
+        /// Inside the window with nothing queued; publish once after this many seconds.
+        case scheduleIn(Double)
+        /// Inside the window and a flush is already queued, which will cover this line.
+        case alreadyQueued
+    }
+
+    nonisolated static func logPublishDecision(
+        now: Double, lastPublish: Double, flushQueued: Bool, interval: Double = publishCoalesceSeconds,
+    ) -> LogPublishDecision {
+        let elapsed = now - lastPublish
+        if elapsed >= interval { return .publishNow }
+        if flushQueued { return .alreadyQueued }
+        // Clamped into [0, interval]. A clock that went backwards must neither ask for a negative sleep nor
+        // stall the log for longer than one window: without the upper clamp a `lastPublish` in the future
+        // makes `interval - elapsed` exceed the interval, and the log would sit un-notified for that long.
+        return .scheduleIn(min(interval, max(0, interval - elapsed)))
+    }
+
+    private var lastLogPublish: Double = -.greatestFiniteMagnitude
+    private var logFlushQueued = false
+
+    /// Bump `logRevision` now, or once at the end of the current window.
+    private func publishLogCoalesced() {
+        let now = ProcessInfo.processInfo.systemUptime
+        switch Self.logPublishDecision(now: now, lastPublish: lastLogPublish, flushQueued: logFlushQueued) {
+        case .alreadyQueued:
+            return
+        case .publishNow:
+            lastLogPublish = now
+            logRevision &+= 1
+        case .scheduleIn(let wait):
+            logFlushQueued = true
+            Task { @MainActor [weak self] in
+                // `try?` and NOT an early return on failure, deliberately. The flag is what suppresses every
+                // other publish in the window, so the one thing this closure must always do is clear it. A
+                // cancelled sleep throws; swallowing that and falling through still clears the flag and
+                // publishes. Rewriting this as `try await` with the error propagating would leave the flag
+                // set forever, and the log would keep capturing while the UI silently froze.
+                try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+                guard let self else { return }
+                self.logFlushQueued = false
+                self.lastLogPublish = ProcessInfo.processInfo.systemUptime
+                self.logRevision &+= 1
+            }
+        }
+    }
+
+    /// The in-app log lines tagged for one test domain (for the Test Centre live readout). Read-only,
+    /// no side effects; the prefix is the same one `append(log:domain:)` writes, and redaction never
+    /// strips it (the tag is prepended before the scrub, which only touches identifiers). (Group E)
+    public func taggedTail(domain: TestDomain) -> [String] {
+        let prefix = "[\(domain.id)] "
+        return log.filter { $0.hasPrefix(prefix) }
+    }
+
+    // MARK: - The log on disk
+
+    /// Every line of every run, kept across restarts within a fixed size — see `StrapLogArchive`. Opened at the
+    /// first line or export of the process; that first use also carries over the lines the UserDefaults ring
+    /// kept before the log moved to disk, then drops the ring's keys.
+    nonisolated static let archive: StrapLogArchive = {
+        let fm = FileManager.default
+        let directory = (try? StorePaths.strapLogDirectory())
+            ?? fm.temporaryDirectory.appendingPathComponent("strap-log", isDirectory: true)
+        try? fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        let archive = StrapLogArchive(directory: directory)
+        let defaults = UserDefaults.standard
+        archive.importLegacy(StrapLogArchive.legacyRingLines(
+            generations: (defaults.array(forKey: legacyGenerationsKey) as? [[String]]) ?? [],
+            tail: (defaults.array(forKey: legacyTailKey) as? [String]) ?? [],
+            now: Date()))
+        defaults.removeObject(forKey: legacyGenerationsKey)
+        defaults.removeObject(forKey: legacyTailKey)
+        return archive
+    }()
+
+    /// Where the ring kept its runs (#510, #1263), read once to carry them over.
+    private nonisolated static let legacyTailKey = "strapLog.tail"
+    private nonisolated static let legacyGenerationsKey = "strapLog.generations"
+
+    /// A shareable strap-log body read from disk, for a background / scheduled export that runs with no live
+    /// `LiveState` instance. Mirrors `exportableLogText()`'s header so a scheduled drop reads the same as a
+    /// manual share (this is a `static` so a background task needs no main-actor instance).
+    nonisolated public static func scheduledExportText(extraHeaderLines: [String] = []) -> String {
+        let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        #if os(iOS)
+        let osName = "iOS"
+        #else
+        let osName = "macOS"
+        #endif
+        var header = "NOOP strap log (scheduled export) — \(osName)\nApp: \(Self.appIdentityLine)\n\(osName): "
+            + ProcessInfo.processInfo.operatingSystemVersionString + "\n"
+        // #453: the BODY is scrubbed as it is appended, but these header lines come from the diagnostics
+        // block and never pass through that path - and they carry device ids, which embed a BLE address
+        // for a re-added or second strap. Same redactor, so one export cannot be safe while the other leaks.
+        if !extraHeaderLines.isEmpty {
+            header += extraHeaderLines.map { Self.redactPii($0) }.joined(separator: "\n") + "\n"
+        }
+        header += String(repeating: "-", count: 40) + "\n"
+        // Same earlier-runs-then-current shape as `exportableLogText()`: a scheduled drop that fires after a
+        // restart reports the runs before it, not only the (possibly empty) current one.
+        return header + archive.exportText()
+    }
+
+    /// `<version> (<build>) <bundle id>` for the export header.
+    ///
+    /// The build number and the bundle id were both absent (#2553). The build matters because a tester is
+    /// routinely asked to confirm they are on a particular staging build, and the version alone cannot say.
+    /// The bundle id matters because the `.ipa` ships unsigned and a re-signer can rewrite it, which changes
+    /// how Apple Health identifies this app as a source and which background-task identifiers iOS accepts.
+    ///
+    /// The version and build identify nobody. The bundle id is the app's own identifier and normally does
+    /// not either, but `Config/BundleId.xcconfig` exists so someone building from source can set their own
+    /// `BUNDLE_ID_PREFIX`, and that string is whatever they chose. It is printed anyway, and NOT routed
+    /// through `redactPii`, because seeing the real id IS the diagnostic and masking it would defeat the
+    /// point on exactly the builds most likely to need it.
+    ///
+    /// Shared by both header builders on purpose: the two used to construct the same `App:` line
+    /// independently, which is how a field goes into one export and not the other.
+    nonisolated static var appIdentityLine: String {
+        let info = Bundle.main.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        let bundleID = Bundle.main.bundleIdentifier ?? "?"
+        return "\(version) (\(build)) \(bundleID)"
+    }
+
+    /// Scrub personal identifiers from a strap-log line so it's safe to share publicly (#445): BLE MAC
+    /// addresses are masked to their first + last byte, the WHOOP's SERIAL — carried in its device
+    /// name ("WHOOP 4C1594026") and tied to the owner's account — is removed, and the CoreBluetooth
+    /// peripheral identifier (a per-install random UUID iOS/macOS print in "Discovered …(<uuid>)" lines)
+    /// is masked. Applied at the single log sink (BLEManager + the generic-HR diagnostics both feed it).
+    /// MACs require colons, so hex command payloads are untouched; the dotted model names ("WHOOP
+    /// 4.0"/"5.0") don't match the serial pattern. The UUID rule deliberately KEEPS standard-BLE-base
+    /// UUIDs (…-0000-1000-8000-00805f9b34fb, e.g. the 0x2A37 HR characteristic) and the WHOOP vendor
+    /// service base (…-8d6d-82b8-614a-1c8cb0f8dcc6) — those are public, identical on every strap, and
+    /// are exactly the GATT diagnostics a shared log needs to be useful (#421). Thanks @ujix (#447) for
+    /// catching the peripheral-UUID leak; this is a targeted form so we don't redact the service UUIDs.
+    /// #1833: mask a WHOOP serial that arrives as HEX rather than as text.
+    ///
+    /// Every rule in `redactPii` matches an identifier written as characters. None can see one encoded
+    /// as hex, because they are reading hex digits and not the ASCII those bytes decode to. On a 5/MG,
+    /// event 109 carries the strap serial as plain ASCII inside its payload, so any diagnostic that dumps
+    /// a frame or payload puts the serial into the log we ask people to attach to public issues — while
+    /// the MAC rule keeps firing, so the line still LOOKS redacted.
+    ///
+    /// Deliberately NOT keyed on a label. This side writes hex as `frame=…` (the clock diagnostic),
+    /// `[raw …]` and `(raw …)` (the alarm readback), and the #900 whole-frame dump carries none. A rule
+    /// enumerating today's phrasings is one the next diagnostic slips past. Matching the hex itself needs
+    /// no maintenance and covers dumps not yet written.
+    ///
+    /// Only bytes inside a serial-shaped ASCII run are masked; the rest of the dump survives, because the
+    /// payload is exactly where an undocumented field would be found. Twin of `redactHexDumpPii`.
+    nonisolated static func redactHexDump(_ hex: String) -> String {
+        let chars = Array(hex)
+        // NO even-length requirement, deliberately. The run regex matches consecutive hex characters, so
+        // a dump abutting other hex-valid text yields an ODD-length match — and bailing on that returned
+        // the serial UNREDACTED, while the Kotlin twin processed the even prefix and masked it. Swift was
+        // the weaker half of a pair that has to behave identically. Process what pairs up, ignore a
+        // trailing half-byte.
+        guard chars.count >= 16 else { return hex }
+        var bytes = [UInt8](); bytes.reserveCapacity(chars.count / 2)
+        var i = 0
+        while i + 1 < chars.count {
+            guard let b = UInt8(String(chars[i...(i + 1)]), radix: 16) else { return hex }
+            bytes.append(b); i += 2
+        }
+        var out = chars
+        var runStart = -1
+        func closeRun(_ end: Int) {
+            defer { runStart = -1 }
+            guard runStart >= 0 else { return }
+            // Anchor on the first LETTER with enough run left after it, mirroring the Kotlin regex
+            // `[A-Za-z][0-9A-Za-z]{8,}` — which finds a serial ANYWHERE inside an alphanumeric run, not
+            // only at its start. Testing just the run's first byte left the serial exposed whenever a
+            // digit happened to precede it with no separator, and Kotlin masked the same bytes. Two
+            // halves of one rule disagreeing about which payloads are safe is the failure to avoid.
+            var i = runStart
+            while i < end {
+                let b = bytes[i]
+                let isLetter = (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+                if isLetter, end - i >= 9 {
+                    for k in i..<end { out[k * 2] = "•"; out[k * 2 + 1] = "•" }
+                    return
+                }
+                i += 1
+            }
+        }
+        for (idx, b) in bytes.enumerated() {
+            let alnum = (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+            if alnum { if runStart < 0 { runStart = idx } } else { closeRun(idx) }
+        }
+        closeRun(bytes.count)
+        return String(out)
+    }
+
+    /// Tokens that identify a MODEL rather than a person, for `logSafeDeviceName`.
+    ///
+    /// Two shapes only, both EXACT: a known vendor, product or model word, and a version number ("4.0").
+    ///
+    /// There is deliberately no letters-plus-digits pattern for model codes. One was tried and it
+    /// defeated the whole design: "[a-z]{1,4}\\d{1,3}" matches "Ryan1" and "Sam99" as readily as "H10",
+    /// so a first name with a digit passed through untouched. A pattern cannot be an allowlist - the
+    /// moment a rule describes a SHAPE rather than a known value it admits everything else of that
+    /// shape. Model codes are therefore listed one by one.
+    ///
+    /// The cost is that an unlisted device logs as "<name>" until its code is added, which is the right
+    /// direction to fail: a missing model is an inconvenience, a leaked name is not.
+    ///
+    /// Anything not on this list is DROPPED, which is the point: a naming shape nobody anticipated loses
+    /// by default. Kotlin twin: `SAFE_DEVICE_NAME_TOKEN_RE`.
+    private static let safeDeviceNameToken = try? NSRegularExpression(
+        pattern: "^(whoop|mg|polar|verity|sense|wahoo|tickr|garmin|hrm|forerunner|fenix|vantage|ignite|amazfit|huami|zepp|xiaomi|mi|band|coospo|magene|suunto|scosche|rhythm|kickr|tacx|elite|cateye|decathlon|kalenji|geonaute|h6|h7|h9|h10|h64|h808s|oh1|dual|\\d+(\\.\\d+)?)$", options: [.caseInsensitive])
+
+    /// A device name reduced to what is safe to put in a shared log: the MODEL, never the person.
+    ///
+    /// WHOOP seeds a strap's name from the account holder ("<FirstName>'s Whoop") and people rename
+    /// straps to anything at all. `redactPii` can only GUESS which words in a line are a name; here the
+    /// whole string IS the advertised name, so the safe move is an ALLOWLIST - keep the tokens known to
+    /// name a model and drop everything else. A naming shape nobody anticipated is then dropped by
+    /// default rather than needing a rule to catch it: "Ryan B's WHOOP 4.0" keeps only "WHOOP 4.0", and
+    /// "Dad's spare" keeps nothing.
+    ///
+    /// The "no name advertised" sentinel survives, because "we saw no name" and "we removed a name" are
+    /// different facts to whoever reads the log. Kotlin twin: `logSafeDeviceName`.
+    nonisolated static func logSafeDeviceName(_ name: String?) -> String {
+        let n = (name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if n.isEmpty || n == "unknown" { return "unknown" }
+        let tokens = n.split(whereSeparator: { $0.isWhitespace })
+        let safe = tokens.filter { tok in
+            guard let re = Self.safeDeviceNameToken else { return false }
+            let t = String(tok)
+            return re.firstMatch(in: t, range: NSRange(location: 0, length: (t as NSString).length)) != nil
+        }
+        // Say "<name>" only when something was actually removed. An unrenamed "WHOOP 4.0" or "Polar H10"
+        // carries nothing personal, and prefixing it would claim a redaction that never happened.
+        if safe.count == tokens.count { return n }
+        return safe.isEmpty ? "<name>" : "<name> " + safe.joined(separator: " ")
+    }
+
+    private static let hexRunRegex = try? NSRegularExpression(pattern: "[0-9a-fA-F]{16,}")
+
+    nonisolated static func redactPii(_ s: String) -> String {
+        var out = s
+        // Hex first: the text rules below must not see (or mangle) a run we are about to mask.
+        if let re = Self.hexRunRegex {
+            let ns = out as NSString
+            let matches = re.matches(in: out, range: NSRange(location: 0, length: ns.length))
+            if !matches.isEmpty {
+                var rebuilt = ""
+                var last = 0
+                for m in matches {
+                    rebuilt += ns.substring(with: NSRange(location: last, length: m.range.location - last))
+                    rebuilt += Self.redactHexDump(ns.substring(with: m.range))
+                    last = m.range.location + m.range.length
+                }
+                rebuilt += ns.substring(from: last)
+                out = rebuilt
+            }
+        }
+        out = out.replacingOccurrences(
+            of: "([0-9A-Fa-f]{2}):[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:([0-9A-Fa-f]{2})",
+            with: "$1:••:••:••:••:$2", options: .regularExpression)
+        // #1193 field capture: the old rule required a DIGIT straight after "WHOOP ", but real serials
+        // start with letters as often as digits - "WHOOP MGB0779473" sat unredacted in a log attached to
+        // an issue while "WHOOP 4C1594026" beside it was masked. The rule now accepts any alnum run of 6+
+        // that CONTAINS a digit.
+        //
+        // The digit requirement is not decoration, it is what keeps this from eating words: "WHOOP PUFFIN
+        // service 1150" is a real diagnostic line, and PUFFIN is six alnum characters. A serial always
+        // carries a digit; a word does not. "WHOOP 4.0" stays untouched for a different reason - the dot
+        // stops the run at one character, short of the six the lookahead demands.
+        out = out.replacingOccurrences(
+            of: "WHOOP (?=[0-9A-Za-z]{6,})[0-9A-Za-z]*[0-9][0-9A-Za-z]*", with: "WHOOP <serial>", options: .regularExpression)
+        // Mask a CoreBluetooth peripheral UUID, but NOT a standard-BLE / WHOOP-vendor service UUID.
+        out = out.replacingOccurrences(
+            of: "(?![0-9A-Fa-f]{8}-(?:0000-1000-8000-00805f9b34fb|8d6d-82b8-614a-1c8cb0f8dcc6))[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}",
+            with: "<device>", options: [.regularExpression, .caseInsensitive])
+        // #1303: an ADOPTED device id (`whoop-<SERIAL>`) is a device identifier in every line that prints
+        // an id. Neither rule above catches it — the MAC rule wants MAC shape and the serial rule wants the
+        // literal "WHOOP " then a DIGIT, while an adopted id is `whoop-` + a serial commonly starting with
+        // a letter. Keeps three characters, matching `WhoopSerialIdentity.logSafe`, so two straps stay
+        // distinguishable; PRESERVES the `-noop` computed-sibling suffix, which is not identifying and is
+        // what lets a reader tell derived rows from measured ones. Six-character minimum matches
+        // `minSerialLength`, so `my-whoop` and `my-whoop-noop` are untouched. Kotlin twin in
+        // `redactStrapLogPii`.
+        out = out.replacingOccurrences(
+            of: "whoop-([A-Za-z0-9]{3})[A-Za-z0-9-]{3,}(-noop)",
+            with: "whoop-$1…$2", options: .regularExpression)
+        out = out.replacingOccurrences(
+            of: "whoop-([A-Za-z0-9]{3})[A-Za-z0-9-]{3,}",
+            with: "whoop-$1…", options: .regularExpression)
+        // #2092: an Oura device id (`oura-<serial>`) is the same #1303 gap for the OTHER brand — neither
+        // rule above catches it, since the prefix isn't "whoop-". Exact same shape (3-character prefix +
+        // `…`, matching `OuraSerialIdentity.logSafe`) and the same `-noop`-suffix-preserving pair, since
+        // `DeviceRegistryStore.computedSuffix` is brand-agnostic — an Oura device gets a `oura-<serial>
+        // -noop` sibling the same way a WHOOP strap does. Applied AFTER the WHOOP rules but that ordering
+        // is not load-bearing: the two prefixes never overlap. Kotlin twin in `redactStrapLogPii`.
+        out = out.replacingOccurrences(
+            of: "oura-([A-Za-z0-9]{3})[A-Za-z0-9-]{3,}(-noop)",
+            with: "oura-$1…$2", options: .regularExpression)
+        out = out.replacingOccurrences(
+            of: "oura-([A-Za-z0-9]{3})[A-Za-z0-9-]{3,}",
+            with: "oura-$1…", options: .regularExpression)
+        // The account holder's NAME, as WHOOP writes it into the advertised local name. WHOOP names a
+        // strap "<FirstName>'s Whoop" by default and the scan path logs that name on every discovery, so
+        // the shareable log (#445) we ask people to attach to public issues carried a real person's name.
+        // No rule above could see it: they key on MAC shape, "WHOOP " + digit, or a "whoop-" id.
+        //
+        // Keeps the possessive and whatever follows, so "Ryan's WHOOP 4.0" keeps the MODEL, which is
+        // diagnostic and identifies nobody. Matches the curly apostrophe because Apple platforms write
+        // U+2019 into default device names — a straight-quote-only rule would miss this platform's logs.
+        //
+        // LIMITATION, deliberate: exactly ONE token before the possessive, so "Ryan B's Whoop" keeps
+        // "Ryan". A multi-token rule cannot tell a name from the surrounding log text and would swallow
+        // "Discovered" with it. A fully custom name with no possessive stays a known gap. Kotlin twin in
+        // `redactStrapLogPii` as `PII_DEVICE_NAME_RE`.
+        out = out.replacingOccurrences(
+            of: "[\\p{L}\\p{N}_.\\-]+(['\u{2019}]s\\s+(?i:whoop))",
+            with: "<name>$1", options: .regularExpression)
+        return out
+    }
+
+    /// The full, shareable strap log for a bug report (issue #17): a header carrying the app version,
+    /// OS, and — on iOS — the environment diagnostics that actually cause issues, followed by the live
+    /// session log. Shared so BOTH the Live screen's log card AND a macOS Settings shortcut (#507 — a 4.0
+    /// owner couldn't find the log on Mac) build the SAME text. Call on the main thread (button taps).
+    func exportableLogText(extraHeaderLines: [String] = []) -> String {
+        let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        #if os(iOS)
+        let osName = "iOS"
+        #else
+        let osName = "macOS"
+        #endif
+        var header = "NOOP strap log - \(osName)\nApp: \(Self.appIdentityLine)\n\(osName): "
+            + ProcessInfo.processInfo.operatingSystemVersionString + "\n"
+        #if os(iOS)
+        let diagLines = IOSDiagnostics.capture().summaryLines()
+        if !diagLines.isEmpty { header += diagLines.joined(separator: "\n") + "\n" }
+        // #1578: what the Apple Health observer path cost this session. Silent unless it ran, so a log from
+        // someone with Health off or unauthorized is unchanged.
+        let healthLines = HealthSyncStats.summaryLines()
+        if !healthLines.isEmpty { header += healthLines.joined(separator: "\n") + "\n" }
+        #endif
+        // #453: the BODY is scrubbed as it is appended, but these header lines come from the diagnostics
+        // block and never pass through that path - and they carry device ids, which embed a BLE address
+        // for a re-added or second strap. Same redactor, so one export cannot be safe while the other leaks.
+        if !extraHeaderLines.isEmpty {
+            header += extraHeaderLines.map { Self.redactPii($0) }.joined(separator: "\n") + "\n"
+        }
+        header += String(repeating: "-", count: 40) + "\n"
+        // Earlier runs first, so the body stays in chronological order and the log-parsing tools read it
+        // unchanged; then this whole run, from disk — not only the newest `maxLogLines` the screen keeps.
+        // An export before this process logs anything (Report tapped right after a restart) still carries
+        // the run before it (#1263).
+        return header + Self.archive.exportText()
+    }
+}
+
+/// What the Live Console should read out, given WHICH device is active.
+///
+/// `LiveState` is one object that every live source writes into, so "is this field populated" is not the
+/// same question as "does this field describe the device on screen". A bonded WHOOP sitting beside a
+/// streaming Oura ring leaves every WHOOP-only field truthful-looking while the console is naming the
+/// ring, which is #2075: the ring's own 93% was decoded and held, and the strap's stale 72% was what got
+/// drawn under "Oura Ring 5".
+///
+/// Pure and shared so the Apple and Android consoles cannot answer it differently.
+public enum LiveConsoleReadout {
+
+    /// Whether the ACTIVE registry device is a WHOOP.
+    ///
+    /// Defaults to true when the registry has not opened or the active row is not resolvable, which is
+    /// the WHOOP-first tone the console's device name already takes. Delegates to `SourceIdentity`, the
+    /// one place that answers this, rather than adding a second spelling of it.
+    ///
+    /// That default is load-bearing rather than cosmetic. A WHOOP adopting its serial identity re-keys
+    /// the active row mid-session (#1303), so the id being asked about can briefly name a row that no
+    /// longer exists; answering "WHOOP" there keeps a working strap's console intact, which is the right
+    /// call because the device that just re-keyed IS a WHOOP.
+    public static func activeIsWhoop(devices: [PairedDevice], activeId: String?) -> Bool {
+        guard let activeId, let active = devices.first(where: { $0.id == activeId }) else { return true }
+        return SourceIdentity.isWhoop(active)
+    }
+
+    /// Whether the ACTIVE registry device is an Oura ring (#2305).
+    ///
+    /// The OPPOSITE default to `activeIsWhoop`: false when the registry has not opened or the active row is
+    /// not resolvable. The ring-only affordances this gates (the ring status line, "Reconnect ring") have
+    /// no WHOOP-first tone to keep; showing them for an unknown device would offer a reconnect that
+    /// reaches nothing. A device that is neither (Polar, Garmin, …) is neither — it gets the Devices row.
+    public static func activeIsOura(devices: [PairedDevice], activeId: String?) -> Bool {
+        guard let activeId, let active = devices.first(where: { $0.id == activeId }) else { return false }
+        return active.brand.caseInsensitiveCompare(ExperimentalBrand.oura.displayBrand) == .orderedSame
+    }
+
+    /// The charge to show for the ACTIVE device, or nil to show nothing.
+    ///
+    /// A non-WHOOP active device never falls back to the WHOOP's charge. Showing nothing is the honest
+    /// answer when a ring has not reported yet; showing the strap's number would be a confident lie, and
+    /// it is the exact shape of the reported bug.
+    public static func batteryPercent(activeIsWhoop: Bool, whoopPct: Double?, ringPct: Int?) -> Int? {
+        // ROUNDS, and deliberately. The surfaces this replaced disagreed: Devices and the widget rounded,
+        // the Live Console truncated, so a strap on 72.6% read 73 on one screen and 72 on another. One
+        // seam has to pick, and for a percentage rounding is the accurate one. `.rounded()` is
+        // half-away-from-zero and Kotlin's Math.round is half-up, identical over the 0...100 this sees.
+        if activeIsWhoop { return whoopPct.map { Int($0.rounded()) } }
+        return ringPct
     }
 }

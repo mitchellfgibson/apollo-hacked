@@ -1,0 +1,314 @@
+import Foundation
+import WhoopProtocol
+import OuraProtocol
+
+/// Pure, testable mapping from a batch of decoded `OuraEvent` (emitted by `OuraProtocol.OuraDriver`)
+/// onto the datastore's `Streams` shape, so the isolated live Oura source (`OuraLiveSource` in the app
+/// target) can persist its samples through the SAME `StreamStore.insert` path the WHOOP pipeline uses,
+/// keyed by the ring's own `deviceId`, without duplicating row-construction logic in the app target
+/// where it can't be unit-tested. Parallels `StandardHRMapping`.
+///
+/// Honest-data invariant (hard): we surface only the ring's decoded raw signals + its own open event
+/// tags (HR/IBI/HRV/SpO2/temp/sleep-phase/battery). We NEVER read or surface Oura's encrypted readiness
+/// or sleep scores. NOOP computes its own Charge/Rest downstream from these per-device streams. The
+/// `OuraHRV` 0x5D tag is the ring's OWN RMSSD-derived HRV signal (OURA_PROTOCOL.md s6.9), not a readiness
+/// score; NOOP also independently reconstructs RMSSD from the IBI streams for its own scoring.
+///
+/// Timestamping: the live source streams a batch and stamps every row at the arrival wall-clock `ts`
+/// (unix seconds), exactly as `StandardHRMapping.samples(...at:)` does. The decoded events carry only a
+/// ring-clock `ringTimestamp` (a `(session << 16) | counter` value, NOT wall-clock), so anchoring is the
+/// transport's job; the mapping stays pure and deterministic by taking the wall-clock `ts` as input. A
+/// signal that could not be decoded never reaches this layer (the decoders return nil upstream), so a
+/// missing stream stays empty here, never faked (Huami precedent).
+///
+/// Tier-B (UNVERIFIED) events are dropped: only Tier-A decoded signals map into `Streams`, so an
+/// unverified summary can never silently feed scoring. ONE exception, and it is explicit rather than
+/// silent: `.sleepPeriodInfo`'s `breath` field maps to `resp` (see the case below). That value is the
+/// RING's own measurement, not something NOOP derives, so keeping it is a decode question rather than a
+/// method question — but it is kept OUT of the sleep stager at the read (`OuraRespScale.forScoring`)
+/// rather than out of the database, because the stager reads this stream as a 1 Hz raw ADC waveform and
+/// a per-window rate is the wrong SHAPE for it, however good the rate is.
+public enum OuraStreamMapping {
+    /// WhoopEvent.kind for the ring's own HRV 0x5D tag. The payload carries the honestly-labelled decoded
+    /// fields `pair_index` / `hr_bpm` / `rmssd_ms` — the 0x5D body is a run of `(u8 avg HR bpm, u8 avg
+    /// RMSSD ms)` pairs, one per 5-min bucket (layout pinned to open_oura, OURA_PROTOCOL.md s6.9). This is
+    /// the ring's OWN summary tag, NOT Oura's readiness score, and NOT NOOP's scoring RMSSD (that is
+    /// reconstructed from `rr`). Each bucket is stamped at its own 5-min offset (see `.hrv` below) so the
+    /// per-bucket series survives the (deviceId, ts, kind) event key. Must match the Kotlin twin exactly.
+    public static let hrvEventKind = "OURA_HRV"
+    /// WhoopEvent.kind for a decoded sleep-phase code (2-bit: awake/light/deep/rem).
+    public static let sleepPhaseEventKind = "OURA_SLEEP_PHASE"
+    /// WhoopEvent.kind for a decoded 0x47 motion_events window (open_oura `decode_motion`). The payload
+    /// carries the ring's OWN per-window motion summary — `orientation` / `motion_seconds` / `x` / `y` / `z`
+    /// (avg accel ×8) / `low_intensity` / `high_intensity` (the last two absent on a short record). This is
+    /// INSTRUMENTATION: an honest activity signal, never scored and never fed to the sleep stager (0x47 is
+    /// movement-gated — a shape mismatch for the gravity-stillness stager, #804). Must match the Kotlin twin.
+    public static let motionEventKind = "OURA_MOTION"
+
+    /// Build a `Streams` from a batch of decoded Oura events, all stamped at the arrival wall-clock `ts`
+    /// (unix seconds). Pure → unit-testable. Section-4 table:
+    ///   - `.hr`         (0x55 live-HR push)            → `hr:[HRSample]`
+    ///   - `.ibi`        (0x44/0x60 IBI)                → `rr:[RRInterval]`
+    ///   - `.hrv`        (0x5D HRV tag, u8 hr/rmssd pairs) → `events:[WhoopEvent(kind: OURA_HRV)]` (one row per 5-min bucket)
+    ///   - `.spo2`       (0x6F/0x70 ONLY)              → `spo2:[SpO2Sample]`, carrying the decoder's own
+    ///     `unit` tag. NOT all one quantity: 0x6F/0x70 are firmware-computed PERCENTAGES (tagged `"raw"`,
+    ///     a legacy channel label — see `OuraDecoders.decodeSpO2PerSample`), while 0x77 is a genuine raw
+    ///     DC channel tagged `"dc_raw"` on a wholly different scale. **0x77 is decoded but NOT persisted**
+    ///     — it is filtered at the guard below, because blending two scales into one `red` column corrupts
+    ///     any consumer that averages the stream without a unit filter. Nothing is written to `spo2Pct`.
+    ///   - `.temp`       (0x46/0x75)                    → `skinTemp:[SkinTempSample(raw_adc)]`
+    ///   - `.sleepPhase` (0x4E/0x5A 2-bit codes)        → `events:[WhoopEvent(kind: OURA_SLEEP_PHASE)]`
+    ///   - `.battery`                                   → `battery:[BatterySample]`
+    ///   - `.sleepPeriodInfo` (0x6A, Tier B)            → `resp:[RespSample(milli_bpm)]` — `breath` ONLY,
+    ///     as instrumentation; every other field of the record stays in the investigation log.
+    /// Every other event case (`.motion`, `.state`, `.timeSync`, `.rtcBeacon`, `.debugText`, `.tierB`,
+    /// `.activityInfo`) is intentionally not folded into a durable stream here. In particular the 0x50
+    /// activity/MET decode NEVER mints a `steps` row: the formula is third-party and unvalidated (Tier B,
+    /// OURA_PROTOCOL.md s6.13), and MET is not a step count - fabricating one would break the honest-data
+    /// invariant and the per-source day-owner rules.
+    public static func streams(from events: [OuraEvent], at ts: Int) -> Streams {
+        var out = Streams()
+        for e in events {
+            switch e {
+            case .hr(let v):
+                // Honest HR: surface only the ring's decoded BPM. The push also carries one IBI, but the
+                // dedicated `.ibi` events are the R-R source, so we do not synthesise an RR row from the HR
+                // push here to avoid double-counting the same interval.
+                out.hr.append(HRSample(ts: ts, bpm: v.bpm))
+
+            case .ibi(let v):
+                // Carry the decoder's OWN channel tag onto the durable row (#1071). The ring reports the
+                // same heartbeats on more than one tag — 0x80 green-quality all night, 0x6E only while an
+                // SpO2 measurement runs — and both decode to `.ibi`, so an untagged store held roughly TWO
+                // complete copies of every night (measured 2.06x beats and 2.17x sum(rrMs)/wall-clock over
+                // one 488-min window). Both rows are real measurements, so neither is dropped here; the
+                // scoring READ (`Reads.rrIntervals`) picks one channel and the other stays on disk as its
+                // cross-check. Nil stays nil — a channel is never guessed.
+                out.rr.append(RRInterval(ts: ts, rrMs: v.ibiMs, srcChannel: rrChannel(v.channel)))
+
+            case .hrv(let v):
+                // The ring's OWN 0x5D 5-min bucket: average HR (bpm) + average RMSSD (ms), both u8, no
+                // scaling (layout pinned to open_oura's (u8 hr, u8 rmssd) pairs — the byte->unit scaling
+                // that was "unpinned" is now known, so these are honestly labelled, not raw bytes).
+                // `pair_index` is the bucket's position in the record. This is the ring's open summary
+                // tag, NOT Oura's readiness score; NOOP's own scoring RMSSD still comes from the IBI
+                // stream (`rr`). Keys/values are IDENTICAL to the Kotlin twin so both platforms emit
+                // byte-for-byte the same OURA_HRV payload.
+                //
+                // Each bucket gets its OWN timestamp so it lands on a distinct event row. The event PK is
+                // (deviceId, ts, kind), so N pairs sharing the record `ts` would collide on insert and only
+                // one survive — silently dropping the rest of the ring's per-5-min series.
+                //
+                // ORDER (#1167): the record's FIRST byte-pair is its OLDEST bucket, and the record `ts`
+                // marks the END of the span it covers — so the LAST pair's 5 minutes end at `ts`. This
+                // matches the two sibling per-record series in this file rather than contradicting them:
+                // `.spo2` below lays its samples back from the record time (`count - 1 - index`), and the
+                // hypnogram assembler lays a burst's codes backward from its anchored end. A bucket is an
+                // INTERVAL stamped at its start, not an instant, hence `count - index` where SpO2 uses
+                // `count - 1 - index`.
+                //
+                // This corrects an earlier `ts - index * 300`, which mirrored every bucket within its own
+                // record (up to +30/-20 min out on a 6-pair record). Measured against an independent
+                // reconstruction — the median HR of the `0x60` beats in each 5-min window, a different tag
+                // and a different decoder — over three consecutive overnights: r = +0.970 / +0.959 / +0.894
+                // with this ordering, against -0.079 / +0.629 / +0.111 with the old one. Reversing within
+                // the same span (no shift) collapses the best night to +0.060, so it is the ORDER that is
+                // being measured, not a clock offset.
+                //
+                // `count` is the record's ORIGINAL pair count, including a `00 00` pad dropped at decode
+                // (#1131) — the offset is measured from the record's tail, so an uncounted pad would slide
+                // every surviving bucket in that record.
+                let bucketTs = ts - (v.count - v.index) * 300
+                out.events.append(WhoopEvent(ts: bucketTs, kind: hrvEventKind, payload: [
+                    "pair_index": .int(v.index),
+                    "hr_bpm": .int(v.hrBpm),
+                    "rmssd_ms": .int(v.rmssdMs),
+                ]))
+
+            case .spo2(let v):
+                // Only persist the 0x6F/0x70 channel (`unit == "raw"`): a real overnight capture
+                // (2026-07-30/31, 22516 samples) clusters tightly at 95-105, matching a genuine %SpO2
+                // reading. The 0x77 DC channel (`unit == "dc_raw"`) is a wildly different-scale raw
+                // PPG/perfusion signal (-9K to +11.7M in the same capture) - not SpO2 at all, so blending
+                // it into `red` corrupts any consumer that averages the stream with no unit filter
+                // (`AnalyticsEngine.nightlySpo2RawMeans` still does; the ceiling-mean path only survives
+                // because it range-gates at 50...110). Still decoded, still reachable from
+                // `oura-raw.jsonl`; just never durably persisted. `SpO2Sample` is the WHOOP-shaped
+                // two-channel raw row, so we record the decoded value on `red` and leave `ir` at 0.
+                guard v.unit == "raw" else { continue }
+
+                // `unit` still travels onto the row (always "raw" past the guard) so downstream never
+                // assumes a %.
+                //
+                // Each surviving sample gets its OWN second. `spo2Sample` is keyed (deviceId, ts), so the 13 samples
+                // of one 0x6F record written at the record's single `ts` collided and only the first
+                // survived — 92% of an overnight silently discarded, and unrecoverable because the ring
+                // trims its banked history once the offload is acked (#1070). The samples are one per
+                // second (measured: 13 values per packet at a 13 s median packet interval, p10 12 / p90 14,
+                // so they tile the interval at exactly 1 Hz), and they are laid BACKWARD from the record
+                // time — the record envelope marks the WRITE moment, so the LAST sample keeps the record's
+                // own `ts` and the anchor semantics are unchanged. Same derivation standard the
+                // hypnogram assembler is held to (see `.sleepPhase` below, which lays a burst's codes
+                // backward at the documented 30 s epoch from its anchored end, precisely so every code
+                // is a distinct row): a documented cadence plus a record anchor, never a guessed one.
+                // `count == 1` (0x7B, and any single-sample record) yields offset 0, i.e. exactly the
+                // previous behaviour. PARITY: the Kotlin twin computes the IDENTICAL second.
+                //
+                // This is collision-RARE, not collision-proof. The cadence has a tight tail (p10 12 s),
+                // and a 12 s gap between two 13-sample records makes the newer record's FIRST second
+                // equal the older record's last, costing one sample at that boundary. Measured over the
+                // same overnight: 204 of 1,877 adjacent pairs overlap, by exactly 1 s each, so 204 of
+                // 24,405 samples (0.84 %) are lost — against 92.3 % before. `spo2Sample` inserts
+                // `ON CONFLICT DO NOTHING`, so the survivor is the older record's last sample, which is
+                // the anchor-exact one; what is dropped is the newer record's most back-extrapolated
+                // sample. Sub-second timestamps would be needed to keep both, and the row key is seconds.
+                let sampleTs = ts - max(0, v.count - 1 - v.index)
+                out.spo2.append(SpO2Sample(ts: sampleTs, red: v.value, ir: 0, unit: v.unit))
+
+            case .temp(let v):
+                // The decoder yields degrees C. The durable `SkinTempSample.raw` is an integer in the
+                // codebase-wide CENTI-degree-C convention: the WHOOP @73 historical path stores raw at
+                // this scale and the analytics reader (AnalyticsEngine.skinTempFunnel) divides raw by 100
+                // to recover °C. We store the SAME centi-°C scale so an Oura night reads on the SAME gates
+                // as a WHOOP night with no scorer change, and tag the unit so the convention is explicit
+                // and never silently assumed. PARITY: the Kotlin twin stores the SAME celsius * 100, so a
+                // given decoded celsius yields an IDENTICAL raw integer on both platforms.
+                out.skinTemp.append(SkinTempSample(ts: ts, raw: Int((v.celsius * 100).rounded()), unit: "centi_c"))
+
+            case .sleepPhase(let v):
+                // Each code arrives with its RECONSTRUCTED time as `ts` (OuraHypnogramAssembler lays the
+                // burst's codes backward at the documented 30 s SleepNet epoch from the anchored burst
+                // end — the record envelope marks the analysis WRITE moment, not the sleep). 30 s spacing
+                // makes every code a distinct (deviceId, ts, kind) row; the earlier provisional
+                // `ts + index` offset is gone (it would double-shift reconstructed codes). The raw 2-bit
+                // code persists unchanged; `index` (position within the wire record) is kept for audit.
+                out.events.append(WhoopEvent(ts: ts, kind: sleepPhaseEventKind, payload: [
+                    "phase": .int(v.stage.rawValue),
+                    "index": .int(v.index),
+                ]))
+
+            case .battery(let v):
+                out.battery.append(BatterySample(
+                    ts: ts,
+                    soc: Double(v.percent),
+                    mv: v.voltageMv,
+                    charging: v.charging))
+
+            case .motionEvent(let m):
+                // 0x47 motion window → an OURA_MOTION event carrying the ring's OWN per-window summary. This
+                // is INSTRUMENTATION on the honest activity signal, NOT a gravity stream: 0x47 is
+                // movement-gated (no still samples), a shape mismatch for the gravity-stillness `SleepStager`
+                // (#804), so it is NEVER folded into `gravitySample` and NEVER scored. It rides the SAME
+                // event-table path as OURA_HRV / OURA_SLEEP_PHASE (the ring's other per-record signals), one
+                // row per window at its own anchored `ts`. Keys IDENTICAL to the Kotlin twin. `low_/
+                // high_intensity` are omitted on a short record (absent, never faked to 0).
+                var payload: [String: ParsedValue] = [
+                    "orientation": .int(m.orientation),
+                    "motion_seconds": .int(m.motionSeconds),
+                    "x": .int(m.avgX), "y": .int(m.avgY), "z": .int(m.avgZ),
+                ]
+                if let lo = m.lowIntensity { payload["low_intensity"] = .int(lo) }
+                if let hi = m.highIntensity { payload["high_intensity"] = .int(hi) }
+                out.events.append(WhoopEvent(ts: ts, kind: motionEventKind, payload: payload))
+
+            case .sleepPeriodInfo(let v):
+                // 0x6A `breath` → a `respSample` row under the RING's deviceId, and on a ring night that
+                // row set supplies the SCORED `dailyMetric.respRateBpm` (AnalyticsEngine.vendorRespRateBpm
+                // takes the in-session median). `OuraRespScale.forScoring` still refuses these rows at the
+                // STAGING read — a per-window rate is the wrong shape for a peak detector expecting a
+                // ~1 Hz raw ADC waveform.
+                //
+                // Why this one field is stored: `breath` is the RING's own measurement, read off the wire
+                // — not a signal NOOP derives from raw sensor data. The #194 rule governs the latter
+                // (PPG→HR, RSA-from-R-R: methods where NOOP invents the number), so the question here is
+                // whether the DECODE is right, and that is settled structurally: 3,493 records over four
+                // nights, every value an exact multiple of 0.125, both of the source's declared invariants
+                // upheld. It has the same standing as the ring's own hypnogram, which NOOP already
+                // persists and scores from (#773/#877). Cross-checks, in order of weight: these records
+                // median 14.75/min against the SAME wearer's 851-night Oura APP export at 15.250 (IQR
+                // 14.875–15.625) — same quantity, same band (distribution, not paired: the corpora do not
+                // overlap in date); against a WHOOP worn the same nights the decode reproduces the
+                // VENDOR's own offset (Oura below WHOOP 18/18, Δ −1.158; ours Δ −1.458 sign-stable 6/6,
+                // r = +0.599 / +0.748 well-covered, against Oura's own +0.680 ceiling); and the date
+                // falsifier passed (wrong mapping collapses r to −0.151).
+                //
+                // Scale: `raw` is MILLI-breaths-per-minute (`OuraRespScale`), which is exact for every
+                // wire value rather than merely close. `respSample.raw` otherwise carries a WHOOP raw ADC
+                // WAVEFORM sample — a different physical quantity in the same table — so the row's owner
+                // is what tells the two apart, and `OuraRespScale` is the one place that knows it.
+                //
+                // What this record does NOT persist, and why: `averageHrBpm` would land in the same `hr`
+                // series as the beat-derived channel at a different cadence and provenance;
+                // `breathVariability` / `mzci` / `dzci` / `cv` are named but uninterpreted; `sleepState`
+                // has no documented code meaning. They stay in the investigation log. The scored slot
+                // `dailyMetric.respRateBpm` is fed from these rows in `AnalyticsEngine`, not here — this
+                // layer only mints the durable row; the coverage guards and the era-scoped baseline that
+                // make it safe to score live there.
+                // PARITY: the Kotlin twin stores the IDENTICAL integer for a given decoded value.
+                out.resp.append(RespSample(ts: ts,
+                                           raw: OuraRespScale.milliBpm(fromBreathsPerMin: v.breathsPerMin),
+                                           unit: OuraRespScale.unitTag))
+
+            case .motion, .state, .timeSync, .rtcBeacon, .debugText, .tierB, .activityInfo,
+                 .realStepsFields:
+                // Not a durable per-device stream row (timeSync/rtcBeacon anchor the transport's clock;
+                // motion/state/debug are diagnostics; Tier-B / .activityInfo / .realStepsFields are
+                // UNVERIFIED and must never feed scoring or the steps stream). In particular the 0x50
+                // activity/MET decode NEVER mints a `steps` row: the formula is third-party and
+                // unvalidated, and MET is not a step count — fabricating one would break the honest-data
+                // invariant. Nor may .realStepsFields mint one: ground truth showed no field is a count,
+                // they are the inputs to Oura's step model (see OuraRealStepsFields).
+                //
+                // `.sleepPeriodInfo` used to be dropped here too. It is now mapped above, to ONE stream
+                // and one field: `breath` → `resp`. Its `averageHrBpm` is still refused, for the reason
+                // that kept the whole record out — it would land in the same HR series as the
+                // beat-derived channel at a DIFFERENT cadence and a different provenance.
+                continue
+            }
+        }
+        return out
+    }
+
+    /// Group already-stamped events into ONE batch per timestamp, keeping the order they arrived in
+    /// (and the first-appearance order of the timestamps themselves). Pure → unit-testable.
+    ///
+    /// This exists because `StreamStore.insert`'s `seq` / `ord` counters are **batch-local by design**:
+    /// `ord` is a beat's position among the beats that share its second *within one insert*, which is
+    /// the only place emission order is still known (v30, #823). A transport that hands the store one
+    /// event per insert therefore restarts the counter on every beat and writes `ord = 0` on every row
+    /// — measured on a real database as 575,630 of 575,630 rows (#1072). With `ord` tied, the read falls
+    /// through to `(rrMs, seq)`, i.e. a second's beats come back sorted by VALUE, and RMSSD — built
+    /// entirely from successive differences — is biased down by construction.
+    ///
+    /// One record's beats all carry that record's own ring time, so grouping by the resolved timestamp
+    /// is what hands the store a record's beats together. Order is the only property callers may rely
+    /// on: events keep their relative order inside a batch, so `ord` counts in emission order.
+    public static func batched(_ stamped: [(event: OuraEvent, ts: Int)]) -> [(ts: Int, events: [OuraEvent])] {
+        var order: [Int] = []
+        var byTs: [Int: [OuraEvent]] = [:]
+        for s in stamped {
+            if byTs[s.ts] == nil {
+                order.append(s.ts)
+                byTs[s.ts] = []
+            }
+            byTs[s.ts]?.append(s.event)
+        }
+        return order.map { (ts: $0, events: byTs[$0] ?? []) }
+    }
+
+    /// Translate the protocol layer's `OuraIBIChannel` to the store's `RRSourceChannel` (#1071).
+    ///
+    /// Two enums rather than one because `OuraProtocol` deliberately does not depend on `WhoopProtocol`
+    /// (it is the pure, Linux-buildable ring decoder). They pin the SAME raw values, and the mapping is
+    /// written out case by case rather than as `RRSourceChannel(rawValue:)` so that adding a case on one
+    /// side without the other is a COMPILE error instead of a silent nil. Exposed for the parity test.
+    public static func rrChannel(_ c: OuraIBIChannel?) -> RRSourceChannel? {
+        switch c {
+        case .greenQuality:  return .greenQuality
+        case .spo2Ibi:       return .spo2Ibi
+        case .ibiAmplitude:  return .ibiAmplitude
+        case .ibiBare:       return .ibiBare
+        case nil:            return nil
+        }
+    }
+}

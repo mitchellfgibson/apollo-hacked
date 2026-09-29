@@ -595,7 +595,11 @@ private struct ProfileStep: View {
             VStack(spacing: 16) {
                 StrandCard {
                     VStack(spacing: 18) {
-                        Stepper(value: $profile.age, in: 13...100) {
+                        // `profile.age` is derived from dateOfBirth (#146) and read-only, so the
+                        // stepper writes through the DOB — same control, same range.
+                        Stepper(value: Binding(get: { profile.age },
+                                               set: { profile.dateOfBirth = ProfileStore.dateOfBirth(forAge: $0) }),
+                                in: 13...100) {
                             FieldRow(label: "Age", value: "\(profile.age) yrs")
                         }
 

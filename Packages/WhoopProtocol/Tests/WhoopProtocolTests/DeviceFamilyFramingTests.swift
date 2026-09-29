@@ -3,27 +3,6 @@ import XCTest
 
 final class DeviceFamilyFramingTests: XCTestCase {
 
-    // MARK: - Whoop 5.0 command framing (puffinCommandFrame) — locked to ground truth
-
-    /// A 4-aligned command needs no padding and must verify as a well-formed puffin frame.
-    func testPuffinCommandFrameAligned() {
-        // SEND_HISTORICAL_DATA (cmd 22) payload [0]: inner [35,1,22,0] is already 4-aligned.
-        let built = puffinCommandFrame(cmd: 22, seq: 1, payload: [0x00])
-        XCTAssertEqual(built, Self.hex("aa0108000001e671230116002c00998e"))
-        XCTAssertTrue(verifyFrame(built, family: .whoop5).ok)
-    }
-
-    /// THE PADDING FIX: the 12-byte maverick haptic payload makes the inner record 15 bytes, which
-    /// MUST be padded to 16 before the length/CRC are computed — otherwise the strap rejects the
-    /// frame (it was ACK'd-but-silent before this fix). Round-trips through verifyFrame.
-    func testPuffinCommandFramePads12ByteHaptic() {
-        let buzz = MaverickHaptics.notificationBuzz(loops: 1)   // 12 bytes
-        XCTAssertEqual(buzz.count, 12)
-        let built = puffinCommandFrame(cmd: 19, seq: 5, payload: buzz)
-        XCTAssertEqual(built, Self.hex("aa0114000001e1e1230513012f9800000000000000000100ba9fe436"))
-        XCTAssertTrue(verifyFrame(built, family: .whoop5).ok, "padded frame must verify")
-    }
-
     static func hex(_ s: String) -> [UInt8] {
         var out = [UInt8](); out.reserveCapacity(s.count / 2)
         var idx = s.startIndex
@@ -150,6 +129,60 @@ final class DeviceFamilyFramingTests: XCTestCase {
         XCTAssertEqual(DeviceFamily.allCases, [.whoop4, .whoop5])
     }
 
+    func testDiagnosticGattFamiliesAreMetadataOnly() {
+        XCTAssertEqual(WhoopGattServiceFamily.unsupportedServiceUUIDStrings, [
+            "11500001-6215-11ee-8c99-0242ac120002",
+            "8a580001-2fe8-4796-9267-b87a2b0c8234",
+            "59830001-5955-419b-bb8d-c8262926af23",
+        ])
+
+        for family in WhoopGattServiceFamily.unsupportedFamilies {
+            XCTAssertFalse(family.isConnectable)
+            XCTAssertNil(family.connectableDeviceFamily)
+            XCTAssertTrue(family.diagnosticUnsupportedMessage.contains("will not connect or send commands"))
+            XCTAssertEqual(family.characteristicUUIDStrings.count, 5)
+        }
+    }
+
+    func testSupportedGattFamiliesRemainTheOnlyConnectableFamilies() {
+        XCTAssertEqual(WhoopGattServiceFamily.whoop4.connectableDeviceFamily, .whoop4)
+        XCTAssertEqual(WhoopGattServiceFamily.maverickGooseFD4B.connectableDeviceFamily, .whoop5)
+        XCTAssertEqual(
+            WhoopGattServiceFamily.maverickGooseFD4B.serviceUUIDString,
+            "fd4b0001-cce1-4033-93ce-002d5875f58a"
+        )
+    }
+
+    func testUnsupportedAdvertisementsDoNotConnect() {
+        let decision = whoopGattScanDecision(
+            selectedServiceUUIDString: DeviceFamily.whoop5.serviceUUIDString,
+            advertisedServiceUUIDStrings: ["8A580001-2FE8-4796-9267-B87A2B0C8234"]
+        )
+
+        XCTAssertFalse(decision.shouldConnect)
+        XCTAssertEqual(decision.unsupportedFamily, .monument)
+    }
+
+    func testSelectedServiceAdvertisementsStillConnect() {
+        let decision = whoopGattScanDecision(
+            selectedServiceUUIDString: DeviceFamily.whoop4.serviceUUIDString,
+            advertisedServiceUUIDStrings: [DeviceFamily.whoop4.serviceUUIDString]
+        )
+
+        XCTAssertTrue(decision.shouldConnect)
+        XCTAssertNil(decision.unsupportedFamily)
+    }
+
+    func testEmptyAdvertisementServiceListPreservesLegacyConnectPath() {
+        let decision = whoopGattScanDecision(
+            selectedServiceUUIDString: DeviceFamily.whoop4.serviceUUIDString,
+            advertisedServiceUUIDStrings: []
+        )
+
+        XCTAssertTrue(decision.shouldConnect)
+        XCTAssertNil(decision.unsupportedFamily)
+    }
+
     // MARK: - Puffin packet type names
 
     func testPuffinTypeNamesAliased() {
@@ -170,6 +203,7 @@ final class DeviceFamilyFramingTests: XCTestCase {
         // A puffin-metadata (type 56) frame must parse with typeName "METADATA".
         // payload=[56 03 00 ab cd 00 00 00] (padded), crc32 over it.
         let frame = Self.hex("aa010c000001e741380300abcd00000060153281")
+        // collectFields: the annotated fields array is opt-in diagnostics (D#742).
         let parsed = parseFrame(frame, family: .whoop5, collectFields: true)
         XCTAssertTrue(parsed.ok)
         XCTAssertEqual(parsed.typeName, "METADATA")
@@ -234,10 +268,106 @@ final class DeviceFamilyFramingTests: XCTestCase {
         XCTAssertEqual(out.first, frame)
     }
 
+    // MARK: - Puffin command frame builder (experimental 5/MG outbound)
+
+    func testPuffinCommandFrameVerifies() {
+        // A puffin TOGGLE_REALTIME_HR (cmd 3, payload [0x01]) must be a well-formed whoop5 frame.
+        let f = puffinCommandFrame(cmd: 3, seq: 7, payload: [0x01])
+        let check = verifyFrame(f, family: .whoop5)
+        XCTAssertTrue(check.ok)
+        XCTAssertEqual(check.crc8OK, true)    // CRC16 header outcome surfaced via crc8OK
+        XCTAssertEqual(check.crc32OK, true)
+        // And it parses back as a whoop5 frame with the seq we set.
+        let parsed = parseFrame(f, family: .whoop5)
+        XCTAssertTrue(parsed.ok)
+        XCTAssertEqual(parsed.seq, 7)
+        // It also reassembles cleanly through the whoop5 reassembler.
+        XCTAssertEqual(Reassembler(family: .whoop5).feed(f), [f])
+    }
+
     func testReassemblerWhoop4DefaultUnchanged() {
         // Default family stays WHOOP 4.0: a 28-byte whoop4 frame (length=0x18=24 -> total 28).
         let frame = Self.hex("aa1800ff28020f3de10128663c0000000000000000000000da855212")
         XCTAssertEqual(Reassembler().feed(frame), [frame])
         XCTAssertEqual(Reassembler(family: .whoop4).feed(frame), [frame])
+    }
+
+    func testPuffinHapticsFrameMatchesMaverickGolden() {
+        // WHOOP 5/MG buzz (#48): the haptic inner is 15 bytes ([35, seq, 0x13] + 12-byte payload), which
+        // pad4 must extend to 16 before length/CRC — exactly as the strap's maverick framing does. The
+        // golden frame is computed from the working app's buildMaverickFrame (notify preset, effects
+        // 47,152) at seq=1; byte-for-byte equality proves our opcode (0x13), payload, AND pad4 are correct.
+        let payload: [UInt8] = [0x01, 47, 152, 0, 0, 0, 0, 0, 0, 0, 0, 0]   // 0x01 + effects(8) + loopCtl(2) + overallLoop
+        XCTAssertEqual(payload.count, 12)
+        let frame = puffinCommandFrame(cmd: 0x13, seq: 1, payload: payload)
+        XCTAssertEqual(frame, Self.hex("aa0114000001e1e1230113012f980000000000000000000098cb83a5"))
+        XCTAssertEqual(frame.count, 28)            // 8 header + 16 padded inner + 4 crc32
+        XCTAssertTrue(verifyFrame(frame, family: .whoop5).ok)
+        XCTAssertEqual(Reassembler(family: .whoop5).feed(frame), [frame])
+        // pad4 is a NO-OP for already-4-aligned commands: HR toggle inner ([35, seq, 3, 1]) stays 16 bytes.
+        XCTAssertEqual(puffinCommandFrame(cmd: 3, seq: 7, payload: [0x01]).count, 16)
+    }
+
+    // MARK: - 5/MG firmware-alarm payloads (REVISION_4 / REVISION_2) — Swift twin of AlarmPayloadTest.kt
+
+    func testMaverickAlarmPayloadBytes() {
+        // wakeEpochMs 1_700_000_000_123 → seconds 1700000000 (LE 00 f1 53 65),
+        // subseconds (123*32768)/1000 = 4030 = 0x0FBE (LE be 0f); tail = effects 47/152,
+        // loopControl 0, overallLoop 7, duration 30 s. Byte-for-byte the Android vectors.
+        let body = AlarmPayload.setAlarmRev4(wakeEpochMs: 1_700_000_000_123)
+        XCTAssertEqual(body.count, 20)
+        XCTAssertEqual(body, Self.hex("040100f15365be0f2f980000000000000000071e"))
+        XCTAssertEqual(AlarmPayload.disableRev2(), [0x02, 0xFF])
+        XCTAssertEqual(AlarmPayload.runAlarmRev2(), [0x02, 0x01])
+        // #926: overallLoop counts the repeats AFTER the first pulse (hardware-confirmed on a 5/MG by
+        // @dwehrmann), so ONE buzz is 0 — and that is byte-for-byte the literal both send() paths shipped
+        // for years, which is why the old single buzz was the observed behaviour.
+        XCTAssertEqual(MaverickHaptics.notificationBuzz(loops: 1),
+                       [0x01, 47, 152, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        // The SAME vectors the Kotlin twin pins (MaverickHapticBodyTest), so the two reimplementations
+        // cannot drift on what this byte means.
+        XCTAssertEqual(MaverickHaptics.notificationBuzz(loops: 2).last, 1)       // 2 buzzes = 1 repeat
+        XCTAssertEqual(MaverickHaptics.notificationBuzz(loops: 3).last, 2)       // 3 buzzes
+        XCTAssertEqual(MaverickHaptics.notificationBuzz(loops: 5).last, 4)       // BuzzPattern.Long
+        XCTAssertEqual(MaverickHaptics.notificationBuzz(loops: 999).last, 7)     // clamped to the alarm's 7
+        XCTAssertEqual(MaverickHaptics.notificationBuzz(loops: 0).last, 0)       // never underflows
+        // Everything except byte 11 is the shipped constant, at every loop count.
+        for n in 1...8 {
+            let body = MaverickHaptics.notificationBuzz(loops: n)
+            XCTAssertEqual(body.count, 12)
+            XCTAssertEqual(Array(body[0..<11]), [0x01, 47, 152, 0, 0, 0, 0, 0, 0, 0, 0])
+        }
+    }
+
+    func testPuffinAlarmFramesMatchKotlinParityGoldens() {
+        // Cross-platform parity pins: the Android FramingTest asserts these SAME three full-frame
+        // hexes, so both platforms are locked to identical alarm bytes (the same pipeline whose
+        // buzz output is capture-verified above). SET_ALARM_TIME inner is 23 bytes → pad4 → 24,
+        // declLen 28; the rev-2 bodies pad 5 → 8.
+        let alarm = puffinCommandFrame(cmd: 66, seq: 1,
+                                       payload: AlarmPayload.setAlarmRev4(wakeEpochMs: 1_700_000_000_123))
+        XCTAssertEqual(alarm, Self.hex("aa011c000001e381230142040100f15365be0f2f980000000000000000071e00392f2ac9"))
+        XCTAssertEqual(alarm.count, 36)
+        XCTAssertTrue(verifyFrame(alarm, family: .whoop5).ok)
+        XCTAssertEqual(Reassembler(family: .whoop5).feed(alarm), [alarm])
+        XCTAssertEqual(puffinCommandFrame(cmd: 69, seq: 1, payload: AlarmPayload.disableRev2()),
+                       Self.hex("aa010c000001e74123014502ff000000267ffc4f"))
+        XCTAssertEqual(puffinCommandFrame(cmd: 68, seq: 1, payload: AlarmPayload.runAlarmRev2()),
+                       Self.hex("aa010c000001e741230144020100000017cd19e2"))
+    }
+
+    func testPuffinOneShotBuzzSequenceGoldens() {
+        // #921 one-shot buzz (BLEManager.buzzStrapOnce): on a 5/MG the confirmed sequence is the
+        // maverick 0x13 notify buzz followed by RUN_ALARM(68) REVISION_2, on consecutive seq bytes.
+        // Golden hexes generated independently (Python: zlib CRC-32, CRC16-Modbus) and cross-checked
+        // against the Android FramingTest vectors, so a drift in either frame fails here. (Android
+        // stops at the maverick buzz on a 5/MG: its allow-list excludes RUN_ALARM for that family.)
+        let buzz = puffinCommandFrame(cmd: 0x13, seq: 1,
+                                      payload: [0x01, 47, 152, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        XCTAssertEqual(buzz, Self.hex("aa0114000001e1e1230113012f980000000000000000000098cb83a5"))
+        let runAlarm = puffinCommandFrame(cmd: 68, seq: 2, payload: AlarmPayload.runAlarmRev2())
+        XCTAssertEqual(runAlarm, Self.hex("aa010c000001e74123024402010000008ad7f1d3"))
+        XCTAssertTrue(verifyFrame(buzz, family: .whoop5).ok)
+        XCTAssertTrue(verifyFrame(runAlarm, family: .whoop5).ok)
     }
 }

@@ -1,0 +1,76 @@
+# Catches translation drift BEFORE merge instead of after a user reports it (#326, #342, #448
+# were all the same recurring pattern: new UI text lands without its German translation, or a
+# Kotlin literal never gets wired to stringResource() at all since Compose has no Xcode-style
+# auto-extraction). With the #453 backlog closed, Tools/i18n_audit.py --ci hard-fails on any
+# hardcoded/un-extracted UI literal or any missing German, Spanish, or French translation across
+# Android resources and all four Apple String Catalogs.
+# Pure Python + git, no Xcode/Gradle: runs in seconds on ubuntu-latest, independent of the
+# disabled-by-default app-build.yml / android.yml compile jobs.
+name: i18n Coverage
+
+on:
+  pull_request:
+    branches: [main]
+  # Audit main itself too, not just PRs into it. A RELEASE pushes STRAIGHT to main with no PR, and
+  # Tools/appchangelog-gen.py emits the What's New title as a RAW Kotlin literal that has to be
+  # localized by hand afterwards (Compose has no Xcode-style auto-extraction). With a PR-only
+  # trigger that landed completely unaudited, and — because --ci is a whole-tree gate, not a diff —
+  # it then red-checked EVERY contributor's PR on a line none of them touched (9.0.1, fixed by
+  # #514). Auditing the push surfaces it on main the moment it lands, so it is fixed before anyone
+  # else trips over it. Same 8-second job; no new cost.
+  push:
+    branches: [main]
+
+concurrency:
+  group: i18n-coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # Which commit the audit diffs against. Since #524 this DECIDES the verdict: `--ci` exempts
+      # any violation already present at the base, so the gate reports what this change introduced
+      # rather than auditing the whole tree. That is the point of #524 (a regression on main no
+      # longer red-flags every open PR), and it makes the base ref load-bearing in two ways.
+      #
+      # `fetch-depth: 0` above is one of them. The audit reads the base through `git show`, so a
+      # shallow clone misses every base lookup. That direction fails safe, since nothing is exempt
+      # and the gate fails loudly rather than passing, but it fails for a reason nobody would guess.
+      #
+      # The other is this resolution. `github.base_ref` is set ONLY for pull_request. On a push it is
+      # empty, and the obvious fallback of origin/main is the PUSHED COMMIT ITSELF: the run would
+      # compare the tree against itself and could never fail. Verified by planting a hardcoded
+      # literal, base=HEAD passes and base=HEAD~1 catches it. That would have quietly retired the
+      # case the push trigger exists for, described at the top of this file: a release pushes
+      # straight to main with no PR, and appchangelog-gen.py emits the What's New title as a raw
+      # Kotlin literal. So a push diffs against `github.event.before`, the tip before the push,
+      # which spans every commit the push carried rather than just the last one.
+      - name: Resolve the base to diff against
+        id: base
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.base_ref }}" ]; then
+            base="origin/${{ github.base_ref }}"          # pull_request: the branch it targets
+          else
+            before="${{ github.event.before }}"           # push: the tip before this push
+            # All-zeros on a branch's first push, and absent for a manual run. Neither can be
+            # diffed, so fall back to the parent: still a real comparison, just narrower.
+            if [ -n "$before" ] \
+               && [ "$before" != "0000000000000000000000000000000000000000" ] \
+               && git cat-file -e "$before^{commit}" 2>/dev/null; then
+              base="$before"
+            else
+              base="HEAD~1"
+            fi
+          fi
+          echo "ref=$base" >> "$GITHUB_OUTPUT"
+          echo "diffing against $base"
+
+      - name: i18n audit (regression gate)
+        run: python3 Tools/i18n_audit.py --ci "${{ steps.base.outputs.ref }}"

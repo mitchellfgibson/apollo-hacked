@@ -19,7 +19,8 @@ The persistence layer is the `WhoopStore` Swift package
 (`Packages/WhoopStore`), built on [GRDB](https://github.com/groue/GRDB.swift) over SQLite. Like
 every package in the repo, it declares both platforms — `.iOS(.v16)` and `.macOS(.v13)`
 (`Packages/WhoopStore/Package.swift`) — and is UI-framework agnostic, so the same schema and
-storage code back the macOS reference app today and the planned iOS app later.
+storage code back both the macOS app and the iOS app (the latter build-from-source only — see
+`docs/IOS.md`).
 
 The macOS app target opens the database at a fixed, per-user location
 (`Strand/Collect/StorePaths.swift`):
@@ -59,14 +60,20 @@ single `DatabaseQueue` and applies these PRAGMAs before any query runs:
 | `busyMode` | `.timeout(5)` | 5-second busy timeout under write contention. |
 
 `WhoopStore` is an `actor`: all GRDB calls run on the actor's serial executor (off the main
-thread) through the `syncRead` / `syncWrite` helpers. The reported schema version is
-`WhoopStoreInfo.schemaVersion = 9`.
+thread) through the `syncRead` / `syncWrite` helpers. `WhoopStoreInfo.schemaVersion` is a
+separate, manually-maintained constant (currently `18`) that has lagged the real migration
+history for a while and should not be read as the schema's true version. The migrator itself
+(`makeMigrator()`, below) is the source of truth for what tables/columns exist, and has run
+through **v25** (`v25-oura-raw` — the Oura raw-payload archive, the newest addition; see
+below).
 
 ---
 
 ## Schema at a glance
 
-The schema falls into four groups:
+The schema falls into five groups (this section predates, and undercounts, everything added
+after v9 — see the schema-version note above; the Oura raw archive below is the one
+post-v9 addition currently documented here):
 
 | Group | Tables | Origin |
 | --- | --- | --- |
@@ -74,7 +81,8 @@ The schema falls into four groups:
 | **Decoded streams** (durable) | `hrSample`, `rrInterval`, `event`, `battery`, `spo2Sample`, `skinTempSample`, `respSample`, `gravitySample` | Decoded from strap frames on-device |
 | **Raw outbox** (transient) | `rawBatch` | Compressed raw BLE frames, prunable |
 | **Bookkeeping** | `cursors` | Highwater / read cursors |
-| **Metric caches** | `sleepSession`, `dailyMetric`, `journal`, `workout`, `appleDaily`, `metricSeries` | Derived metrics + CSV / Apple-Health imports |
+| **Metric caches** | `sleepSession`, `dailyMetric`, `journal`, `workout`, `appleDaily`, `metricSeries`, `scoreInputProvenance` | Derived metrics + their input-provider provenance + CSV / Apple-Health imports |
+| **Oura raw archive** (durable, v25) | `ouraRaw` | Verbatim Oura API payloads behind the opt-in cloud import — see below |
 
 All timestamp columns named `ts`, `startTs`, `endTs`, `capturedAt`, etc. are **unix seconds**
 (integers). Day-keyed cache tables use a `day` text column in `YYYY-MM-DD` form and compare it
@@ -98,6 +106,14 @@ Migrations are registered in `Packages/WhoopStore/Sources/WhoopStore/Database.sw
 | **v7** | Adds in-sleep signal aggregates to `dailyMetric`: `spo2Pct`, `skinTempDevC`, `respRateBpm` (all nullable). |
 | **v8** | Adds `journal`, `workout`, and `appleDaily` (Apple-Health daily aggregates). |
 | **v9** | Adds the generic long-format `metricSeries` table and its `(deviceId, key, day)` index. |
+| **v24-rr-seq** | Rebuilds the `rrInterval` primary key as `(deviceId, ts, rrMs, seq)`, so an identical interval recurring within one second is no longer dropped. |
+| **v29-score-input-provenance** | Adds metric-level `scoreInputProvenance` for NOOP-computed headline scores. It does not change `dayOwnership` or score precedence. |
+| **v30-rr-ord** | Adds the nullable `rrInterval.ord` column — emission order within a `ts` — and makes it lead the read sort (#823/#830). Additive; pre-existing rows keep `ord` NULL. |
+
+> This table is a selection, not the full list — it covers the migrations the tables above refer to.
+> The registered set is the authority. Migrations are keyed by their **identifier string**, not by
+> the number in it, so renaming one re-runs it against an already-migrated database. Cite the
+> identifier in full — `v30-rr-ord`, not "v30".
 
 ### The vestigial `synced` column
 
@@ -168,10 +184,39 @@ stuck-strap watchdog.
 | `deviceId` | TEXT NOT NULL | Part of PK. |
 | `ts` | INTEGER NOT NULL | Wall-clock unix seconds. Part of PK. |
 | `rrMs` | INTEGER NOT NULL | Beat-to-beat interval, milliseconds. Part of PK. |
+| `seq` | INTEGER NOT NULL DEFAULT 0 | *(v24)* Repeat counter for an **identical** beat. Part of PK. |
+| `ord` | INTEGER | *(v30)* Emission order within `ts`. Nullable; **not** in the PK. |
 | `synced` | INTEGER NOT NULL DEFAULT 0 | *(v5, vestigial)* |
 
-**Primary key:** `(deviceId, ts, rrMs)` — `rrMs` is in the key because multiple R-R intervals can
-share a single `REALTIME_DATA` timestamp. Reads order by `ts ASC, rrMs ASC`.
+**Primary key:** `(deviceId, ts, rrMs, seq)` — `rrMs` is in the key because multiple R-R intervals can
+share a single `REALTIME_DATA` timestamp, and `seq` because the same interval value can legitimately
+recur within that second. `seq` keys on `(ts, rrMs)`, **not** `ts` alone: every *distinct* interval in
+a second therefore carries `seq = 0` and keeps its own key, so a distinct beat is never dropped when a
+second arrives across separate insert batches or via the live/historical merge. A `ts`-only counter
+would restart per batch and collide distinct beats — a data-loss regression.
+
+**Read order:** `ts ASC, ord ASC, rrMs ASC, seq ASC`
+(`Reads.swift` `rrIntervals`, `WhoopDao.kt` `rrIntervals`).
+
+`ord` leads the sort because ordering by `rrMs` returned a second's beats sorted by **value**, which
+makes successive beats similar by construction and biases RMSSD — built entirely from successive
+differences — downward (#823, fixed in #830). `ord` is the beat's position among all beats sharing its
+`ts`, stamped at decode time. It is deliberately **not** in the key, for the reason above.
+
+Two properties of `ord` a consumer has to know:
+
+- **Pre-v30 rows have `ord` NULL.** The order was never recorded and cannot be backfilled. SQLite
+  sorts NULL first in ASC, so an all-legacy second ties on `ord` and falls through to the old
+  `(rrMs, seq)` order — i.e. existing data reads back exactly as before, with the #823 bias intact.
+  No `COALESCE`, no sentinel. Room and GRDB agree here because both are SQLite.
+- **`ord` is batch-local.** A second split across two live flushes restarts `ord` at 0, and
+  `ON CONFLICT DO NOTHING` keeps whichever row landed first, so that second also falls back to
+  magnitude order. The historical offload path delivers a second atomically and is unaffected.
+
+`ord` is a sort key only. The two platforms differ in whether they carry it back: Swift selects
+`ts, rrMs`, so `ord` is excluded, while `WhoopDao.rrIntervals` is `SELECT *` and Room materialises it
+into every returned `RrInterval` (`Entities.kt`, `val ord: Int? = null`). No consumer reads its value
+on either platform.
 
 ### `event` *(v1)* — strap events
 
@@ -251,6 +296,11 @@ inserts, identical range-read shape).
 | `synced` | INTEGER NOT NULL DEFAULT 0 | *(v5, vestigial)* |
 
 **Primary key:** `(deviceId, ts)`.
+
+This is the low-rate decoded vector used by normal analytics, not the 100 Hz six-axis capture.
+High-rate IMU deliberately remains outside SQLite. Capture sessions own canonical, decoded `.imus`
+files split into fixed 30-minute UTC segments with independently compressed 30-second blocks. See
+[5/MG raw data capture](RAW_DATA_CAPTURE.md#storage-design).
 
 ---
 
@@ -438,6 +488,66 @@ to:)`) or `metricDays(key:)`, which scan `(deviceId, key)` and then walk days. T
 those reads index-only. Accessors: `upsertMetricSeries(...)`, `metricSeries(...)`,
 `metricKeys(...)` (distinct keys for a device), and `metricDays(...)` (`MIN`/`MAX` day per key).
 
+### `scoreInputProvenance` *(v29)*
+
+Records which sensor/import source supplied the inputs for each persisted NOOP-computed score.
+This is deliberately separate from `dayOwnership`, which remains a scoring resolver override.
+Rows are replaced atomically with the corresponding `dailyMetric` / `metricSeries` score writes;
+legacy scores without a row have unknown provenance and the UI omits their provider badge.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `deviceId` | TEXT NOT NULL | Computed `-noop` namespace. Part of PK. |
+| `day` | TEXT NOT NULL | `YYYY-MM-DD`. Part of PK. |
+| `key` | TEXT NOT NULL | `recovery`, `strain`, or `sleep_performance`. Part of PK. |
+| `sourceId` | TEXT NOT NULL | Physical device or import source that supplied the inputs. |
+
+**Primary key:** `(deviceId, day, key)`. **Index:** `idx_scoreInputProvenance_source` on
+`sourceId`, used when a provider's data is deleted.
+
+---
+
+## Oura raw-payload archive
+
+This section documents the one table added after this document's v9 baseline (see the
+schema-version note above): the lossless backstop behind the opt-in Oura history import
+(off by default; user-initiated OAuth backfill — `docs/PRIVACY_SECURITY.md` §1.1b). It is
+**not** a metric cache like the tables above — it stores verbatim API responses, not decoded
+values, so any field Oura returns can be re-derived later without re-fetching.
+
+### `ouraRaw` *(v25)*
+
+One row per fetched PAGE of an Oura API endpoint response — not one row per Oura document; a
+single page's `data` array can carry many documents (`OuraRawStore.swift`, `struct OuraRawRow`).
+Written by `OuraSyncCoordinator.fetchRaw(_:dateParam:)` in the app target (`Strand/Oura/`).
+Natural key `(deviceId, endpoint, documentId)`. Migration `v25-oura-raw`
+(`Packages/WhoopStore/Sources/WhoopStore/Database.swift`) — additive only, a new table, no
+existing row touched.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `deviceId` | TEXT NOT NULL | Part of PK. `"oura-api"` for the live cloud-import lane. |
+| `endpoint` | TEXT NOT NULL | Part of PK. Oura endpoint name, e.g. `"sleep"`, `"daily_readiness"`, `"heartrate"`. |
+| `documentId` | TEXT NOT NULL | Part of PK. A SYNTHESIZED page key, `"<endpoint>-<startDate>-<pageIndex>"` (`startDate` is the backfill window's start date, `pageIndex` the fetched page's 0-based position) — never Oura's own document `id`, for any endpoint. |
+| `day` | TEXT | `YYYY-MM-DD`, nullable. Currently always NULL — the coordinator never sets it. Reserved for a future per-document (rather than per-page) keying scheme. |
+| `payloadJSON` | TEXT NOT NULL | Verbatim JSON body of the fetched page (the raw HTTP response, including its `data` array of documents) — losslessness holds at the page level, not the individual-document level. |
+| `fetchedAt` | INTEGER NOT NULL | Unix seconds. |
+
+**Primary key:** `(deviceId, endpoint, documentId)`. `upsertOuraRaw(...)` is idempotent on this
+key via `ON CONFLICT(...) DO UPDATE` — re-pulling the SAME window (same `startDate`, so the same
+`pageIndex` synthesizes the same `documentId`) overwrites that page's `day`/`payloadJSON`/
+`fetchedAt` in place rather than duplicating.
+
+**Index** — `idx_ouraRaw_device_endpoint_day` on `(deviceId, endpoint, day)`, so per-endpoint
+reads (`ouraRaw(deviceId:endpoint:)`) scan `(deviceId, endpoint)` and walk `day` in order
+without a table scan.
+
+**Not covered by `deleteAllData(deviceId:)`.** Unlike the metric-cache tables above, `ouraRaw`
+is not in `DeviceRegistryStore.deviceScopedTables`, so the general per-device wipe skips it by
+construction. Disconnecting Oura calls the dedicated `deleteOuraRaw(deviceId:)` alongside
+`deleteAllData(deviceId:)` (`Strand/Oura/OuraConnectModel.swift`) so the raw archive is purged
+too, not left behind.
+
 ---
 
 ## Index summary
@@ -446,6 +556,7 @@ those reads index-only. Accessors: `upsertMetricSeries(...)`, `metricSeries(...)
 | --- | --- | --- | --- |
 | *(implicit PK)* | every table above | (its natural key) | Dedupe + primary lookup. |
 | `idx_metricSeries_device_key_day` | `metricSeries` | `deviceId, key, day` | Index-only per-metric range reads. |
+| `idx_ouraRaw_device_endpoint_day` | `ouraRaw` | `deviceId, endpoint, day` | Index-only per-endpoint range reads. |
 
 Every other table relies on its primary-key index; the decoded-stream and date-range reads are all
 served by the `(deviceId, ts)` / `(deviceId, day)` / `(deviceId, startTs)` primary keys.

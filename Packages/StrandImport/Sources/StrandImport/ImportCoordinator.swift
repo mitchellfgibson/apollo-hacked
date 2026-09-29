@@ -11,25 +11,57 @@ public struct ImportCoordinator {
 
     private let appleHealth: AppleHealthImporter
     private let whoop: WhoopExportImporter
+    private let xiaomi: XiaomiBandImporter
+    private let wearable: WearableExportImporter
 
     public init(
         appleHealth: AppleHealthImporter = AppleHealthImporter(),
-        whoop: WhoopExportImporter = WhoopExportImporter()
+        whoop: WhoopExportImporter = WhoopExportImporter(),
+        xiaomi: XiaomiBandImporter = XiaomiBandImporter(),
+        wearable: WearableExportImporter = WearableExportImporter()
     ) {
         self.appleHealth = appleHealth
         self.whoop = whoop
+        self.xiaomi = xiaomi
+        self.wearable = wearable
     }
 
     // MARK: - Explicit-kind entry points
 
     /// Parse an Apple Health export (`export.zip`, `export.xml`, or a folder).
-    public func importAppleHealth(from url: URL) throws -> AppleHealthImportResult {
-        try appleHealth.import(from: url)
+    ///
+    /// `retainRawSamples` defaults to `true` so existing call sites and tests get
+    /// the raw `samples` array. The app's import path passes `false` so a
+    /// multi-year export is folded into per-day aggregates incrementally and the
+    /// raw samples are dropped, keeping peak memory bounded (issue #355).
+    public func importAppleHealth(
+        from url: URL,
+        retainRawSamples: Bool = true
+    ) throws -> AppleHealthImportResult {
+        // Reuse the injected importer when its flag already matches (keeps any
+        // custom importer the caller supplied); otherwise build one with the
+        // requested retention so callers can opt into bounded memory per-call.
+        if retainRawSamples == appleHealth.retainRawSamples {
+            return try appleHealth.import(from: url)
+        }
+        return try AppleHealthImporter(retainRawSamples: retainRawSamples).import(from: url)
     }
 
     /// Parse a Whoop CSV export (`.zip` or folder).
     public func importWhoopExport(from url: URL) throws -> WhoopImportResult {
         try whoop.import(from: url)
+    }
+
+    /// Parse a Xiaomi / Mi Band export (the Mi Fitness sandbox folder, a `.zip` of it,
+    /// or the bare `<user_id>.db`).
+    public func importXiaomiBand(from url: URL) throws -> XiaomiImportResult {
+        try xiaomi.import(from: url)
+    }
+
+    /// Parse a user's own Oura / Fitbit / Garmin data export (a `.json`, a folder, or a `.zip`).
+    /// The brand is auto-detected by content.
+    public func importWearableExport(from url: URL) throws -> WearableImportResult {
+        try wearable.import(from: url)
     }
 
     // MARK: - Auto-detecting entry point
@@ -38,11 +70,15 @@ public struct ImportCoordinator {
     public enum DetectedImport: Sendable, Equatable {
         case appleHealth(AppleHealthImportResult)
         case whoopExport(WhoopImportResult)
+        case xiaomiBand(XiaomiImportResult)
+        case wearable(WearableImportResult)
 
         public var kind: DataSourceKind {
             switch self {
             case .appleHealth: return .appleHealth
             case .whoopExport: return .whoopExport
+            case .xiaomiBand: return .xiaomiBand
+            case .wearable(let r): return r.brand.dataSourceKind
             }
         }
 
@@ -50,6 +86,8 @@ public struct ImportCoordinator {
             switch self {
             case .appleHealth(let r): return r.summary
             case .whoopExport(let r): return r.summary
+            case .xiaomiBand(let r): return r.summary
+            case .wearable(let r): return r.summary
             }
         }
     }
@@ -62,11 +100,28 @@ public struct ImportCoordinator {
     ///   CSVs) → Whoop export.
     /// - A folder/zip containing `export.xml` → Apple Health.
     public func detectAndImport(from url: URL) throws -> DetectedImport {
-        switch try detectKind(of: url) {
+        // The three first-party exports have distinctive structural markers; try them first.
+        let kind: DataSourceKind
+        do {
+            kind = try detectKind(of: url)
+        } catch ImportError.notAZipOrFolder {
+            // A readable file with no first-party marker: hand it to the Oura/Fitbit/Garmin wearable
+            // export importer, which sniffs the brand by content. ONLY this case falls through. A
+            // genuinely missing file (fileNotFound) or any other structural error is re-thrown so the
+            // user sees the real problem instead of a misleading "not an Oura/Fitbit/Garmin export".
+            return .wearable(try wearable.import(from: url))
+        }
+        switch kind {
         case .appleHealth:
             return .appleHealth(try appleHealth.import(from: url))
         case .whoopExport:
             return .whoopExport(try whoop.import(from: url))
+        case .xiaomiBand:
+            return .xiaomiBand(try xiaomi.import(from: url))
+        // detectKind never returns the wearable-import kinds (it has no marker for them) — the wearable
+        // importer owns brand detection. Unreachable but kept exhaustive.
+        case .ouraImport, .fitbitImport, .garminImport:
+            return .wearable(try wearable.import(from: url))
         }
     }
 
@@ -80,6 +135,8 @@ public struct ImportCoordinator {
 
         let ext = url.pathExtension.lowercased()
         if ext == "xml" { return .appleHealth }
+        // A bare Mi Fitness SQLite file.
+        if ext == "db" { return .xiaomiBand }
 
         let names = try entryFilenames(of: url, isDirectory: isDir.boolValue)
         if names.contains("export.xml") { return .appleHealth }
@@ -88,7 +145,30 @@ public struct ImportCoordinator {
         ]
         if !names.isDisjoint(with: whoopNames) { return .whoopExport }
 
+        // Mi Fitness sandbox: a `DataBase/<user_id>/de/<user_id>.db` somewhere inside.
+        if try containsMiFitnessDB(of: url, isDirectory: isDir.boolValue) { return .xiaomiBand }
+
         throw ImportError.notAZipOrFolder(url.path)
+    }
+
+    /// True if a folder or zip holds a Mi Fitness health DB (`.../de/<…>.db`).
+    private func containsMiFitnessDB(of url: URL, isDirectory: Bool) throws -> Bool {
+        func isHealthDBPath(_ p: String) -> Bool {
+            let lower = p.lowercased()
+            return lower.hasSuffix(".db") && lower.contains("/de/")
+        }
+
+        if isDirectory {
+            let fm = FileManager.default
+            guard let e = fm.enumerator(at: url, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else {
+                return false
+            }
+            for case let u as URL in e where isHealthDBPath(u.path) { return true }
+            return false
+        }
+
+        guard let paths = try? ZipPeek.paths(in: url) else { return false }
+        return paths.contains(where: isHealthDBPath)
     }
 
     // MARK: - Helpers
@@ -132,5 +212,12 @@ enum ZipPeek {
             names.insert((entry.path as NSString).lastPathComponent.lowercased())
         }
         return names
+    }
+
+    /// Full relative entry paths (lowercased) — for structure-aware detection where a
+    /// base filename isn't enough (e.g. spotting `DataBase/<id>/de/<id>.db`).
+    static func paths(in zipURL: URL) throws -> [String] {
+        let archive = try Archive(url: zipURL, accessMode: .read)
+        return archive.compactMap { $0.type == .file ? $0.path.lowercased() : nil }
     }
 }

@@ -118,6 +118,26 @@ final class AppleHealthAggregatorTests: XCTestCase {
         XCTAssertEqual(a.basalKcal!, 1500, accuracy: 1e-9)
     }
 
+    /// #589: overlapping step samples from DIFFERENT sources (an iPhone AND an Apple Watch both count the
+    /// same walk) must NOT be summed across sources — that double-counts ~2x and poisons the steps
+    /// calibration. We sum WITHIN a source but take the MAX source per day, the de-overlap Apple Health
+    /// itself shows. Same-source samples still sum (see testDailySums).
+    func testStepsDoNotDoubleCountAcrossSources() {
+        let day = Fixtures.utc(2024, 3, 8, 10, 0, 0)
+        func step(_ v: Double, _ src: String) -> HealthSample {
+            HealthSample(type: "StepCount", value: v, valueString: String(Int(v)), unit: "count",
+                         start: day, end: day, tzOffsetMin: 0, sourceName: src)
+        }
+        // iPhone logs 4000 + 3000 = 7000 across the day; the Watch logs 6500 + 1000 = 7500 the SAME day.
+        let samples = [
+            step(4000, "iPhone"), step(3000, "iPhone"),
+            step(6500, "Apple Watch"), step(1000, "Apple Watch"),
+        ]
+        let a = try! XCTUnwrap(agg(AppleHealthAggregator.daily(samples: samples), "2024-03-08"))
+        // NOT 14500 (the naive cross-source sum). MAX source = 7500.
+        XCTAssertEqual(a.steps!, 7500, accuracy: 1e-9)
+    }
+
     // MARK: - VO2Max latest
 
     func testVO2MaxLatestWins() {

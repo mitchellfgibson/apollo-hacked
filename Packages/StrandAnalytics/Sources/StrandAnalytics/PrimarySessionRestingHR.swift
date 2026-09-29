@@ -1,0 +1,93 @@
+import Foundation
+
+/// #1169: a shadow resting-HR definition — the arithmetic MEAN of valid HR samples in the longest
+/// (primary) sleep session, rather than the five-minute floor `AnalyticsEngine` ships today.
+///
+/// ## Why (issue #1169, artemc)
+/// The original daily RHR took the minimum floor across sessions, letting a short low-HR nap replace
+/// the main overnight session. A clean-room,
+/// single-participant 5-night experiment (official WHOOP RHR + a Polar H10 ECG mean as independent
+/// references, a pre-declared dev/holdout split, no fitted offset) found the primary-session sample mean
+/// tracked both references far better: rounded MAE vs the official target 6.0→2.0 (dev) / 7.5→0.8 (holdout).
+///
+/// ## Shadow metric after #2522
+/// #2358 temporarily wired this mean into the daily headline while selecting the primary session to
+/// avoid the nap problem. #2522 keeps that session selection but takes its existing five-minute floor.
+/// This mean remains in `rhr_primary_session` for comparison and does not feed scoring.
+///
+/// What that means for the evidence below: the MAE figures are from ONE participant over five nights against
+/// a pre-declared split, which is the holdout the issue says is not yet large enough. #2284 proposes
+/// changing a session's `restingHR` definition separately; this shadow comparison does not enact it.
+///
+/// ## Definition (documented per the issue)
+/// - **Primary session**: the LONGEST session by duration; ties resolve to the FIRST (stable). A shorter nap
+///   never replaces the main night — the selection rule now used by the shipped daily RHR too.
+/// - **Valid sample**: bpm within `validBpm` (default 30…220, matching `AnalyticsEngine`'s worn-HR range).
+///   Anything outside the range — or a missing sample (simply absent from the array) — is excluded.
+/// - **Mean**: the arithmetic SAMPLE mean (unweighted). The experiment validated the sample mean; a
+///   time-weighted variant behaves differently under irregular cadence and must be evaluated separately.
+/// - **Coverage**: returns `nil` unless the primary session has at least `minValidSamples` valid samples.
+/// - The result is an APPROXIMATION, not a clinically validated measurement.
+///
+/// Twin of Kotlin `PrimarySessionRestingHR`. Keep byte-identical.
+public enum PrimarySessionRestingHR {
+
+    /// One sleep session for a wake day: its duration and its raw (possibly-invalid) HR samples in bpm.
+    /// Wake-day assignment and session building stay in the caller (`AnalyticsEngine`); this type is the
+    /// minimal input the pure metric needs, so it is testable with no engine, DB, or clock.
+    public struct Session: Sendable, Equatable {
+        public let durationSec: Double
+        public let bpm: [Int]
+        public init(durationSec: Double, bpm: [Int]) {
+            self.durationSec = durationSec
+            self.bpm = bpm
+        }
+    }
+
+    /// The worn-HR range `AnalyticsEngine` uses when deciding a sample is real; reused so validity is one rule.
+    public static let defaultValidBpm: ClosedRange<Int> = 30...220
+    /// Provisional minimum valid-sample coverage before a value is returned. A sample count is cadence-blind;
+    /// the exact rule is a tuning parameter for the multi-participant validation the issue calls for.
+    public static let defaultMinValidSamples = 30
+
+    /// Mean valid HR of the LONGEST session, or `nil` when no session clears `minValidSamples` valid samples.
+    public static func meanHR(sessions: [Session],
+                              validBpm: ClosedRange<Int> = defaultValidBpm,
+                              minValidSamples: Int = defaultMinValidSamples) -> Double? {
+        // Primary = longest by duration. `max(by:)` keeps the FIRST of equal-duration sessions (only a
+        // strictly-longer one replaces it); Kotlin `maxByOrNull` resolves ties the same way, so parity holds.
+        guard let primary = sessions.max(by: { $0.durationSec < $1.durationSec }) else { return nil }
+        let valid = primary.bpm.filter { validBpm.contains($0) }
+        guard valid.count >= minValidSamples else { return nil }
+        return Double(valid.reduce(0, +)) / Double(valid.count)
+    }
+
+    /// #1169 coverage INPUTS for the same primary session `meanHR` averages: its valid-sample count and its
+    /// duration. The fixed `minValidSamples` gate is cadence-blind, so the accruing shadow dataset needs to
+    /// weight/filter each night's mean by how well-covered it was — but this deliberately records the raw
+    /// inputs, NOT a derived coverage fraction, so the later multi-participant holdout can pick its own
+    /// coverage definition rather than inheriting one. Same longest-session selection + gate as `meanHR`
+    /// (returns `nil` in lockstep with it), so the mean and its coverage are always emitted together. Still
+    /// pure + unwired — shadow instrumentation only. Twin of Kotlin `PrimarySessionRestingHR.coverage`.
+    public struct Coverage: Sendable, Equatable {
+        /// Valid HR samples in the primary session (the count the `minValidSamples` gate saw).
+        public let validSamples: Int
+        /// The primary (longest) session's duration in seconds.
+        public let durationSec: Double
+        public init(validSamples: Int, durationSec: Double) {
+            self.validSamples = validSamples
+            self.durationSec = durationSec
+        }
+    }
+
+    /// The primary session's valid-sample count + duration, or `nil` in lockstep with `meanHR` (no session
+    /// clears `minValidSamples`). Selection + gate mirror `meanHR` exactly.
+    public static func coverage(sessions: [Session],
+                                validBpm: ClosedRange<Int> = defaultValidBpm,
+                                minValidSamples: Int = defaultMinValidSamples) -> Coverage? {
+        guard let primary = sessions.max(by: { $0.durationSec < $1.durationSec }) else { return nil }
+        let valid = primary.bpm.filter { validBpm.contains($0) }
+        guard valid.count >= minValidSamples else { return nil }
+        return Coverage(validSamples: valid.count, durationSec: primary.durationSec)
+    }
+}

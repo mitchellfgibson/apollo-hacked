@@ -1,0 +1,135 @@
+# The Python test suites under Tools/, which nothing ran.
+#
+# `Tools/linux-capture` carries 212 tests across 8 files — the frame decoder, the HCI extractor, the
+# activity and sync decoders, the spot-HRV path, and the SpO2 promote gate that #103 is waiting on. Every
+# one of them only ever executed when a contributor remembered to, which meant a decoder could regress and
+# the suite that would have caught it stayed green by never being run.
+#
+# Cheap to run: pure stdlib `unittest`, no dependencies, no fixtures to fetch, ubuntu rather than macOS —
+# about 25 seconds end to end.
+#
+# NOT path-filtered, and that is deliberate. It used to fire only on `Tools/**.py`, on the premise that a
+# suite can only break when its own source changes. That is false for `test_home_i18n.py`, which asserts
+# on the CONTENTS of app and package files — AppModel.swift, the xcstrings catalogues, ReadinessEngine,
+# DayNavBar. A Swift-only commit broke it (#1671 moved a sign and a hardcoded °C out of a localized
+# literal) and the filter meant this job never ran, so `main` sat red until a contributor touching
+# `Tools/` for something unrelated tripped over it in their own PR (#1691).
+#
+# Widening the filter to name those paths would just re-create the trap one edit later: the list is
+# whatever the assertions happen to read today. Twenty-five seconds on every PR is cheaper than a gate
+# that is green because it did not run.
+#
+# That paragraph was already here, and a `Tools/**` filter was reinstated underneath it anyway, on the
+# Windows runner's cost. It cost the same thing a second time on 2026-09-24: an Android-only commit
+# changed a padding `test_home_i18n.py` asserts on, this job did not run, and main carried a red suite
+# through nine merges until a commit that happened to touch Tools/ finally tripped it. One of those
+# merges was an outside contributor's.
+#
+# So the split below, rather than a third round of the same argument: the Linux leg runs on everything
+# because it reads product source, and the Windows leg keeps its filter because it does not.
+name: Tools Python CI
+
+on:
+  # UNFILTERED, which is what the note above argues for and what the filter that used to sit here undid.
+  #
+  # The filter was added for a real reason: a Windows runner billed at twice a Linux minute should not run
+  # on the many pull requests that touch no Python. That reason was sound and the remedy was not, because
+  # it silenced the Linux leg too, and the Linux leg is the one that reads product source. The Windows leg
+  # now lives in tools-python-windows.yml and keeps a filter of its own, so the cost argument is answered
+  # where it applies instead of across a job it was never about.
+  #
+  # This leg is ubuntu and about 25 seconds. It stays on every pull request and every push to main.
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: tools-python-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-capture:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # `discover` rather than a hand-listed set, so a NEW test file is picked up without editing this
+      # workflow — the failure mode that leaves a suite unrun is exactly what this job exists to end.
+      #
+      # The count assertion is the same idea one level up: `discover` exits 0 having found NOTHING, so a
+      # wrong working-directory or a renamed pattern would turn this job green while running no tests at
+      # all. Checking a floor makes that fail loudly instead. Raise the floor when suites are added; do
+      # not lower it to make a red run pass.
+      - name: Run Tools/linux-capture tests
+        run: |
+          set -o pipefail   # GitHub's default shell is `bash -e` WITHOUT pipefail: piping into tee
+                            # would return tee's status and swallow a failing suite entirely.
+          python3 -m unittest discover -p "test_*.py" -v 2>&1 | tee "$RUNNER_TEMP/out.txt"
+          ran=$(grep -oE '^Ran [0-9]+ test' "$RUNNER_TEMP/out.txt" | grep -oE '[0-9]+')
+          echo "collected ${ran:-0} tests"
+          if [ "${ran:-0}" -lt 200 ]; then
+            echo "::error::expected at least 200 tests, collected ${ran:-0} — discovery is broken, not the suite"
+            exit 1
+          fi
+        working-directory: Tools/linux-capture
+
+      # The ONE parity suite that belongs on an unfiltered leg (#2567).
+      #
+      # `Tools/tests/test_parity_governance_acceptance.py` does not test the scanner. It asserts that the
+      # CHECKED-IN authority and baseline still reproduce from the CURRENT product source, so product
+      # changes are what invalidate it. It used to run only in parity-governance.yml, whose filter names
+      # `Tools/parity_*` — a filter that does not describe this suite's inputs, which is the same shape as
+      # the `test_home_i18n.py` trap in #1691 and is called out in that workflow's own header.
+      #
+      # It cost main a red ratchet on 2026-09-29: a change took the only production call to
+      # `primarySessionRestingHR` on both platforms, turning it test-only, and the two new findings went
+      # unrecorded because the change touched no `Tools/parity_*` path. Seventeen green checks, and the
+      # gate that governs call-site structure never ran. It surfaced on an outside contributor's PR that
+      # had caused none of it, which that header notes had already happened four times.
+      #
+      # Here rather than in a filter naming product paths, because that list is whatever the assertions
+      # happen to read today and would only move the trap. Its own step and its own floor so the core
+      # floor above stays independent, matching the reasoning already written there.
+      #
+      # COST, measured on this runner and not on a workstation: about 134 s for 49 tests, against about
+      # 6 s for the core step beside it. It derives the semantic authority once over both trees, which is
+      # the whole expense. Locally the same suite takes about 51 s, so do not size this from a laptop.
+      # It runs in parallel with the Swift and Android legs, which are minutes long on any product PR, so
+      # the wall-clock cost there is roughly nothing; a docs-only PR pays the full 134 s. The scanner's own
+      # multi-minute unit tests stay path-filtered in parity-governance.yml where they belong.
+      - name: Run the parity repository-acceptance suite
+        run: |
+          set -o pipefail
+          python3 -m unittest -v tests.test_parity_governance_acceptance 2>&1 | tee "$RUNNER_TEMP/acc.txt"
+          ran=$(grep -oE '^Ran [0-9]+ test' "$RUNNER_TEMP/acc.txt" | grep -oE '[0-9]+')
+          echo "collected ${ran:-0} tests"
+          if [ "${ran:-0}" -lt 49 ]; then
+            echo "::error::expected at least 49 acceptance tests, collected ${ran:-0} — discovery is broken, not the suite"
+            exit 1
+          fi
+        working-directory: Tools
+
+      # Parity governance has its own path-filtered workflow because that suite scans the repository and
+      # is intentionally much slower. Keep this core floor independent so growth in parity cannot hide
+      # accidental deletion here; these six source-reference checks raise it to 114.
+      - name: Run core Tools/ tests
+        run: |
+          set -o pipefail
+          mapfile -t files < <(find . -maxdepth 1 -name 'test_*.py' -printf '%f\n' | sort)
+          modules=("${files[@]%.py}")
+          python3 -m unittest -v "${modules[@]}" 2>&1 | tee "$RUNNER_TEMP/out.txt"
+          ran=$(grep -oE '^Ran [0-9]+ test' "$RUNNER_TEMP/out.txt" | grep -oE '[0-9]+')
+          echo "collected ${ran:-0} tests"
+          if [ "${ran:-0}" -lt 114 ]; then
+            echo "::error::expected at least 114 core Tools tests, collected ${ran:-0} — discovery is broken, not the suite"
+            exit 1
+          fi
+        working-directory: Tools

@@ -1,0 +1,40 @@
+NOOP — third-party notices
+===========================
+
+NOOP's own source code and documentation are licensed under the PolyForm
+Noncommercial License 1.0.0 (see LICENSE). That license covers NOOP's original
+work only. The components and prior work below keep their own terms.
+
+Bundled dependencies
+--------------------
+
+GRDB.swift — https://github.com/groue/GRDB.swift
+  License: MIT
+  Used for: SQLite persistence (the on-device store).
+
+ZIPFoundation — https://github.com/weichsel/ZIPFoundation
+  License: MIT
+  Used for: reading WHOOP / Apple Health export archives during import.
+
+The MIT license is permissive: these components may be used, modified, and
+redistributed (including commercially) on their own terms. When they are used as
+part of NOOP's combined work, the combined work as a whole is governed by NOOP's
+PolyForm Noncommercial license.
+
+Prior reverse-engineering research
+----------------------------------
+
+NOOP builds on two community reverse-engineering efforts. Neither states a
+license; NOOP does not redistribute their code. NOOP uses only the uncopyrightable
+factual protocol information they document (BLE service/characteristic identifiers,
+frame layouts, CRC parameters, command/event/packet numbers, byte offsets) and
+re-implements those facts as original code — it does not copy their source.
+
+  johnmiddleton12/my-whoop — https://github.com/johnmiddleton12/my-whoop
+    WHOOP 4.0 BLE protocol facts.
+
+  b-nnett/goose — https://github.com/b-nnett/goose
+    WHOOP 5.0 / MG ("puffin") BLE protocol facts.
+
+See ATTRIBUTION.md for fuller credit and DISCLAIMER.md for the interoperability and
+fair-use rationale.

@@ -134,7 +134,12 @@ struct SettingsView: View {
                                 .font(StrandFont.bodyNumber)
                                 .foregroundStyle(StrandPalette.textPrimary)
                                 .frame(minWidth: 28, alignment: .trailing)
-                            Stepper("Age", value: $profile.age, in: 13...100)
+                            Stepper("Age", value: Binding(
+                // `profile.age` is read-only now (derived from dateOfBirth), so the stepper writes
+                // back through the DOB the model derives it from — same control, same range.
+                get: { profile.age },
+                set: { profile.dateOfBirth = ProfileStore.dateOfBirth(forAge: $0) }
+            ), in: 13...100)
                                 .labelsHidden()
                                 .accessibilityLabel("Age, \(profile.age) years")
                         }
@@ -309,7 +314,7 @@ struct SettingsView: View {
         ) {
             VStack(alignment: .leading, spacing: 16) {
                 HStack(spacing: 12) {
-                    StatePill(strapStatusTitle, tone: strapTone, pulsing: live.connected)
+                    StatePill(LocalizedStringKey(strapStatusTitle), tone: strapTone, pulsing: live.connected)
                     if let pct = live.batteryPct {
                         StatePill("Battery \(Int(pct.rounded()))%",
                                   tone: batteryTone(pct), showsDot: false)
@@ -318,7 +323,7 @@ struct SettingsView: View {
                     // Data-sync circle: slowly fills as we catch up on the strap's stored history.
                     // Full = "live" (caught up).
                     VStack(spacing: 3) {
-                        SyncRing(progress: live.syncProgress, size: 40)
+                        StrandSyncRing(progress: live.syncProgress, size: 40)
                         Text(live.isLive ? "Live" : "Syncing")
                             .font(StrandFont.caption)
                             .foregroundStyle(live.isLive ? StrandPalette.accent : StrandPalette.textTertiary)
@@ -471,15 +476,35 @@ struct SettingsView: View {
             backupAlertTitle = "Backup exported"
             backupAlertMessage = "Saved to \(url.lastPathComponent). Copy this file to your other Mac and use Import there to restore everything."
             showBackupAlert = true
+        case .exportedOversize(let url, let bytes, let limit):
+            // The file is valid and worth keeping — restoring it just needs one confirmation. Said at
+            // EXPORT time on purpose: the alternative is finding out during a restore, which is exactly
+            // when the original is gone.
+            backupAlertTitle = "Backup exported (large)"
+            backupAlertMessage = """
+                Saved to \(url.lastPathComponent) — \(Self.fileSize(bytes)), above the \(Self.fileSize(limit)) \
+                restore ceiling. The backup is complete and safe to keep; restoring it will just ask you \
+                to confirm once.
+                """
+            showBackupAlert = true
         case .imported:
             backupAlertTitle = "Backup imported"
             backupAlertMessage = "Your data has been restored. Quit and reopen NOOP for it to take effect."
+            showBackupAlert = true
+        case .restoreTooLarge(let name, let limit):
+            backupAlertTitle = "Backup too large to restore"
+            backupAlertMessage = "\(name) is above the \(Self.fileSize(limit)) restore ceiling, so it wasn't imported. Your current data is untouched."
             showBackupAlert = true
         case .failure(let message):
             backupAlertTitle = "Backup problem"
             backupAlertMessage = message
             showBackupAlert = true
         }
+    }
+
+    /// Human-readable byte count for the backup alerts.
+    private static func fileSize(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
     }
 
     // MARK: - Shared bits

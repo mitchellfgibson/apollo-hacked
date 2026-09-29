@@ -18,11 +18,63 @@ public struct CachedSleepSession: Equatable, Codable {
     public let restingHr: Int?
     public let avgHrv: Double?
     public let stagesJSON: String?
+    /// True once the user has hand-corrected this session's wake/sleep bounds. The recompute/import
+    /// upsert preserves an edited session's `endTs`/`stagesJSON` instead of overwriting them with the
+    /// strap-detected values (see `upsertSleepSessions`). Defaults false so every cache/recompute path
+    /// that doesn't know about edits keeps producing un-edited rows.
+    public let userEdited: Bool
+    /// The user's hand-corrected sleep ONSET, or nil when the onset wasn't edited. `startTs` remains the
+    /// immutable detected key; display + re-staging use `effectiveStartTs`. (#318)
+    public let startTsAdjusted: Int?
+    /// The onset to display / stage from: the user's correction if present, else the detected `startTs`.
+    public var effectiveStartTs: Int { startTsAdjusted ?? startTs }
+    /// True when this night's on-device staging ran on SPARSE motion coverage (`SleepStager.isGravitySparse`
+    /// — the same signal that downgrades Rest confidence, #345). A sparse night is unreliable and can
+    /// UNDER-detect: the gravity-only spine fragments and the sub-60-min pieces are dropped, so a real ~8h
+    /// night can collapse to ~1h. The UI reads this to caption "sleep may be incomplete" honestly instead
+    /// of presenting the short total as fact. nil for imported nights and pre-migration rows (unknown, not
+    /// flagged). Set per session to the DAY's value; only NOOP-computed nights populate it. Byte-parity twin.
+    public let stagingSparse: Bool?
+    /// Which device's row this is, when the read that produced it knew.
+    ///
+    /// The Kotlin `SleepSession` entity has carried `deviceId` all along; this type never did, so a caller
+    /// holding a block had no way to say where it came from and had to ask the store which device owned it,
+    /// once per block. That probe is the expensive half of the Sleep screen's load.
+    ///
+    /// Optional, and defaulted, for two reasons. Seventy-six construction sites build these by hand, and a
+    /// required field would churn every one of them to state something most of them do not know. And the
+    /// honest value for a hand-built session IS absent: claiming a device it was never read from would be
+    /// worse than saying nothing. Readers treat nil as "ask", so provenance is a shortcut where the store
+    /// supplied it and never a silent wrong answer where it did not. `Codable` decodes a missing key to nil,
+    /// so persisted payloads written before this field stay readable.
+    ///
+    /// The WRITE never reads it. `upsertSleepSessions` takes its device as a separate argument, so
+    /// setting this on a session being stored cannot route the row into another device's namespace,
+    /// and a row always reads back stamped with the id it was actually written under.
+    public let deviceId: String?
     public init(startTs: Int, endTs: Int, efficiency: Double?, restingHr: Int?,
-                avgHrv: Double?, stagesJSON: String?) {
+                avgHrv: Double?, stagesJSON: String?, userEdited: Bool = false,
+                startTsAdjusted: Int? = nil, stagingSparse: Bool? = nil,
+                deviceId: String? = nil) {
         self.startTs = startTs; self.endTs = endTs
         self.efficiency = efficiency; self.restingHr = restingHr
         self.avgHrv = avgHrv; self.stagesJSON = stagesJSON
+        self.userEdited = userEdited
+        self.startTsAdjusted = startTsAdjusted
+        self.deviceId = deviceId
+        self.stagingSparse = stagingSparse
+    }
+
+    /// A copy re-keyed to `newStartTs`, every other field (including the stage segments) unchanged. Used by
+    /// the #1284 generation-side onset keying to set the session's PK to the rounded 0x49 onset (the stable
+    /// per-night anchor); the onset key differs from the end-anchored first-code time by at most the grid.
+    public func withStartTs(_ newStartTs: Int) -> CachedSleepSession {
+        CachedSleepSession(startTs: newStartTs, endTs: endTs, efficiency: efficiency, restingHr: restingHr,
+                           avgHrv: avgHrv, stagesJSON: stagesJSON, userEdited: userEdited,
+                           startTsAdjusted: startTsAdjusted, stagingSparse: stagingSparse,
+                           // Carried: a re-keyed session is the same row from the same device, and
+                           // dropping it here would turn a known provenance back into a store probe.
+                           deviceId: deviceId)
     }
 }
 
@@ -44,15 +96,122 @@ public struct DailyMetric: Equatable, Codable {
     public let spo2Pct: Double?        // mean SpO2 (%) during sleep
     public let skinTempDevC: Double?   // skin-temperature deviation (°C) from baseline
     public let respRateBpm: Double?    // mean respiration rate (breaths/min) during sleep
+    // On-device daily activity totals (v11 columns, APPROXIMATE estimates). Both nullable, so
+    // imported/cloud rows that never carry them stay nil and old call sites are unaffected.
+    public let steps: Int?             // daily/file step total from the cumulative @57 counter or activity import
+    public let activeKcalEst: Double?  // whole-day HR-only calorie estimate (kcal)
+    // WHOOP 4.0 raw SpO2 PPG ADC means over detected sleep (v23 columns, #93). These are the RAW
+    // red/IR optical channels banked on the v24 historical layout (spo2_red@68 / spo2_ir@70), NOT a
+    // calibrated blood-oxygen % — that needs WHOOP's proprietary curve. Both nullable and on-device
+    // only (imports/cloud never carry them), so old rows + non-4.0 nights stay nil and every existing
+    // call site is unaffected.
+    public let spo2Red: Int?           // mean raw red PPG ADC during detected sleep
+    public let spo2Ir: Int?            // mean raw IR PPG ADC during detected sleep
+    /// Nightly SDNN (ms — the Task Force 5-min SDNN INDEX: mean of per-5-min-segment SDNN, ddof=1). The
+    /// BROAD autonomic-variability twin of `avgHrv` (which is RMSSD for the strap: the fast, vagal,
+    /// "recovered today?" metric). The 5-min index — not a single whole-night SD — is stored deliberately:
+    /// whole-night SD is dominated by the slow HR drift across sleep stages (reads 2-3× high) and is not
+    /// comparable to a watch's short-window SDNN; the index is. v31 column, nullable: WHOOP/on-device nights
+    /// compute it from the night's R-R (`HRVAnalyzer.sdnnIndex`); Apple rows mirror their own SDNN reading;
+    /// Oura/other imports carry no SDNN so it stays nil.
+    public let avgSdnn: Double?
+    /// Nightly ABSOLUTE skin temperature (°C) — the wear-gated mean over the night's detected sleep, the
+    /// value `skinTempDevC` is derived FROM (#1636).
+    ///
+    /// The engine already computed this on every scoring pass and threw it away once the deviation was
+    /// taken, so a wearer could see "+0.5 Δ°C" with no way to learn what it moved from — and a febrile
+    /// night reads as a small delta while the absolute reads as a fever. v40 column, nullable: nights
+    /// scored before it shipped stay nil until a re-score re-derives them from the same raw samples.
+    ///
+    /// Distinct from `skinTempDevC`, which is bimodal — CSV/Apple imports write an ABSOLUTE wrist °C into
+    /// that column and `SkinTempDisplay.isAbsoluteSkinTemp` separates them by magnitude. This column is
+    /// unambiguous: it is always an absolute, and only the strap pipeline writes it.
+    public let skinTempC: Double?
+    /// Kotlin twin: `DailyMetric.sleepHrOnly`. Every session that night staged from heart rate alone.
+    public let sleepHrOnly: Bool?
     public init(day: String, totalSleepMin: Double?, efficiency: Double?, deepMin: Double?,
                 remMin: Double?, lightMin: Double?, disturbances: Int?, restingHr: Int?,
                 avgHrv: Double?, recovery: Double?, strain: Double?, exerciseCount: Int?,
-                spo2Pct: Double? = nil, skinTempDevC: Double? = nil, respRateBpm: Double? = nil) {
+                spo2Pct: Double? = nil, skinTempDevC: Double? = nil, respRateBpm: Double? = nil,
+                steps: Int? = nil, activeKcalEst: Double? = nil,
+                spo2Red: Int? = nil, spo2Ir: Int? = nil, avgSdnn: Double? = nil,
+                skinTempC: Double? = nil,
+                sleepHrOnly: Bool? = nil) {
         self.day = day; self.totalSleepMin = totalSleepMin; self.efficiency = efficiency
         self.deepMin = deepMin; self.remMin = remMin; self.lightMin = lightMin
         self.disturbances = disturbances; self.restingHr = restingHr; self.avgHrv = avgHrv
         self.recovery = recovery; self.strain = strain; self.exerciseCount = exerciseCount
         self.spo2Pct = spo2Pct; self.skinTempDevC = skinTempDevC; self.respRateBpm = respRateBpm
+        self.steps = steps; self.activeKcalEst = activeKcalEst
+        self.spo2Red = spo2Red; self.spo2Ir = spo2Ir; self.avgSdnn = avgSdnn
+        self.skinTempC = skinTempC
+        self.sleepHrOnly = sleepHrOnly
+    }
+
+    /// The freshest STRICTLY-PRIOR day that carries at least one overnight vital (HRV / resting HR /
+    /// respiratory), or nil. This is the recovery-INDEPENDENT twin of the whole-row Charge carry: it never
+    /// gates on `recovery != nil`, so a night whose recovery is null but which still recorded real HRV/RHR
+    /// is a valid vitals source (the whole-row carry would skip it). It only supplies the FALLBACK — each
+    /// vital is read today-first at the call site (`displayDay?.field ?? vitalsDay?.field`), so today's own
+    /// value always wins and this never overrides it. `days` is oldest→newest.
+    ///
+    /// `todayKey` must be the future-clock-safe "today" key (the later of the logical/local day key,
+    /// mirroring `Repository.widgetAnchor`'s `carriedKey`); the `$0.day < todayKey` bound (yyyy-MM-dd
+    /// compares lexicographically) keeps only genuine prior days, so today's own still-forming row and any
+    /// stray future-dated row (a bad-clock strap) can never be picked up as "last night's" vitals.
+    public nonisolated static func lastVitalsDay(days: [DailyMetric], todayKey: String) -> DailyMetric? {
+        days.last(where: { ($0.avgHrv != nil || $0.restingHr != nil || $0.respRateBpm != nil) && $0.day < todayKey })
+    }
+
+    /// PER-FIELD twin of `lastVitalsDay` for SpO₂: the freshest STRICTLY-PRIOR day with a non-nil `spo2Pct`.
+    /// `lastVitalsDay`'s predicate only checks HRV / resting-HR / respiratory, so it can land on a row whose
+    /// `spo2Pct` is nil (the on-device engine writes `spo2Pct = nil` — it banks only raw `spo2Red`/`spo2Ir`;
+    /// only imported rows carry a percentage) while an OLDER imported row holds a real reading. Resolving
+    /// SpO₂ per field keeps the Blood Oxygen card honest instead of "No Data". Same `$0.day < todayKey`
+    /// future-clock guard as `lastVitalsDay`; `days` is oldest→newest. Byte-twin of the Android `lastSpo2Row`.
+    public nonisolated static func lastSpo2Day(days: [DailyMetric], todayKey: String) -> DailyMetric? {
+        days.last(where: { $0.spo2Pct != nil && $0.day < todayKey })
+    }
+
+    /// PER-FIELD twin of `lastVitalsDay` for skin-temperature deviation. See `lastSpo2Day`. Byte-twin of the
+    /// Android `lastSkinTempRow`.
+    public nonisolated static func lastSkinTempDay(days: [DailyMetric], todayKey: String) -> DailyMetric? {
+        days.last(where: { $0.skinTempDevC != nil && $0.day < todayKey })
+    }
+
+    /// The freshest strictly-prior row carrying EITHER skin-temp number (#1844), so a surface can lead
+    /// with the absolute and fall back to the deviation from ONE night rather than mixing two.
+    ///
+    /// The OR here is deliberate and is NOT the #1842 defect. That bug read field X off a row selected on
+    /// (X or Y), so a row holding only Y blanked X. This selects a row for a value that is "whichever of
+    /// the two this night has", and the caller reads both fields off THAT row and lets
+    /// `SkinTempDisplay.leadReading` pick — so the chosen row always supplies the number shown, and an
+    /// absolute is never paired with another night's deviation. `lastSkinTempDay` stays as-is for the
+    /// deviation-only surfaces. Byte-twin of the Android `lastSkinTempReadingRow`.
+    public nonisolated static func lastSkinTempReadingDay(days: [DailyMetric], todayKey: String) -> DailyMetric? {
+        days.last(where: { ($0.skinTempC != nil || $0.skinTempDevC != nil) && $0.day < todayKey })
+    }
+
+    /// PER-FIELD HRV carry — the twin of `lastSpo2Day` for a field `lastVitalsDay` DOES check, which is
+    /// precisely why it needs one. That predicate is an OR across HRV / resting-HR / respiratory, so it
+    /// resolves the freshest row carrying ANY of the three — including a respiratory-only row whose
+    /// `avgHrv` is nil. The HRV card then reads that nil and renders "—" while a tile carrying a different
+    /// row shows a real number on the same screen (#1842). Resolving per field picks the freshest row that
+    /// actually holds an HRV, the same correction `lastSpo2Day` and `lastSkinTempDay` already make.
+    ///
+    /// Deliberately NOT staleness-bounded, unlike `Repository.lastRespDay`: an old HRV/RHR carry is
+    /// disclosed rather than suppressed — the call sites stamp the row's own date and `carriedCaption`
+    /// relabels a weeks-old one to "Latest sleep" (#779). Respiratory took a hard bound instead because a
+    /// single CSV import's value was reading as today's for a fortnight (#1331). Same `$0.day < todayKey`
+    /// future-clock guard; `days` is oldest→newest. Byte-twin of the Android `lastHrvRow`.
+    public nonisolated static func lastHrvDay(days: [DailyMetric], todayKey: String) -> DailyMetric? {
+        days.last(where: { $0.avgHrv != nil && $0.day < todayKey })
+    }
+
+    /// PER-FIELD resting-HR carry — twin of `lastHrvDay`, same OR-predicate cause and same unbounded-by-
+    /// design carry (#1842). Byte-twin of the Android `lastRestingHrRow`.
+    public nonisolated static func lastRestingHrDay(days: [DailyMetric], todayKey: String) -> DailyMetric? {
+        days.last(where: { $0.restingHr != nil && $0.day < todayKey })
     }
 
     /// Copy with `skinTempDevC` replaced. Used to fill the skin-temperature deviation after the
@@ -71,63 +230,396 @@ extension WhoopStore {
     // MARK: - Upserts (idempotent by natural key; latest server value wins on conflict)
 
     /// Upsert cached sleep sessions. Natural key (deviceId, startTs). Returns rows changed.
+    ///
+    /// A non-user-edited candidate whose stage timeline is LESS complete than what's already stored for
+    /// the same (deviceId, startTs) is dropped whole rather than written: a device can serve the same
+    /// night's hypnogram more than once (a reconnect mid-day, a resumed drain), and a later, shorter
+    /// decode has no business overwriting an earlier, fuller one — the two would otherwise silently
+    /// disagree on `stagesJSON` vs. `efficiency`/`endTs` for the same row. `HypnogramCoverage`'s 0/1/2
+    /// richness rank (none / holed / covers-its-span) is the same scale `SleepMerge` already judges a
+    /// day's best session on for DISPLAY; this applies the identical comparison at WRITE time so it
+    /// protects every caller (BLE live sources, importers, recomputes), not just the ones a caller
+    /// happens to gate behind their own dedup toggle.
     @discardableResult
     public func upsertSleepSessions(_ sessions: [CachedSleepSession], deviceId: String) async throws -> Int {
         try syncWrite { db in
             var n = 0
             for s in sessions {
+                if !s.userEdited, let existing = try Self.storedSleepSession(db, deviceId: deviceId, startTs: s.startTs),
+                   !existing.userEdited {
+                    let candidate = CachedSleepSession(startTs: s.startTs, endTs: s.endTs, efficiency: nil,
+                                                       restingHr: nil, avgHrv: nil, stagesJSON: s.stagesJSON)
+                    if SleepMerge.richness(candidate) < SleepMerge.richness(existing) {
+                        continue   // a less-complete re-serve of this night must never clobber the stored one
+                    }
+                }
                 try db.execute(sql: """
                     INSERT INTO sleepSession
-                        (deviceId, startTs, endTs, efficiency, restingHr, avgHrv, stagesJSON)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                        (deviceId, startTs, endTs, efficiency, restingHr, avgHrv, stagesJSON,
+                         userEdited, startTsAdjusted, stagingSparse)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(deviceId, startTs) DO UPDATE SET
-                        endTs = excluded.endTs,
+                        -- A user-corrected night keeps its hand-set bed/wake times and stage breakdown;
+                        -- a recompute/import refresh (this path) updates only the derived vitals. The
+                        -- `userEdited` flag is preserved, never cleared here, so a later strap re-sync
+                        -- can't revert a correction (the dedicated edit path is `applySleepEdit`).
+                        endTs = CASE WHEN sleepSession.userEdited THEN sleepSession.endTs ELSE excluded.endTs END,
                         efficiency = excluded.efficiency,
                         restingHr = excluded.restingHr,
                         avgHrv = excluded.avgHrv,
-                        stagesJSON = excluded.stagesJSON
+                        stagesJSON = CASE WHEN sleepSession.userEdited THEN sleepSession.stagesJSON ELSE excluded.stagesJSON END,
+                        startTsAdjusted = CASE WHEN sleepSession.userEdited THEN sleepSession.startTsAdjusted ELSE excluded.startTsAdjusted END,
+                        userEdited = sleepSession.userEdited,
+                        -- Derived from the day's motion coverage, so a recompute always refreshes it.
+                        stagingSparse = excluded.stagingSparse
                     """, arguments: [deviceId, s.startTs, s.endTs, s.efficiency,
-                                     s.restingHr, s.avgHrv, s.stagesJSON])
+                                     s.restingHr, s.avgHrv, s.stagesJSON, s.userEdited, s.startTsAdjusted,
+                                     s.stagingSparse])
                 n += db.changesCount
             }
             return n
         }
     }
 
+    /// The stored row at (deviceId, startTs), or nil when there is none yet — the completeness check
+    /// `upsertSleepSessions` runs before deciding whether a candidate may overwrite it. Only the fields
+    /// that check needs are read; `efficiency`/`restingHr`/`avgHrv` are left nil since richness never
+    /// looks at them.
+    private static func storedSleepSession(_ db: Database, deviceId: String, startTs: Int) throws -> CachedSleepSession? {
+        guard let row = try Row.fetchOne(db, sql: """
+            SELECT endTs, stagesJSON, userEdited FROM sleepSession WHERE deviceId = ? AND startTs = ?
+            """, arguments: [deviceId, startTs]) else { return nil }
+        return CachedSleepSession(startTs: startTs, endTs: row["endTs"], efficiency: nil, restingHr: nil,
+                                  avgHrv: nil, stagesJSON: row["stagesJSON"], userEdited: row["userEdited"],
+                                  deviceId: deviceId)
+    }
+
+    /// Hand-correct a sleep session's bed (onset) and/or wake (end) time. Sets `userEdited = 1` so the
+    /// next recompute/import `upsertSleepSessions` preserves the corrected bounds instead of overwriting
+    /// them with the strap-detected values. Keyed by the stable detected natural key
+    /// (deviceId, `detectedStartTs`) — which never moves; the corrected onset is stored in
+    /// `startTsAdjusted`. `newStartTs == detectedStartTs` leaves the onset effectively unchanged.
+    /// `stagesJSON`, when non-nil, replaces the stored breakdown (the caller re-derives it for the new
+    /// window via `SleepStager.stageSession`, falling back to `SleepWindowReclip`); nil keeps the
+    /// existing stages. Returns rows changed (0 if no such session).
+    @discardableResult
+    public func applySleepEdit(deviceId: String, detectedStartTs: Int, newStartTs: Int, newEndTs: Int,
+                               stagesJSON: String? = nil) async throws -> Int {
+        try syncWrite { db in
+            try db.execute(sql: """
+                UPDATE sleepSession
+                SET startTsAdjusted = ?, endTs = ?, stagesJSON = COALESCE(?, stagesJSON), userEdited = 1
+                WHERE deviceId = ? AND startTs = ?
+                """, arguments: [newStartTs, newEndTs, stagesJSON, deviceId, detectedStartTs])
+            return db.changesCount
+        }
+    }
+
+    /// Delete ONE sleep session entirely — the delete half of `applySleepEdit` with no re-insert.
+    /// (deviceId, startTs) is the primary key, so it uniquely identifies the row, letting the user clear a
+    /// misread or spurious night so the day recomputes without it (#68/#281). Returns rows deleted (0 when
+    /// no such session). Mirrors Android `dao.deleteSleepSession(deviceId, startTs)`. The durable
+    /// "user deleted this night" tombstone that stops the recompute regenerating it lives in the
+    /// Repository layer (`dismissedSleepSpans`), exactly as the dismissed-WORKOUT span list does — this
+    /// store call only removes the row.
+    @discardableResult
+    public func deleteSleepSession(deviceId: String, startTs: Int) async throws -> Int {
+        try syncWrite { db in
+            try db.execute(sql: "DELETE FROM sleepSession WHERE deviceId = ? AND startTs = ?",
+                           arguments: [deviceId, startTs])
+            return db.changesCount
+        }
+    }
+
+    /// Manually ADD a sleep session the detector missed — typically a daytime NAP (#508). Inserts a NEW
+    /// row keyed by the chosen `startTs`, flagged `userEdited = 1` so the post-sync recompute's overlap
+    /// guard preserves it (drops any later re-detected session overlapping its window) exactly as it
+    /// protects a hand-corrected night — the manual nap can never be overwritten or folded away. `startTs`
+    /// is the immutable detected-style key; `startTsAdjusted` stays nil because a manually-added session's
+    /// onset IS the chosen onset (there is no "detected" onset to diverge from). `stagesJSON` is staged from
+    /// the raw streams over `[startTs, endTs]` by the caller (falling back to a single "awake" block when
+    /// the strap has no dense data there yet — the self-heal swaps in real stages once raw lands).
+    ///
+    /// Uses `ON CONFLICT(deviceId, startTs) DO NOTHING` so it is purely ADDITIVE: it can never clobber an
+    /// existing detected/edited session that happens to share the exact onset second. Returns rows inserted
+    /// (0 when a session already exists at that onset). Mirrors Android `insertManualSleepSession`.
+    @discardableResult
+    public func insertManualSleepSession(deviceId: String, startTs: Int, endTs: Int,
+                                         efficiency: Double?, stagesJSON: String?) async throws -> Int {
+        try syncWrite { db in
+            try db.execute(sql: """
+                INSERT INTO sleepSession
+                    (deviceId, startTs, endTs, efficiency, restingHr, avgHrv, stagesJSON,
+                     userEdited, startTsAdjusted)
+                VALUES (?, ?, ?, ?, NULL, NULL, ?, 1, NULL)
+                ON CONFLICT(deviceId, startTs) DO NOTHING
+                """, arguments: [deviceId, startTs, endTs, efficiency, stagesJSON])
+            return db.changesCount
+        }
+    }
+
+    /// Replace ONLY the stage breakdown of an already user-edited night, leaving the corrected bed/wake
+    /// bounds (`startTsAdjusted`/`endTs`) and the `userEdited` flag untouched. The post-sync self-heal
+    /// calls this when a strap sync finally delivers the raw streams for a night that was edited BEFORE
+    /// they arrived: at edit time the stages were fabricated by `SleepWindowReclip` (a trailing "awake"
+    /// block) because the raw wasn't present yet, and `userEdited` then froze that breakdown against every
+    /// later sync. This swaps in the real re-derived stages without disturbing the user's bound correction.
+    /// Scoped to `userEdited = 1` rows so it can never rewrite an un-edited (freely re-derivable) night.
+    /// Returns rows changed (0 when no such edited session exists).
+    @discardableResult
+    public func updateSleepStages(deviceId: String, detectedStartTs: Int, stagesJSON: String) async throws -> Int {
+        try syncWrite { db in
+            try db.execute(sql: """
+                UPDATE sleepSession
+                SET stagesJSON = ?
+                WHERE deviceId = ? AND startTs = ? AND userEdited = 1
+                """, arguments: [stagesJSON, deviceId, detectedStartTs])
+            return db.changesCount
+        }
+    }
+
+    // MARK: - Per-epoch sleep analytics (v18: motionJSON / sleepStateJSON)
+    //
+    // Banked on the EXISTING sleepSession row (deviceId, startTs) beside `stagesJSON`, NOT on
+    // CachedSleepSession — these are aux per-session series the analytics layer writes/reads through
+    // targeted methods (the same shape as `updateSleepStages`), so the common session read path stays
+    // lean and the recompute/import/edit upserts (which don't name these columns) preserve them.
+    // HONESTY: an absent signal is stored as SQL NULL and read back as `nil`, never a fabricated zero array.
+
+    /// Persist the SleepStager's per-epoch motion magnitudes for one session, as a compact JSON array on
+    /// the same 30 s epoch grid as `stagesJSON`. Keyed by the immutable detected key (deviceId, startTs).
+    /// Passing an EMPTY array clears the column to NULL (no series), never an empty `[]` masquerading as
+    /// data. Returns rows changed (0 when no such session). Twin of Android `dao.updateSessionMotion`.
+    @discardableResult
+    public func persistSessionMotion(deviceId: String, sessionStart: Int, motionEpochs: [Double]) async throws -> Int {
+        let json = motionEpochs.isEmpty ? nil : Self.encodeDoubleArray(motionEpochs)
+        return try syncWrite { db in
+            try db.execute(sql: """
+                UPDATE sleepSession SET motionJSON = ?
+                WHERE deviceId = ? AND startTs = ?
+                """, arguments: [json, deviceId, sessionStart])
+            return db.changesCount
+        }
+    }
+
+    /// The persisted per-epoch motion magnitudes for one session, or nil when the column is NULL / the
+    /// session doesn't exist / the JSON is unparseable (absent stays absent). Keyed by detected startTs.
+    public func sessionMotion(deviceId: String, sessionStart: Int) async throws -> [Double]? {
+        try syncRead { db in
+            let json = try String.fetchOne(db, sql: """
+                SELECT motionJSON FROM sleepSession WHERE deviceId = ? AND startTs = ?
+                """, arguments: [deviceId, sessionStart])
+            return json.flatMap(Self.decodeDoubleArray)
+        }
+    }
+
+    /// Persist the decoded v18 band sleep_state per epoch for one session — the Interpreter's `(sb>>4)&3`
+    /// band value, one entry per epoch — as a compact JSON array of ints. Keyed by (deviceId, startTs).
+    /// EMPTY clears to NULL (no banked band state). Returns rows changed. Twin of `dao.updateSessionSleepState`.
+    @discardableResult
+    public func persistSessionSleepState(deviceId: String, sessionStart: Int, states: [Int]) async throws -> Int {
+        let json = states.isEmpty ? nil : Self.encodeIntArray(states)
+        return try syncWrite { db in
+            try db.execute(sql: """
+                UPDATE sleepSession SET sleepStateJSON = ?
+                WHERE deviceId = ? AND startTs = ?
+                """, arguments: [json, deviceId, sessionStart])
+            return db.changesCount
+        }
+    }
+
+    /// The persisted decoded v18 band sleep_state per epoch for one session, or nil when unset / unparseable
+    /// (absent stays absent). Keyed by detected startTs.
+    public func sessionSleepState(deviceId: String, sessionStart: Int) async throws -> [Int]? {
+        try syncRead { db in
+            let json = try String.fetchOne(db, sql: """
+                SELECT sleepStateJSON FROM sleepSession WHERE deviceId = ? AND startTs = ?
+                """, arguments: [deviceId, sessionStart])
+            return json.flatMap(Self.decodeIntArray)
+        }
+    }
+
+    /// One device's session BOUNDS in a window, as `startTs -> endTs`, in a single lean read.
+    ///
+    /// Deliberately not `sleepSessions(deviceId:from:to:limit:)`, which selects `stagesJSON` among other
+    /// columns: a caller that only needs to know which blocks a device owns would haul every night's
+    /// staging blob, once per candidate device, to read two integers from each. On a browsable history
+    /// that is the same rows re-read several times over.
+    ///
+    /// `(deviceId, startTs)` is the primary key, so a start maps to exactly one end and the dictionary
+    /// loses nothing. Unpaged on purpose: the window bounds the result, and a page limit sized from a
+    /// caller's own list would silently drop rows for a caller that passed a sparse subset of a wide span.
+    public func sleepSessionBounds(deviceId: String, from: Int, to: Int) async throws -> [Int: Int] {
+        try syncRead { db in
+            var out: [Int: Int] = [:]
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT startTs, endTs FROM sleepSession
+                WHERE deviceId = ? AND startTs >= ? AND startTs <= ?
+                """, arguments: [deviceId, from, to])
+            for row in rows { out[row["startTs"]] = row["endTs"] }
+            return out
+        }
+    }
+
+    /// Batched twin of `sessionMotion` for a SET of session starts: the persisted per-epoch motion series
+    /// for each of `sessionStarts` that HAS one, in a SINGLE query, keyed by startTs. Same contract as the
+    /// single-key accessor — a start whose column is NULL/absent (or an empty series) is simply omitted from
+    /// the result (absent stays absent, never a fabricated zero array) — but without the per-session
+    /// round-trip the Sleep tab's main-night group used to pay (N single-row reads → one). The `IN (…)` list
+    /// is de-duplicated and chunked to stay well under SQLite's bound-parameter ceiling.
+    public func sessionMotions(deviceId: String, sessionStarts: [Int]) async throws -> [Int: [Double]] {
+        guard !sessionStarts.isEmpty else { return [:] }
+        return try syncRead { db in
+            var out: [Int: [Double]] = [:]
+            let uniq = Array(Set(sessionStarts))
+            var lo = 0
+            while lo < uniq.count {
+                let chunk = Array(uniq[lo ..< min(lo + Self.inClauseChunk, uniq.count)])
+                lo += Self.inClauseChunk
+                let placeholders = chunk.map { _ in "?" }.joined(separator: ",")
+                var args: [DatabaseValueConvertible] = [deviceId]
+                args.append(contentsOf: chunk)
+                let rows = try Row.fetchAll(db, sql: """
+                    SELECT startTs, motionJSON FROM sleepSession
+                    WHERE deviceId = ? AND startTs IN (\(placeholders)) AND motionJSON IS NOT NULL
+                    """, arguments: StatementArguments(args))
+                for row in rows {
+                    let startTs: Int = row["startTs"]
+                    guard let json: String = row["motionJSON"],
+                          let arr = Self.decodeDoubleArray(json), !arr.isEmpty else { continue }
+                    out[startTs] = arr
+                }
+            }
+            return out
+        }
+    }
+
+    /// Batched twin of `sessionSleepState` over a RANGE: every session in `[from, to]` (by startTs) that has
+    /// banked per-epoch band sleep_state, in ONE query, keyed by startTs. The H7 re-onset guard reads the
+    /// SAME `[from, to]` window as its `sleepSessions` call, so a single range scan replaces the per-session
+    /// round-trip (N single-row reads → one); the caller looks each kept (deduped) session up by startTs.
+    /// NULL/absent columns are omitted (absent stays absent), identical to the single-key accessor.
+    public func sessionSleepStates(deviceId: String, from: Int, to: Int) async throws -> [Int: [Int]] {
+        try syncRead { db in
+            var out: [Int: [Int]] = [:]
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT startTs, sleepStateJSON FROM sleepSession
+                WHERE deviceId = ? AND startTs >= ? AND startTs <= ? AND sleepStateJSON IS NOT NULL
+                """, arguments: [deviceId, from, to])
+            for row in rows {
+                let startTs: Int = row["startTs"]
+                guard let json: String = row["sleepStateJSON"],
+                      let arr = Self.decodeIntArray(json), !arr.isEmpty else { continue }
+                out[startTs] = arr
+            }
+            return out
+        }
+    }
+
+    /// SQLite caps the number of bound `?` parameters per statement (SQLITE_MAX_VARIABLE_NUMBER — 999 on the
+    /// system SQLite iOS ships). Chunk `IN (…)` lists comfortably under it, leaving room for the leading
+    /// `deviceId` bind.
+    static let inClauseChunk = 900
+
+    /// Compact JSON encoders/decoders for the per-epoch series — a bare `[Double]`/`[Int]` array (no
+    /// pretty-printing) so the column stays small and round-trips byte-for-byte with the Android port.
+    static func encodeDoubleArray(_ xs: [Double]) -> String? {
+        (try? JSONEncoder().encode(xs)).flatMap { String(data: $0, encoding: .utf8) }
+    }
+    static func decodeDoubleArray(_ json: String) -> [Double]? {
+        json.data(using: .utf8).flatMap { try? JSONDecoder().decode([Double].self, from: $0) }
+    }
+    static func encodeIntArray(_ xs: [Int]) -> String? {
+        (try? JSONEncoder().encode(xs)).flatMap { String(data: $0, encoding: .utf8) }
+    }
+    static func decodeIntArray(_ json: String) -> [Int]? {
+        json.data(using: .utf8).flatMap { try? JSONDecoder().decode([Int].self, from: $0) }
+    }
+
     /// Upsert cached daily metrics. Natural key (deviceId, day). Returns rows changed.
     @discardableResult
     public func upsertDailyMetrics(_ days: [DailyMetric], deviceId: String) async throws -> Int {
         try syncWrite { db in
-            var n = 0
-            for d in days {
-                try db.execute(sql: """
-                    INSERT INTO dailyMetric
-                        (deviceId, day, totalSleepMin, efficiency, deepMin, remMin, lightMin,
-                         disturbances, restingHr, avgHrv, recovery, strain, exerciseCount,
-                         spo2Pct, skinTempDevC, respRateBpm)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(deviceId, day) DO UPDATE SET
-                        totalSleepMin = excluded.totalSleepMin,
-                        efficiency = excluded.efficiency,
-                        deepMin = excluded.deepMin,
-                        remMin = excluded.remMin,
-                        lightMin = excluded.lightMin,
-                        disturbances = excluded.disturbances,
-                        restingHr = excluded.restingHr,
-                        avgHrv = excluded.avgHrv,
-                        recovery = excluded.recovery,
-                        strain = excluded.strain,
-                        exerciseCount = excluded.exerciseCount,
-                        spo2Pct = excluded.spo2Pct,
-                        skinTempDevC = excluded.skinTempDevC,
-                        respRateBpm = excluded.respRateBpm
-                    """, arguments: [deviceId, d.day, d.totalSleepMin, d.efficiency, d.deepMin,
-                                     d.remMin, d.lightMin, d.disturbances, d.restingHr, d.avgHrv,
-                                     d.recovery, d.strain, d.exerciseCount,
-                                     d.spo2Pct, d.skinTempDevC, d.respRateBpm])
-                n += db.changesCount
-            }
-            return n
+            try Self.upsertDailyMetrics(days, deviceId: deviceId, in: db)
+        }
+    }
+
+    /// Transaction-sharing primitive used by computed-score persistence. Keeping the SQL here ensures
+    /// ordinary cache writes and score+provenance writes cannot drift.
+    static func upsertDailyMetrics(_ days: [DailyMetric], deviceId: String, in db: Database) throws -> Int {
+        var n = 0
+        for d in days {
+            try db.execute(sql: """
+                INSERT INTO dailyMetric
+                    (deviceId, day, totalSleepMin, efficiency, deepMin, remMin, lightMin,
+                     disturbances, restingHr, avgHrv, recovery, strain, exerciseCount,
+                     spo2Pct, skinTempDevC, respRateBpm, steps, activeKcalEst,
+                     spo2Red, spo2Ir, avgSdnn, skinTempC, sleepHrOnly)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(deviceId, day) DO UPDATE SET
+                    totalSleepMin = excluded.totalSleepMin,
+                    efficiency = excluded.efficiency,
+                    deepMin = excluded.deepMin,
+                    remMin = excluded.remMin,
+                    lightMin = excluded.lightMin,
+                    disturbances = excluded.disturbances,
+                    restingHr = excluded.restingHr,
+                    avgHrv = excluded.avgHrv,
+                    recovery = excluded.recovery,
+                    strain = excluded.strain,
+                    exerciseCount = excluded.exerciseCount,
+                    spo2Pct = excluded.spo2Pct,
+                    skinTempDevC = excluded.skinTempDevC,
+                    respRateBpm = excluded.respRateBpm,
+                    steps = excluded.steps,
+                    activeKcalEst = excluded.activeKcalEst,
+                    spo2Red = excluded.spo2Red,
+                    spo2Ir = excluded.spo2Ir,
+                    avgSdnn = excluded.avgSdnn,
+                    skinTempC = excluded.skinTempC,
+                    sleepHrOnly = excluded.sleepHrOnly
+                """, arguments: [deviceId, d.day, d.totalSleepMin, d.efficiency, d.deepMin,
+                                 d.remMin, d.lightMin, d.disturbances, d.restingHr, d.avgHrv,
+                                 d.recovery, d.strain, d.exerciseCount,
+                                 d.spo2Pct, d.skinTempDevC, d.respRateBpm,
+                                 d.steps, d.activeKcalEst,
+                                 d.spo2Red, d.spo2Ir, d.avgSdnn, d.skinTempC, d.sleepHrOnly])
+            n += db.changesCount
+        }
+        return n
+    }
+
+    /// Delete a source's cached daily rows whose day-key is in [from, to] (inclusive, yyyy-MM-dd
+    /// lexicographic = chronological). The #277 local-day re-bucketing migration uses this to drop
+    /// the computed ("-noop") UTC-keyed rows across the recompute window before re-upserting the
+    /// LOCAL-keyed rows, so a UTC/local duplicate day can't linger. Source-scoped, so imported
+    /// "my-whoop" rows are never touched. Returns rows deleted. Mirrors Android
+    /// WhoopDao.deleteComputedDailyInRange.
+    @discardableResult
+    public func deleteDailyMetrics(deviceId: String, from: String, to: String) async throws -> Int {
+        try syncWrite { db in
+            try db.execute(sql: """
+                DELETE FROM dailyMetric
+                WHERE deviceId = ? AND day >= ? AND day <= ?
+                """, arguments: [deviceId, from, to])
+            return db.changesCount
+        }
+    }
+
+    /// #1853: FILL-ONLY write of `skinTempC` for nights the backfill re-derived an absolute for.
+    /// Updates ONLY the `skinTempC` column of an existing row, and ONLY when that column is currently
+    /// NULL — never an upsert of a rebuilt row, never overwriting a measured value. A single-column
+    /// UPDATE is deliberate: the backfill must not touch `skinTempDevC` or any other scored field, and
+    /// a full-row upsert would risk clobbering a concurrent scoring pass's write. Returns rows filled.
+    @discardableResult
+    public func fillSkinTempC(deviceId: String, day: String, skinTempC: Double) async throws -> Int {
+        try syncWrite { db in
+            try db.execute(sql: """
+                UPDATE dailyMetric
+                SET skinTempC = ?
+                WHERE deviceId = ? AND day = ? AND skinTempC IS NULL
+                """, arguments: [skinTempC, deviceId, day])
+            return db.changesCount
         }
     }
 
@@ -137,14 +629,20 @@ extension WhoopStore {
     public func sleepSessions(deviceId: String, from: Int, to: Int, limit: Int) async throws -> [CachedSleepSession] {
         try syncRead { db in
             try Row.fetchAll(db, sql: """
-                SELECT startTs, endTs, efficiency, restingHr, avgHrv, stagesJSON FROM sleepSession
+                SELECT startTs, endTs, efficiency, restingHr, avgHrv, stagesJSON, userEdited,
+                       startTsAdjusted, stagingSparse FROM sleepSession
                 WHERE deviceId = ? AND startTs >= ? AND startTs <= ?
                 ORDER BY startTs ASC LIMIT ?
                 """, arguments: [deviceId, from, to, limit])
                 .map {
                     CachedSleepSession(startTs: $0["startTs"], endTs: $0["endTs"],
                                        efficiency: $0["efficiency"], restingHr: $0["restingHr"],
-                                       avgHrv: $0["avgHrv"], stagesJSON: $0["stagesJSON"])
+                                       avgHrv: $0["avgHrv"], stagesJSON: $0["stagesJSON"],
+                                       userEdited: $0["userEdited"], startTsAdjusted: $0["startTsAdjusted"],
+                                       stagingSparse: $0["stagingSparse"],
+                                       // The read knows the device it queried, so every block it hands
+                                       // back carries it and no caller has to ask the store again.
+                                       deviceId: deviceId)
                 }
         }
     }
@@ -155,7 +653,8 @@ extension WhoopStore {
             try Row.fetchAll(db, sql: """
                 SELECT day, totalSleepMin, efficiency, deepMin, remMin, lightMin, disturbances,
                        restingHr, avgHrv, recovery, strain, exerciseCount,
-                       spo2Pct, skinTempDevC, respRateBpm FROM dailyMetric
+                       spo2Pct, skinTempDevC, respRateBpm, steps, activeKcalEst,
+                       spo2Red, spo2Ir, avgSdnn, skinTempC, sleepHrOnly FROM dailyMetric
                 WHERE deviceId = ? AND day >= ? AND day <= ?
                 ORDER BY day ASC
                 """, arguments: [deviceId, from, to])
@@ -167,7 +666,11 @@ extension WhoopStore {
                                 avgHrv: $0["avgHrv"], recovery: $0["recovery"],
                                 strain: $0["strain"], exerciseCount: $0["exerciseCount"],
                                 spo2Pct: $0["spo2Pct"], skinTempDevC: $0["skinTempDevC"],
-                                respRateBpm: $0["respRateBpm"])
+                                respRateBpm: $0["respRateBpm"],
+                                steps: $0["steps"], activeKcalEst: $0["activeKcalEst"],
+                                spo2Red: $0["spo2Red"], spo2Ir: $0["spo2Ir"], avgSdnn: $0["avgSdnn"],
+                                skinTempC: $0["skinTempC"],
+                                sleepHrOnly: $0["sleepHrOnly"])
                 }
         }
     }
