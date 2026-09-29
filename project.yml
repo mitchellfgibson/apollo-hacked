@@ -180,6 +180,17 @@ targets:
           - "Resources/Strand.entitlements"
           - "Resources/StrandiOS-Info.plist"
           - "Resources/Fonts"
+          # macOS-only sources that arrived with the upstream merge. Unlike the shell files
+          # (StrandApp / RootView / ContentView), which this target KEEPS because putting this fork's
+          # own UX on the phone is the point, these cannot compile for iOS and nothing in this
+          # fork's navigation reaches them:
+          #   NotificationSettings*  import AppKit unguarded (NSWorkspace app picker)
+          #   MenuBar                the MenuBarExtra shell; StrandApp already guards its only use
+          #   NOOPAppIntents         reaches MacActions (Shortcuts/screen-lock), macOS-only
+          - "Data/NotificationSettingsStore.swift"
+          - "Screens/NotificationSettingsView.swift"
+          - "MenuBar"
+          - "System/NOOPAppIntents.swift"
       - path: Strand/Resources/Fonts
         type: folder
     info:
