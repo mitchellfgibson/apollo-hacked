@@ -15,16 +15,19 @@ final class StressPersonalBaselineSurfaceTests: XCTestCase {
     func testDetailAndTodayUseTheSameSelectedMode() throws {
         let detail = try source("Strand/Screens/StressView.swift")
         let producer = try source("Strand/Data/StressDayCurve.swift")
-        let today = try source("Strand/Screens/TodayView.swift")
         let liquidToday = try source("Strand/Liquid/LiquidTodayView.swift")
 
         XCTAssertTrue(detail.contains("let mode = await DaytimeStressMode.selected("))
         XCTAssertTrue(producer.contains("let mode = await DaytimeStressMode.selected("))
         XCTAssertTrue(producer.contains("tzOffsetSeconds: tz, mode: mode,"))
-        for body in [today, liquidToday] {
+        // Upstream also checks its `TodayView`, whose hosted stress card calls `StressDayCurve.today`.
+        // This fork's Today hosts no stress curve at all — stress lives on its own screen in the
+        // condensed nav — so there is no call site there to carry the preference. Every surface that
+        // DOES host the curve is still pinned, which is the contract this test exists for.
+        for body in [detail, liquidToday] {
             XCTAssertTrue(body.contains(
                 "personalBaseline: PuffinExperiment.stressPersonalBaselineEnabled"
-            ))
+            ), "a surface hosting the daytime-stress curve must pass the personal-baseline preference")
         }
         // A slot per lens, not one slot that compares the lens: comparing made the two surfaces evict
         // each other on every alternation, so the fingerprint gate never held with the toggle on.
