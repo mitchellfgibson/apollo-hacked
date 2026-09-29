@@ -169,7 +169,10 @@ targets:
   StrandiOS:
     type: application
     platform: iOS
-    deploymentTarget: "16.0"
+    # 17.0, not 16.0: this target compiles the whole shared `Strand/` tree, which upstream develops
+    # against its own iOS target's 17.0 floor — `scrollBounceBehavior(_:axes:)` (16.4+) and friends
+    # are used unguarded there. Matching the floor is what keeps those sources compiling here.
+    deploymentTarget: "17.0"
     # Same app sources as macOS; platform-specific code is guarded with #if os(macOS) /
     # #if canImport(AppKit), so the desktop-only features (menu bar, Mac automations,
     # Mac-app notification mirroring) compile out and the core WHOOP experience remains.
@@ -191,6 +194,23 @@ targets:
           - "Screens/NotificationSettingsView.swift"
           - "MenuBar"
           - "System/NOOPAppIntents.swift"
+      # The iOS-only implementations the shared tree calls into: HealthKitBridge, CoachVoiceInput,
+      # RootTabView (referenced by NavRouter / LiquidTodayView / BreathingView / CoachView), the
+      # widget publishers and the iOS AppIntents. Excluded from it:
+      #   App/StrandiOSApp.swift  upstream's @main shell — this target uses this fork's StrandApp
+      #   Resources/Assets.xcassets + AltIcons   would collide with this fork's AppIcon
+      #   Resources/Info.plist + NOOP.entitlements  this target carries its own
+      - path: StrandiOS
+        excludes:
+          - "App/StrandiOSApp.swift"
+          - "Resources/Info.plist"
+          - "Resources/NOOP.entitlements"
+          - "Resources/Assets.xcassets"
+          - "Resources/AltIcons"
+      # Types shared between the iOS app and its widget/Live-Activity extensions — the
+      # *ActivityAttributes the Live Activity controllers above are generic over, plus the widget
+      # snapshot/telemetry models. Upstream includes this whole directory in both targets.
+      - path: StrandiOSShared
       - path: Strand/Resources/Fonts
         type: folder
     info:
@@ -215,7 +235,11 @@ targets:
         UIBackgroundModes: [bluetooth-central]
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.mitchellgibson.noop
+        # `com.mitchellgibson.noop` is NOT registerable by this team — Apple reports the app
+        # identifier as unavailable, so automatic signing can mint no profile for it. The team's
+        # existing, working identifier is this one: the last device build (2026-09-16) shipped
+        # "iOS Team Provisioning Profile: com.mitchellgibson.noopstrand" under team R4X6JDGYLF.
+        PRODUCT_BUNDLE_IDENTIFIER: com.mitchellgibson.noopstrand
         PRODUCT_NAME: NOOP
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: NO

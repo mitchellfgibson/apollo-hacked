@@ -28,7 +28,7 @@ struct SettingsView: View {
     // a prepared document; the importer hands back a picked URL.
     @State private var showExporter = false
     @State private var showImporter = false
-    @State private var exportDocument: SQLiteBackupDocument?
+    @State private var exportDocument: NoopBackupDocument?
     #endif
 
     var body: some View {
@@ -66,7 +66,7 @@ struct SettingsView: View {
                     finishExport(result)
                 }
                 .fileImporter(isPresented: $showImporter,
-                              allowedContentTypes: DataBackup.sqliteContentTypes(),
+                              allowedContentTypes: DataBackup.backupContentTypes(),
                               allowsMultipleSelection: false) { result in
                     finishImport(result)
                 }
@@ -444,7 +444,7 @@ struct SettingsView: View {
         Task {
             switch await DataBackup.prepareExportFile(checkpoint: { await model.repo.checkpointForBackup() }) {
             case .success(let url):
-                exportDocument = SQLiteBackupDocument(url: url)
+                exportDocument = NoopBackupDocument(url: url)
                 showExporter = true
             case .failure(let result):
                 handleBackup(result)

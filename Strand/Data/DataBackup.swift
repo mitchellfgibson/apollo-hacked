@@ -594,7 +594,8 @@ enum DataBackup {
     }
 
     /// "NOOP-backup-2026-06-07.noopbak"
-    private static func defaultBackupName() -> String {
+    // Internal, not private: the iOS export stages its temp file under the same name.
+    static func defaultBackupName() -> String {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
         f.dateFormat = "yyyy-MM-dd"
@@ -610,7 +611,8 @@ enum DataBackup {
 
     /// Content types accepted by the export/import panels. Includes the new `.noopbak` (ZIP),
     /// generic ZIP, and legacy `.sqlite` / `.database` types so older backups keep working.
-    private static func backupContentTypes() -> [UTType] {
+    // Internal, not private: the iOS file pickers (DataBackupIOS.swift) accept the same types.
+    static func backupContentTypes() -> [UTType] {
         var types: [UTType] = []
         if let noopbak = UTType(filenameExtension: "noopbak") { types.append(noopbak) }
         types.append(.zip)

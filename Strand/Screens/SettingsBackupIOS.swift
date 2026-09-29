@@ -6,12 +6,12 @@ import UniformTypeIdentifiers
 // which need a `FileDocument` to hand to the exporter. Compiled out on macOS.
 #if !os(macOS)
 
-/// A wrapper around the prepared SQLite backup file so `.fileExporter` can write it to a user-chosen
-/// location (e.g. the Files app / iCloud Drive). We already copied the live DB to a temp URL in
-/// `DataBackup.prepareExportFile`; this streams that file's bytes out.
-struct SQLiteBackupDocument: FileDocument {
-    static var readableContentTypes: [UTType] { DataBackup.sqliteContentTypes() }
-    static var writableContentTypes: [UTType] { DataBackup.sqliteContentTypes() }
+/// A wrapper around the staged `.noopbak` backup so `.fileExporter` can write it to a user-chosen
+/// location (e.g. the Files app / iCloud Drive). `DataBackup.prepareExportFile` already wrote the
+/// verified archive to a temp URL; this streams that file's bytes out.
+struct NoopBackupDocument: FileDocument {
+    static var readableContentTypes: [UTType] { DataBackup.backupContentTypes() }
+    static var writableContentTypes: [UTType] { DataBackup.backupContentTypes() }
 
     let data: Data
     let filename: String
@@ -23,7 +23,7 @@ struct SQLiteBackupDocument: FileDocument {
 
     init(configuration: ReadConfiguration) throws {
         data = configuration.file.regularFileContents ?? Data()
-        filename = "NOOP-backup.sqlite"
+        filename = "NOOP-backup.noopbak"
     }
 
     func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
