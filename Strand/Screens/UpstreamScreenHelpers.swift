@@ -1,5 +1,6 @@
 import SwiftUI
 import WhoopStore
+import StrandAnalytics
 import StrandDesign
 
 // MARK: - Screen helpers lifted from upstream screens this fork replaced
@@ -547,4 +548,132 @@ let vo2MaxAttributionPrefix = "vo2max-estimator:"
 /// `nil` is deliberately preserved as `unknown`; a legacy point must never inherit today's profile method.
 func vo2MaxAttributionSource(_ estimator: Vo2MaxEstimator?) -> String {
     vo2MaxAttributionPrefix + (estimator?.rawValue ?? "unknown")
+}
+
+/// One windowed reading behind a vital's detail chart: its day ("YYYY-MM-DD"), the value, and the RAW
+/// source id it came from (a strap id, the "-noop" computed sibling, "apple-health", or "health-connect").
+/// The readings TABLE and the "N readings" caption both derive from this ONE windowed list, so they can
+/// never disagree; the raw source maps to a human label via `TodayView.provenanceDisplayLabel` — the SAME
+/// resolver Today uses, so no source vocabulary is invented. Swift twin of Android's `VitalReading`.
+struct VitalReading: Equatable {
+    let day: String
+    let value: Double
+    let source: String
+}
+
+/// One row of a vital detail's readings table: the reading's day (localized), its formatted value with
+/// unit, and a human source label. Plain strings so the view is a thin renderer and the projection stays
+/// unit-testable. Swift twin of Android's `VitalReadingRow`.
+struct VitalReadingRow: Equatable {
+    let time: String
+    let value: String
+    let source: String
+}
+
+/// Project a vital's windowed `readings` into table rows, NEWEST FIRST — the same list (so the same count)
+/// the "N readings" caption shows, guaranteeing the two never drift. Each row pairs the reading's DAY
+/// (these vital series carry one aggregated reading per night, so a row's "time" is its localized calendar
+/// date; the date always shows since a charted window spans 2+ days) with the model's own `format`ted
+/// value + `unit` and the source label from `TodayView.provenanceDisplayLabel` (a strap id → "Whoop", its
+/// "-noop" sibling → "On-device", "apple-health" → "Apple Health", "health-connect" → "Health Connect").
+/// `strapDeviceId` is the active strap id the resolver needs. Byte-identical projection to Android's
+/// `vitalReadingRows`.
+func vitalReadingRows(readings: [VitalReading], unit: String, strapDeviceId: String,
+                      now: Date = Date(), format: (Double) -> String) -> [VitalReadingRow] {
+    readings.reversed().map { reading in
+        let value = format(reading.value)
+        return VitalReadingRow(
+            time: vitalReadingDateLabel(reading.day, now: now),
+            value: unit.isEmpty ? value : "\(value) \(unit)",
+            source: TodayView.provenanceDisplayLabel(rawSource: reading.source, deviceId: strapDeviceId)
+        )
+    }
+}
+
+/// "9 Jun" for a "YYYY-MM-DD" reading day (today / yesterday read as words to match the hero "as of"
+/// line); the verbatim string if it doesn't parse. UTC-fixed and localized, matching this file's other date
+/// labels. Swift twin of Android's `vitalReadingDateLabel`.
+func vitalReadingDateLabel(_ day: String, now: Date = Date()) -> String {
+    guard let date = parseDay(day) else { return day }
+    var cal = Calendar(identifier: .gregorian)
+    cal.timeZone = TimeZone(identifier: "UTC")!
+    if cal.isDate(date, inSameDayAs: now) { return String(localized: "Today") }
+    if let yesterday = cal.date(byAdding: .day, value: -1, to: now),
+       cal.isDate(date, inSameDayAs: yesterday) { return String(localized: "Yesterday") }
+    let formatter = DateFormatter()
+    formatter.locale = AppLanguage.activeLocale
+    formatter.timeZone = TimeZone(identifier: "UTC")
+    formatter.dateFormat = "d MMM"
+    return formatter.string(from: date)
+}
+
+
+
+/// The persisted defaults for the Settings "Advanced" disclosure. Pulled out so the one fact that must
+/// never regress, that a fresh install lands COLLAPSED, is a single testable constant. The key matches
+/// the Android `SettingsDisclosurePrefs.KEY` suffix so a backup/restore round-trip carries the choice.
+enum SettingsDisclosureDefaults {
+    static let advancedOpenKey = "settingsAdvancedOpen"
+    static let advancedOpenDefault = false
+}
+
+/// Pure priority ladder behind the Sleep status banner. "Missing" is deliberately held until morning so
+/// opening Sleep during the night does not claim a still-in-progress night was missed.
+func resolveSleepFreshness(hasCurrentNight: Bool, morningReady: Bool, syncing: Bool,
+                           calculating: Bool, syncedSinceDayStart: Bool,
+                           syncFailed: Bool) -> SleepFreshnessStatus? {
+    if syncing { return .syncing }
+    // #2108: a night already in hand outranks .calculating. It used to sit below, so `hasCurrentNight`
+    // could only silence the missing-night states and a finished night was structurally unable to
+    // silence this one: the banner said "detecting and staging the night now" directly above that same
+    // night scored, timed and staged on screen. A note that contradicts the content beside it is worse
+    // than no note, and one that is always on is read by nobody the day it matters. .syncing stays
+    // above, because data still arriving can genuinely change what is shown.
+    if hasCurrentNight { return nil }
+    if calculating { return .calculating }
+    if !morningReady { return nil }
+    if syncFailed { return .syncFailed }
+    return syncedSinceDayStart ? .notDetected : .awaitingSync
+}
+
+/// Whether the skin-temp explorer must explain that deviation-only nights were dropped from the
+/// series when leading with absolutes. Twin of Android's `shouldExplainShortenedSkinTempSeries`.
+///
+/// True ONLY when leading with the absolute — the deviation-led branch also drops rows (calibrating
+/// nights that have only an absolute, and the #622 bimodal partition), but those are the OPPOSITE
+/// kind, so this note's sentence would be precisely backwards there. True only when rows were
+/// actually dropped, so a complete series stays silent.
+func shouldExplainShortenedSkinTempSeries(leadsAbsolute: Bool, shownReadings: Int,
+                                          rowsWithEitherNumber: Int) -> Bool {
+    leadsAbsolute && shownReadings < rowsWithEitherNumber
+}
+
+/// Whether the skin-temp explorer must explain that it fell back to deviations despite the
+/// user's Settings choice asking for temperatures. Twin of Android's `shouldExplainSkinTempFallback`.
+///
+/// True only when the user asked for absolute, the screen is NOT leading with absolutes, and NO
+/// night in the window carries one — so the fallback is total, not partial. A window with one
+/// stored temperature and twenty deltas still leads with temperatures (the #1850 window-wide rule),
+/// so this note stays silent there; it fires only when the setting genuinely cannot be honoured.
+func shouldExplainSkinTempFallback(prefer: SkinTempDisplay.Kind, leadsAbsolute: Bool,
+                                   anyAbsoluteInWindow: Bool) -> Bool {
+    prefer == .absolute && !leadsAbsolute && !anyAbsoluteInWindow
+}
+
+/// Sequential segment ids for the VO₂max trend. The counter matters when a user changes Nes → Uth → Nes:
+/// using the method name alone would reconnect the two non-adjacent Nes runs across the Uth interval.
+func vo2MaxTrendSegmentIds(days: [String], sourceByDay: [String: String]) -> [String] {
+    var previous: String?
+    var group = -1
+    return days.map { day in
+        let source = sourceByDay[day] ?? vo2MaxAttributionSource(nil)
+        if source != previous { group += 1; previous = source }
+        return "\(group):\(source)"
+    }
+}
+
+/// The "Syncing strap history…" note, shown only while a historical offload is running (#77). Owns the
+/// `LiveState` observation so the chunk count ticks without re-rendering the rest of the Sleep screen.
+enum SleepFreshnessStatus: Equatable {
+    case syncing, calculating, syncFailed, awaitingSync, notDetected
 }

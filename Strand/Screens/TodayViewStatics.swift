@@ -9,35 +9,11 @@ import StrandDesign
 //
 // Upstream declares these as statics on ITS `TodayView`. This fork keeps its own Today screen, but
 // `LiquidTodayView` and the hosted cards still call them through `TodayView.…`, so they are carried
-// here verbatim as an extension. Pure projections over stored values — no view state — which is why
-// they move cleanly. `private` is dropped where upstream had it, because the callers now live in a
-// different file.
+// here verbatim as an extension — overloads included, since callers pick between them. Pure
+// projections over stored values, no view state, which is why they move cleanly. `private` is
+// dropped where upstream had it, because the callers now live in a different file.
 
 extension TodayView {
-
-    static var defaultValue: CGFloat = 0
-
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
-
-    static func make(from workout: AppModel.ActiveWorkout?) -> ActiveWorkoutIndicatorModel? {
-        guard let workout else { return nil }
-        return ActiveWorkoutIndicatorModel(sport: workout.sport, startedAt: workout.start,
-                                           pausedAt: workout.pausedAt,
-                                           pausedDuration: workout.pausedDuration)
-    }
-
-    /// Elapsed ACTIVE time, formatted M:SS up to an hour and H:MM:SS once an hour has passed (so a
-    /// 90-minute session reads "1:30:00", not "90:00"). Clamped at zero so a clock-skew negative reads 0:00.
-    /// Pure + injectable `now` for deterministic tests. (StrandFont.bodyNumber already applies tabular figures,
-    /// so the call site does NOT add `.monospacedDigit()`.)
-    ///
-    /// `pausedAt`/`pausedDuration` default to "never paused" so the existing call sites and tests that
-    /// predate pause keep their exact meaning; the math itself lives in `ActiveWorkoutClock`.
-    static func elapsed(since start: Date, pausedAt: Date? = nil, pausedDuration: TimeInterval = 0,
-                        now: Date = Date()) -> String {
-        ActiveWorkoutClock.clock(Int(ActiveWorkoutClock.activeElapsed(
-            start: start, pausedAt: pausedAt, pausedDuration: pausedDuration, now: now)))
-    }
 
     /// Product mark, never natural-language copy. Keeping it out of localization also makes source
     /// classification and tint selection stable when the app language changes.
@@ -570,6 +546,11 @@ extension TodayView {
         return SkinTempDisplay.formatReading(reading, fahrenheit: fahrenheit)
     }
 
+    static func skinTempCardValue(_ value: Double?, fahrenheit: Bool) -> String {
+        guard let value else { return "—" }
+        return SkinTempDisplay.format(value, fahrenheit: fahrenheit)
+    }
+
     /// Pure copy/gate behind `buildingHint`, extracted so it can be unit-tested without a live view.
     /// Rest fills in after a night's sleep; Effort fills in once cardio load is logged. Em-dash-free
     /// house style. Returns nil off-today and for any metric other than Effort/Rest (#527).
@@ -589,33 +570,4 @@ extension TodayView {
     /// #1821: routed through AppClock so the Clock format setting reaches this label. Was a `static
     /// let`, which would have frozen the reader's choice at first use until the app relaunched.
     static var hrTimeFmt: DateFormatter { AppClock.hourMinuteFormatter() }
-
-    static func resolve(live: LiveState) -> SyncChipState {
-        if live.backfilling {
-            // The zero rule above. Negative cannot come off the wire (the decoder returns a ring delta),
-            // but the bound reads the same either way. Android spells this `?.takeIf { it > 0 }`.
-            return .syncing(chunks: live.syncChunksThisSession,
-                            pagesBehind: live.pagesBehindAtConnect.flatMap { $0 > 0 ? $0 : nil })
-        }
-        if let ts = live.lastSyncedAt { return .synced(agoText: shortAgo(ts)) }
-        if live.historySyncExperimental { return .experimentalLive }
-        return .hidden
-    }
-
-    /// Compact relative age for the status card ("<1m" / "Nm" / "Nh" / "Nd") — deliberately terse.
-    ///
-    /// EVERY branch must read correctly with a trailing "ago", because that is the only way this value is
-    /// ever consumed (`DevicesView` wraps it in "Synced %@ ago" and "Strap history synced %@ ago"). The
-    /// sub-minute branch used to return the word "now", which produced the user-visible "Synced now ago"
-    /// for the first minute after any sync (#1472). "<1m" composes; it also needs no catalog entry, being
-    /// digits and symbols in every language.
-    static func shortAgo(_ ts: TimeInterval) -> String {
-        let secs = max(0, Int(Date().timeIntervalSince1970 - ts))
-        if secs < 60 { return "<1m" }
-        let mins = secs / 60
-        if mins < 60 { return "\(mins)m" }
-        let hrs = mins / 60
-        if hrs < 24 { return "\(hrs)h" }
-        return "\(hrs / 24)d"
-    }
 }

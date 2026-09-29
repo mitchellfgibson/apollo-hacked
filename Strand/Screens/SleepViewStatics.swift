@@ -6,8 +6,8 @@ import StrandDesign
 // MARK: - SleepView statics carried from upstream
 //
 // Companions to `SleepViewHelpers`: the constants and small projections upstream declares as statics
-// on ITS `SleepView`. This fork keeps its own sleep screen, so they are carried here verbatim for the
-// sleep model, the sleep cards and the Liquid Today, which all reach them through `SleepView.…`.
+// on ITS `SleepView`, overloads included. This fork keeps its own sleep screen, so they are carried
+// here for the sleep model, the sleep cards and the Liquid Today, which reach them via `SleepView.…`.
 
 extension SleepView {
 

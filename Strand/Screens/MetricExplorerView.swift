@@ -28,7 +28,9 @@ private let strandDayParser: DateFormatter = {
     return f
 }()
 
-private func parseDay(_ day: String) -> Date? { strandDayParser.date(from: day) }
+// Internal, not private: `vitalReadingDateLabel` (carried from upstream into
+// UpstreamScreenHelpers.swift, where upstream had it in this same file) calls it.
+func parseDay(_ day: String) -> Date? { strandDayParser.date(from: day) }
 
 /// "9 Jun 2026" — long, locale-stable date for the hero "as of" line.
 private func longDate(_ d: Date) -> String {
