@@ -2,6 +2,14 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>$(PRODUCT_BUNDLE_IDENTIFIER).debugexport</string>
+		<string>$(PRODUCT_BUNDLE_IDENTIFIER).coachbrief</string>
+		<string>$(PRODUCT_BUNDLE_IDENTIFIER).healthwriteback</string>
+		<string>$(PRODUCT_BUNDLE_IDENTIFIER).rescore</string>
+		<string>$(PRODUCT_BUNDLE_IDENTIFIER).stalebattery</string>
+	</array>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
@@ -22,6 +30,12 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>NOOP connects directly to your WHOOP strap over Bluetooth to read heart rate, R-R intervals, battery, and sensor data locally on your iPhone. Nothing leaves your device.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>NOOP records your route during an outdoor workout to show distance, pace, and a map, and keeps recording while the screen is off. The route stays on your device. Nothing leaves it.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>NOOP uses the microphone to let you ask the coach a question by voice. The audio is transcribed on-device and never leaves your iPhone.</string>
+	<key>NSMotionUsageDescription</key>
+	<string>NOOP reads your iPhone's step count for a walking or running workout to show steps in the activity summary. It stays on your device. Nothing leaves it.</string>
 	<key>UIAppFonts</key>
 	<array>
 		<string>NotoSerifDisplay-Regular.ttf</string>
@@ -30,6 +44,9 @@
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>bluetooth-central</string>
+		<string>location</string>
+		<string>fetch</string>
+		<string>processing</string>
 	</array>
 	<key>UIDeviceFamily</key>
 	<array>

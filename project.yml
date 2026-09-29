@@ -232,7 +232,28 @@ targets:
           - NotoSerifDisplay-Bold.ttf
         # CoreBluetooth: connect to the strap and keep syncing history in the background.
         NSBluetoothAlwaysUsageDescription: "NOOP connects directly to your WHOOP strap over Bluetooth to read heart rate, R-R intervals, battery, and sensor data locally on your iPhone. Nothing leaves your device."
-        UIBackgroundModes: [bluetooth-central]
+        # These three usage strings are REQUIRED, not optional: the merged upstream code paths call the
+        # APIs, and iOS terminates an app that touches one without the matching key declared.
+        NSLocationWhenInUseUsageDescription: "NOOP records your route during an outdoor workout to show distance, pace, and a map, and keeps recording while the screen is off. The route stays on your device. Nothing leaves it."
+        NSMotionUsageDescription: "NOOP reads your iPhone's step count for a walking or running workout to show steps in the activity summary. It stays on your device. Nothing leaves it."
+        NSMicrophoneUsageDescription: "NOOP uses the microphone to let you ask the coach a question by voice. The audio is transcribed on-device and never leaves your iPhone."
+        UIBackgroundModes:
+          - bluetooth-central
+          # REQUIRED by GpsWorkoutRecorder's allowsBackgroundLocationUpdates. Without it iOS raises
+          # "Invalid parameter not satisfying: !stayUp || CLClientIsBackgroundable(...)" and kills the
+          # app the moment background updates start — which is exactly how this build first crashed.
+          - location
+          # BGAppRefreshTaskRequest (the scheduled export and the coach brief) needs "fetch";
+          # BGProcessingTaskRequest (the re-score continuation a backgrounded offload starts) needs
+          # "processing". Each identifier below must also be permitted or the submit fails.
+          - fetch
+          - processing
+        BGTaskSchedulerPermittedIdentifiers:
+          - $(PRODUCT_BUNDLE_IDENTIFIER).debugexport
+          - $(PRODUCT_BUNDLE_IDENTIFIER).coachbrief
+          - $(PRODUCT_BUNDLE_IDENTIFIER).healthwriteback
+          - $(PRODUCT_BUNDLE_IDENTIFIER).rescore
+          - $(PRODUCT_BUNDLE_IDENTIFIER).stalebattery
     settings:
       base:
         # `com.mitchellgibson.noop` is NOT registerable by this team — Apple reports the app
